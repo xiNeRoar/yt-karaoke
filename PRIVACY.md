@@ -8,8 +8,8 @@ Last updated: 2026-11-24
 - No audio is recorded from your microphone, and no data is shared with advertisers or third-party analytics services.
 
 ## Permissions Justification
-- `storage`: Saves your local UI preferences inside your browser (`chrome.storage.local`).
-- `host_permissions` (`https://www.youtube.com/*` and the configured karaoke backend origin): Injects the karaoke control bar and KTV lyrics overlay onto YouTube watch pages and streams separated accompaniment tracks from the backend.
+- This extension requests **zero** special browser API permissions (no `storage`, `tabs`, `cookies`, or `webRequest`).
+- `host_permissions` (`https://www.youtube.com/*` and the configured karaoke backend origin): Injects the karaoke control bar and KTV lyrics overlay onto YouTube watch pages, refreshes open YouTube tabs upon installation/update, and streams separated accompaniment tracks and synchronized lyrics from the backend.
 
 ## Self-Hosting
 This project is 100% open source (MIT License). You may run the entire backend and gateway on your own PC or NAS without connecting to any external hosted server.
