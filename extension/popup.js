@@ -33,11 +33,12 @@ async function refresh() {
     pill.className = "pill online";
   }
 
-  const cacheRes = await apiRequest("/api/cache");
+  const cacheRes = await apiRequest("/api/cache?limit=50");
   songList.textContent = "";
   if (cacheRes.ok && cacheRes.data) {
     const items = (cacheRes.data.items || []).filter((i) => i.mode === "pure");
-    songCount.textContent = `${items.length} 首`;
+    const totalCount = typeof cacheRes.data.count === "number" ? cacheRes.data.count : items.length;
+    songCount.textContent = `${totalCount} 首`;
     if (items.length === 0) {
       const empty = document.createElement("div");
       empty.className = "hint";

@@ -161,6 +161,14 @@ def _require_admin(x_admin_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Admin token required")
 
 
+def _catalog_version(items: list[dict]) -> str:
+    if not items:
+        return "0:0:0"
+    total_mb = round(sum(float(i.get("size_mb") or 0) for i in items), 2)
+    latest_ts = max(float(i.get("created_at") or 0) for i in items)
+    return f"{len(items)}:{total_mb:.2f}:{latest_ts:.2f}"
+
+
 @app.get("/api/health")
 def health(request: Request, x_karaoke_client: Optional[str] = Header(default=None)):
     if x_karaoke_client:
@@ -190,6 +198,7 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
         "rclone_found": bool(manager.gdrive.refresh_binary()),
         "cache_dir": str(manager.cache_dir),
         "cache_count": len(cached),
+        "catalog_version": _catalog_version(cached),
         "cache_size_mb": round(local_mb + gdrive_mb, 2),
         "local_cache_mb": local_mb,
         "gdrive_cache_mb": gdrive_mb,
@@ -288,7 +297,7 @@ def get_recent_logs(lines: int = 120, x_admin_token: Optional[str] = Header(defa
 @app.post("/api/admin/gdrive/sync")
 def gdrive_sync(x_admin_token: Optional[str] = Header(default=None)):
     _require_admin(x_admin_token)
-    count = manager.gdrive.sync_index_from_remote()
+    count = manager.gdrive.sync_index_from_remote(force_full_scan=True)
     if manager.gdrive.is_configured():
         manager.storage_mode = "gdrive"
         manager.save_config()
@@ -368,15 +377,38 @@ def generate_lyrics(req: LyricsRequest):
 
 
 @app.get("/api/cache")
-def get_cache():
-    items = manager.list_cache()
+def get_cache(limit: int = 200, offset: int = 0, q: str = ""):
+    all_items = manager.list_cache()
+    total_size_mb = round(sum(i["size_mb"] for i in all_items), 2)
+    cat_ver = _catalog_version(all_items)
+
+    needle = q.strip().lower()
+    if needle:
+        filtered = [
+            i for i in all_items
+            if needle in (i.get("title") or "").lower() or needle in (i.get("video_id") or "").lower()
+        ]
+    else:
+        filtered = all_items
+
+    safe_offset = max(0, offset)
+    if limit <= 0:
+        page = filtered[safe_offset : safe_offset + 5000]
+    else:
+        safe_limit = max(1, min(1000, limit))
+        page = filtered[safe_offset : safe_offset + safe_limit]
+
     return {
-        "count": len(items),
-        "total_size_mb": round(sum(i["size_mb"] for i in items), 2),
+        "count": len(filtered),
+        "total_songs": len(all_items),
+        "returned": len(page),
+        "has_more": (safe_offset + len(page)) < len(filtered),
+        "catalog_version": cat_ver,
+        "total_size_mb": total_size_mb,
         "max_cache_mb": manager.max_cache_mb,
         "storage_mode": manager.storage_mode,
         "cache_dir": str(manager.cache_dir),
-        "items": items,
+        "items": page,
     }
 
 

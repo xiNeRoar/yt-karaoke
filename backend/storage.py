@@ -17,6 +17,7 @@ from typing import Iterator, Optional
 
 RCLONE_REMOTE = "ytkaraoke_gdrive"
 RCLONE_FOLDER = "YT-Karaoke-Cache"
+CATALOG_FILENAME = "_catalog.json"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -49,6 +50,9 @@ class GoogleDriveStorage:
         self._index: dict[str, dict] = {}
         self._configured_cache: Optional[bool] = None
         self._configured_checked_at: float = 0.0
+        self._catalog_push_lock = threading.Lock()
+        self._catalog_push_pending = False
+        self._catalog_push_running = False
         self._load_index()
 
     def refresh_binary(self) -> Optional[str]:
@@ -145,6 +149,70 @@ class GoogleDriveStorage:
         with self._lock:
             self._index[self._key(video_id, mode)] = entry
             self._save_index()
+        self.push_catalog_async()
+
+    def push_catalog(self) -> bool:
+        """Upload a single compact _catalog.json manifest so NAS Gateways sync 10,000+ songs in 1 API call."""
+        exe = self.refresh_binary()
+        if not exe or not self.is_configured():
+            return False
+        with self._lock:
+            if not self._index:
+                return False
+            payload = {
+                "version": 1,
+                "updated_at": time.time(),
+                "songs": dict(self._index),
+            }
+        tmp_catalog = self.index_file.parent / f".{CATALOG_FILENAME}.tmp"
+        try:
+            tmp_catalog.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            res = subprocess.run(
+                [
+                    exe, "copyto", str(tmp_catalog), f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{CATALOG_FILENAME}",
+                    "--retries", "5",
+                    "--retries-sleep", "6s",
+                    "--low-level-retries", "8",
+                    "--drive-pacer-min-sleep", "200ms",
+                    "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                tmp_catalog.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def push_catalog_async(self) -> None:
+        """Coalesced background upload of _catalog.json (never blocks callers or spams Drive)."""
+        with self._catalog_push_lock:
+            self._catalog_push_pending = True
+            if self._catalog_push_running:
+                return
+            self._catalog_push_running = True
+
+        def _worker() -> None:
+            try:
+                while True:
+                    time.sleep(1.5)
+                    with self._catalog_push_lock:
+                        if not self._catalog_push_pending:
+                            self._catalog_push_running = False
+                            return
+                        self._catalog_push_pending = False
+                    self.push_catalog()
+            except Exception:
+                with self._catalog_push_lock:
+                    self._catalog_push_running = False
+
+        threading.Thread(target=_worker, daemon=True, name="gdrive-catalog-push").start()
 
     def download_file(self, video_id: str, mode: str, filename: str, dest: Path) -> bool:
         exe = self.refresh_binary()
@@ -222,16 +290,36 @@ class GoogleDriveStorage:
             except Exception:
                 pass
 
-    def sync_index_from_remote(self) -> int:
-        """Scan Google Drive folder to rebuild index WITHOUT holding self._lock during network I/O."""
+    def sync_index_from_remote(self, force_full_scan: bool = False) -> int:
+        """Sync Google Drive index cleanly (fast _catalog.json first, --fast-list full scan fallback)."""
         exe = self.refresh_binary()
         if not exe or not self.is_configured(force_refresh=True):
             return 0
+
+        if not force_full_scan:
+            try:
+                cat_raw = subprocess.check_output(
+                    [exe, "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{CATALOG_FILENAME}"],
+                    text=True,
+                    encoding="utf-8",
+                    timeout=25,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                cat_doc = json.loads(cat_raw)
+                songs = cat_doc.get("songs") if isinstance(cat_doc, dict) else None
+                if isinstance(songs, dict) and len(songs) > 0:
+                    with self._lock:
+                        self._index = songs
+                        self._save_index()
+                        return len(self._index)
+            except Exception:
+                pass
+
         try:
             out = subprocess.check_output(
-                [exe, "lsjson", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}", "-R", "--files-only"],
+                [exe, "lsjson", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}", "-R", "--files-only", "--fast-list"],
                 text=True,
-                timeout=30,
+                timeout=120,
                 creationflags=CREATE_NO_WINDOW,
             )
             files = json.loads(out)
@@ -287,11 +375,13 @@ class GoogleDriveStorage:
                     "url": f"https://www.youtube.com/watch?v={vid}",
                 }
 
-        # Atomic swap inside lock (<0.1ms)
+        # Atomic swap inside lock (<0.1ms) and publish consolidated _catalog.json
         with self._lock:
             self._index = new_index
             self._save_index()
-            return len(self._index)
+            count = len(self._index)
+        self.push_catalog_async()
+        return count
 
     def list_items(self) -> list[dict]:
         with self._lock:
@@ -320,6 +410,8 @@ class GoogleDriveStorage:
                 self._index.pop(k, None)
                 removed += 1
             self._save_index()
+        if removed:
+            self.push_catalog_async()
         return removed
 
     def purge_all(self) -> int:

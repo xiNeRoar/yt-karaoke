@@ -140,13 +140,56 @@ class GatewayState:
             time.sleep(180)
             self.sync_gdrive_index()
 
-    def sync_gdrive_index(self) -> int:
+    def sync_gdrive_index(self, force_full_scan: bool = False) -> int:
+        # Fast O(1) path: read consolidated _catalog.json (1 single Drive API call -> ~0.5s even for 10,000+ songs!)
+        if not force_full_scan:
+            try:
+                cat_res = subprocess.run(
+                    ["rclone", "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/_catalog.json", "--drive-pacer-min-sleep", "200ms"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=35,
+                )
+                if cat_res.returncode == 0 and cat_res.stdout.strip():
+                    cat_doc = json.loads(cat_res.stdout)
+                    songs = cat_doc.get("songs") if isinstance(cat_doc, dict) else None
+                    if isinstance(songs, dict) and len(songs) > 0:
+                        cleaned: dict[str, dict] = {}
+                        for key, entry in songs.items():
+                            if not isinstance(entry, dict) or entry.get("mode", "pure") != "pure":
+                                continue
+                            vid = entry.get("video_id", "")
+                            if not VIDEO_ID_RE.match(vid):
+                                continue
+                            cleaned[f"{vid}__pure"] = {
+                                "video_id": vid,
+                                "mode": "pure",
+                                "title": entry.get("title") or vid,
+                                "duration": entry.get("duration") or 0,
+                                "size_mb": entry.get("size_mb") or 0,
+                                "created_at": entry.get("created_at") or time.time(),
+                                "storage": "gdrive",
+                                "url": f"https://www.youtube.com/watch?v={vid}",
+                            }
+                        if cleaned:
+                            with self._lock:
+                                self._index = cleaned
+                                self._lyrics_missing.clear()
+                                self._save_index()
+                                self.last_index_sync = time.time()
+                            print(f"[Gateway] Synced {len(cleaned)} songs via _catalog.json (fast path)", flush=True)
+                            return len(cleaned)
+            except Exception as exc:
+                print(f"[Gateway] _catalog.json fast sync skipped: {exc}", flush=True)
+
+        # Fallback full scan with --fast-list (~100x fewer Drive API calls than plain recursive lsjson)
         try:
             res = subprocess.run(
-                ["rclone", "lsjson", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}", "-R", "--files-only"],
+                ["rclone", "lsjson", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}", "-R", "--files-only", "--fast-list"],
                 capture_output=True,
                 text=True,
-                timeout=45,
+                timeout=120,
             )
             if res.returncode != 0:
                 print(f"[Gateway] rclone lsjson failed (rc={res.returncode}): {res.stderr.strip()[:300]}", flush=True)
@@ -206,7 +249,8 @@ class GatewayState:
 
         print(f"[Gateway] Synced {len(new_idx)} songs from Google Drive", flush=True)
 
-        for key, vid, mode in need_meta:
+        # Cap per-cycle meta.json enrichment so cold startup with thousands of songs never stalls
+        for key, vid, mode in need_meta[:30]:
             try:
                 mraw = subprocess.check_output(
                     ["rclone", "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{vid}/{mode}/meta.json"],
@@ -495,13 +539,34 @@ def heartbeat(req: HeartbeatRequest, request: Request):
 
 
 @app.get("/api/cache")
-def list_cache():
-    items = gw.list_songs()
+def list_cache(limit: int = 60, offset: int = 0, q: str = ""):
+    all_items = gw.list_songs()
+    total_size_mb = round(sum(i["size_mb"] for i in all_items), 2)
+
+    needle = q.strip().lower()
+    if needle:
+        filtered = [
+            i for i in all_items
+            if needle in (i.get("title") or "").lower() or needle in (i.get("video_id") or "").lower()
+        ]
+    else:
+        filtered = all_items
+
+    safe_offset = max(0, offset)
+    if limit <= 0:
+        page = filtered[safe_offset : safe_offset + 2000]
+    else:
+        safe_limit = max(1, min(500, limit))
+        page = filtered[safe_offset : safe_offset + safe_limit]
+
     return {
-        "count": len(items),
-        "total_size_mb": round(sum(i["size_mb"] for i in items), 2),
+        "count": len(filtered),
+        "total_songs": len(all_items),
+        "returned": len(page),
+        "has_more": (safe_offset + len(page)) < len(filtered),
+        "total_size_mb": total_size_mb,
         "storage_mode": "gdrive",
-        "items": items,
+        "items": page,
     }
 
 

@@ -174,6 +174,7 @@ namespace YtKaraokeTray
         private bool _limitsInitialized = false;
         private bool _logsExpanded = false;
         private string _lastCacheSig = "";
+        private string _lastCatalogVersion = "";
 
         // Tray
         private NotifyIcon _trayIcon;
@@ -855,12 +856,20 @@ namespace YtKaraokeTray
                 SetTrayText(string.Format("YouTube 唱K — 連線 {0} 人 | 快取 {1} 首", activeClients, cacheCount));
                 UpdateModeButtons();
 
-                // Refresh cached songs list with clickable YouTube links
-                string cacheRaw = await HttpRequestAsync("GET", "/api/cache", null, 2000, false);
-                if (cacheRaw != null && cacheRaw != _lastCacheSig)
+                // Refresh cached songs list ONLY when catalog_version changes (zero wasted polling at 10,000+ songs!)
+                string catVer = GetStr(h, "catalog_version", "");
+                if (string.IsNullOrEmpty(_lastCatalogVersion) || string.IsNullOrEmpty(catVer) || catVer != _lastCatalogVersion)
                 {
-                    _lastCacheSig = cacheRaw;
-                    PopulateSongsList(cacheRaw);
+                    string cacheRaw = await HttpRequestAsync("GET", "/api/cache?limit=250", null, 3000, false);
+                    if (cacheRaw != null)
+                    {
+                        _lastCatalogVersion = catVer;
+                        if (cacheRaw != _lastCacheSig)
+                        {
+                            _lastCacheSig = cacheRaw;
+                            PopulateSongsList(cacheRaw);
+                        }
+                    }
                 }
             }
             catch { }
@@ -1041,7 +1050,7 @@ namespace YtKaraokeTray
                 _btnConnectGdrive.Enabled = false;
                 _btnConnectGdrive.Text = "同步中...";
                 await HttpRequestAsync("POST", "/api/admin/gdrive/sync", "{}", 30000, true);
-                _lastCacheSig = "";
+                _lastCacheSig = ""; _lastCatalogVersion = "";
                 await PollAllAsync();
                 _btnConnectGdrive.Enabled = true;
                 return;
@@ -1072,7 +1081,7 @@ namespace YtKaraokeTray
             });
 
             await HttpRequestAsync("POST", "/api/admin/gdrive/sync", "{}", 30000, true);
-            _lastCacheSig = "";
+            _lastCacheSig = ""; _lastCatalogVersion = "";
             await PollAllAsync();
             _btnConnectGdrive.Enabled = true;
 
@@ -1104,7 +1113,7 @@ namespace YtKaraokeTray
                 _btnMigrateGdrive.Text = "遷移本地上雲端";
                 return;
             }
-            _lastCacheSig = "";
+            _lastCacheSig = ""; _lastCatalogVersion = "";
             await PollAllAsync();
         }
 
@@ -1143,7 +1152,7 @@ namespace YtKaraokeTray
             var parts = GetSelectedSongParts();
             if (parts == null || parts.Length < 2 || !_backendOnline) return;
             await HttpRequestAsync("DELETE", "/api/cache/" + parts[0] + "?mode=" + parts[1], null, 15000, true);
-            _lastCacheSig = "";
+            _lastCacheSig = ""; _lastCatalogVersion = "";
             await PollAllAsync();
         }
 
@@ -1153,7 +1162,7 @@ namespace YtKaraokeTray
             var res = MessageBox.Show("確定清空全部快取（包括本地及 Google Drive 伴奏）？", "清空快取", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (res != DialogResult.Yes) return;
             await HttpRequestAsync("DELETE", "/api/cache", null, 30000, true);
-            _lastCacheSig = "";
+            _lastCacheSig = ""; _lastCatalogVersion = "";
             await PollAllAsync();
         }
 
