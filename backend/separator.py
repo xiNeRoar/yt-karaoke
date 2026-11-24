@@ -158,11 +158,12 @@ class KaraokeSeparatorManager:
                     with self._lock:
                         busy_mig = bool(self._migration_state.get("running"))
                         queued = set(self._queued_keys)
+                        busy_lyrics = set(self._lyrics_in_progress)
                     if not busy_mig:
                         local_items = self._list_local_cache()
                         for it in local_items:
                             vid, mode = it["video_id"], it["mode"]
-                            if self._job_key(vid, mode) in queued:
+                            if self._job_key(vid, mode) in queued or vid in busy_lyrics:
                                 continue
                             local_dir = self.get_cache_dir(vid, mode)
                             if not local_dir.exists():
@@ -448,11 +449,11 @@ class KaraokeSeparatorManager:
                     self._active_procs[key] = proc
 
                 try:
-                    _, stderr_text = proc.communicate(timeout=360)
+                    _, stderr_text = proc.communicate(timeout=600)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     _, stderr_text = proc.communicate()
-                    raise RuntimeError("處理逾時（超過 6 分鐘），已自動中止保護系統資源。")
+                    raise RuntimeError("處理逾時（超過 10 分鐘），已自動中止保護系統資源。")
                 finally:
                     with self._lock:
                         self._active_procs.pop(key, None)
@@ -460,14 +461,13 @@ class KaraokeSeparatorManager:
                 if proc.returncode != 0:
                     cur = self._read_job_status(video_id, mode) or {}
                     if cur.get("status") != "error":
-                        err_msg = (stderr_text or "").strip().splitlines()[-1] if stderr_text else f"Worker exit {proc.returncode}"
                         cur.update(
                             {
                                 "video_id": video_id,
                                 "mode": mode,
                                 "status": "error",
-                                "error": err_msg,
-                                "stage_text": f"處理失敗：{err_msg}",
+                                "error": "暫時無法處理此影片，請稍後再試",
+                                "stage_text": "處理失敗：暫時無法處理此影片，請稍後再試",
                                 "updated_at": time.time(),
                             }
                         )
@@ -893,9 +893,13 @@ class KaraokeSeparatorManager:
                 ]
                 if inst_path and inst_path.exists():
                     cmd.extend(["--inst-path", str(inst_path)])
+                ly_env = os.environ.copy()
+                if eff_mode == "cpu":
+                    ly_env["CUDA_VISIBLE_DEVICES"] = "-1"
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(BASE_DIR),
+                    env=ly_env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     text=True,

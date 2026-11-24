@@ -1178,6 +1178,7 @@
       mode: targetMode,
       force_ai: forceAi,
     });
+    if (state.videoId !== targetVideoId || !state.lyricsEnabled) return;
 
     if (!res.ok) {
       state.lyricsLoading = false;
@@ -1246,7 +1247,10 @@
   }
 
   async function activateLoadedTracks(videoId, mode) {
-    await engine.loadTracks(videoId, mode, (msg, pct) => setStatus(msg, false, pct));
+    await engine.loadTracks(videoId, mode, (msg, pct) => {
+      if (state.videoId === videoId) setStatus(msg, false, pct);
+    });
+    if (state.videoId !== videoId || state.mode !== mode) return;
     state.active = true;
     state.busy = false;
     attachVideoSync();
@@ -1334,6 +1338,7 @@
         video_id: targetVideoId,
         mode: targetMode,
       });
+      if (state.videoId !== targetVideoId || state.mode !== targetMode) return;
 
       if (!res.ok) {
         throw new Error(res.error || (res.data && res.data.detail) || "未能連線伺服器");

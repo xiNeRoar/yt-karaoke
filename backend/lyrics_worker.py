@@ -646,8 +646,14 @@ def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], 
     import yt_dlp
 
     url = f"https://www.youtube.com/watch?v={video_id}"
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        print(f"[Lyrics] YouTube subtitle probe skipped ({video_id}): {str(exc)[:140]}", flush=True)
+        return None, "", video_id, 0.0, ""
+    if not isinstance(info, dict):
+        return None, "", video_id, 0.0, ""
 
     title = info.get("title") or video_id
     duration = float(info.get("duration") or 0.0)
@@ -1285,13 +1291,28 @@ def align_official_lyrics_with_stable_ts(
         else:
             raise
 
+    def _run_live_safe() -> list[dict]:
+        nonlocal model, used_dev
+        try:
+            return _live_section_anchored_align(
+                model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
+                use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
+            )
+        except Exception as e:
+            if used_dev == "cuda":
+                print(f"[Lyrics] Live-align CUDA fallback to CPU: {e}", file=sys.stderr, flush=True)
+                used_dev = "cpu"
+                model = _load("cpu")
+                return _live_section_anchored_align(
+                    model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
+                    use_cuda=False, inst_path=inst_path, shazam_already_tried=shazam_already_tried,
+                )
+            raise
+
     # Only bypass silence-collapsed full-song align for genuine Mashups/Medleys (multiple songs!).
     # Full-song covers/lives ALWAYS try Silence-Collapsed Pass 1 first (~2.4s, 0% dropped lines!)
     if prefer_live:
-        live_lines = _live_section_anchored_align(
-            model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
-            use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
-        )
+        live_lines = _run_live_safe()
         if len(live_lines) >= 4:
             return live_lines, used_dev, True
 
@@ -1329,10 +1350,7 @@ def align_official_lyrics_with_stable_ts(
     needs_live, reason = _alignment_needs_live_rematch(aligned, comp_dur, np.array([]), step_sec)
     if needs_live:
         print(f"[Lyrics] Detected non-standard live/abridged structure ({reason}); engaging section-anchored live alignment...", flush=True)
-        live_lines = _live_section_anchored_align(
-            model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
-            use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
-        )
+        live_lines = _run_live_safe()
         if len(live_lines) >= 4:
             return live_lines, used_dev, True
 

@@ -103,9 +103,6 @@ class CloudSyncedLogger:
                 if res.returncode == 0:
                     self._last_sync_ts = time.time()
                     self._dirty = False
-                    # If local buffer > 512 KB, truncate it after confirmed cloud sync so local disk stays tiny
-                    if self.log_file.stat().st_size > 524_288:
-                        self.log_file.write_text("", encoding="utf-8")
                     return True
             except Exception:
                 pass

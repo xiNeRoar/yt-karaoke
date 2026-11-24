@@ -14,6 +14,7 @@ import gc
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -49,6 +50,25 @@ def find_ffmpeg_dir() -> str | None:
         for match in root.rglob("ffmpeg.exe"):
             return str(match.parent)
     return None
+
+
+def friendly_error_message(exc: Exception) -> str:
+    """Convert raw yt-dlp / PyTorch / OS exceptions into clean user-facing Cantonese messages."""
+    raw = str(exc or "").strip()
+    low = raw.lower()
+    if any(k in low for k in ("sign in to confirm", "not a bot", "use --cookies")):
+        return "此影片需要 YouTube 驗證，暫時無法處理（請稍後再試或轉唱其他版本）"
+    if "age" in low and ("confirm" in low or "restrict" in low or "sign in" in low):
+        return "此影片有年齡限制，暫時無法處理"
+    if any(k in low for k in ("video unavailable", "private video", "members-only", "copyright")):
+        return "此影片無法讀取或已被設為私人／受地區限制"
+    if "live" in low and ("唔支援" in raw or "stream" in low):
+        return "唔支援直播影片，請揀選一般 MV 或歌曲"
+    if "超過 15 分鐘" in raw or "搵唔到 ffmpeg" in low or "ai 輸出音軌不完整" in low:
+        return raw
+    if "out of memory" in low:
+        return "伺服器記憶體暫時緊張，請稍後再試"
+    return "暫時無法處理此影片，請稍後再試"
 
 
 def write_status(status_file: Path, payload: dict) -> None:
@@ -119,6 +139,14 @@ def main() -> int:
                     pct = int(8 + ratio * 18)
                     update(progress=pct, stage_text=f"下載音訊中... {int(ratio * 100)}%")
 
+        def check_video_limits(info_dict: dict, *, incomplete: bool = False):
+            if info_dict.get("is_live"):
+                return "唔支援直播影片，請揀選一般 MV 或歌曲。"
+            dur = float(info_dict.get("duration") or 0.0)
+            if dur > 900:
+                return f"影片長度超過 15 分鐘（{int(dur // 60)} 分鐘），為保護磁碟同資源已暫停處理。"
+            return None
+
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
@@ -126,6 +154,7 @@ def main() -> int:
             "quiet": True,
             "no_warnings": True,
             "ffmpeg_location": ffmpeg_dir,
+            "match_filter": check_video_limits,
             "progress_hooks": [dl_hook],
             "postprocessors": [
                 {
@@ -137,16 +166,16 @@ def main() -> int:
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # First inspect metadata without downloading to block 10-hour streams / oversized videos (> 15 min)
-            probe = ydl.extract_info(args.url, download=False)
-            duration = float(probe.get("duration") or 0.0)
-            if probe.get("is_live"):
+            # Single YouTube request (halves rate-limit/bot-check exposure!) with pre-download limit guard
+            info = ydl.extract_info(args.url, download=True)
+            if not info:
+                raise RuntimeError("無法讀取影片資料。")
+            duration = float(info.get("duration") or 0.0)
+            if info.get("is_live"):
                 raise RuntimeError("唔支援直播影片，請揀選一般 MV 或歌曲。")
             if duration > 900:
                 raise RuntimeError(f"影片長度超過 15 分鐘（{int(duration // 60)} 分鐘），為保護磁碟同資源已暫停處理。")
-            info = ydl.extract_info(args.url, download=True)
             title = info.get("title") or args.video_id
-            duration = float(info.get("duration") or duration)
 
         wav_path = work_dir / "source.wav"
         if not wav_path.exists():
@@ -407,10 +436,11 @@ def main() -> int:
         )
         return 0
     except Exception as exc:
+        clean_msg = friendly_error_message(exc)
         update(
             status="error",
-            error=str(exc),
-            stage_text=f"處理失敗：{exc}",
+            error=clean_msg,
+            stage_text=f"處理失敗：{clean_msg}",
         )
         print(f"[Worker Error] {exc}", file=sys.stderr, flush=True)
         return 1
