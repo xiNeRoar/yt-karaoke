@@ -1039,7 +1039,10 @@
     let nextUpcomingIdx = -1;
 
     for (let i = 0; i < lines.length; i++) {
-      if (now >= lines[i].start && now <= lines[i].end + 0.15) {
+      // Smooth KTV hold: keep finished line comfortably lit for 0.45s (never overlapping next line's start)
+      const nextStart = i + 1 < lines.length ? lines[i + 1].start : lines[i].end + 1.0;
+      const holdUntil = Math.min(nextStart - 0.05, lines[i].end + 0.45);
+      if (now >= lines[i].start && now <= Math.max(lines[i].end, holdUntil)) {
         activeIdx = i;
         break;
       }

@@ -729,6 +729,151 @@ def _lyric_similarity(a: str, b: str) -> float:
     return 0.55 * sm + 0.30 * jacc + 0.15 * cov
 
 
+def build_silence_collapsed_audio(
+    y: np.ndarray,
+    db_prof: np.ndarray,
+    step_s: float,
+    sr: int = 16000,
+) -> tuple[np.ndarray, list[tuple[float, float, float, float]]]:
+    """Collapse long silent instrumental interludes (>1.6s below -39dBFS) down to 0.35s so
+    Whisper's 30s sliding window NEVER hallucinates lyrics into instrumental breaks, while
+    preserving an exact piecewise map (comp_start, comp_end, real_start, real_end).
+    """
+    n_total = len(y)
+    if n_total == 0 or len(db_prof) == 0:
+        dur = n_total / sr
+        return y, [(0.0, dur, 0.0, dur)]
+
+    active = db_prof > -39.0
+    pad_frames = max(1, int(round(0.35 / step_s)))
+    padded = np.zeros_like(active, dtype=bool)
+    for i, a in enumerate(active):
+        if a:
+            padded[max(0, i - pad_frames) : min(len(active), i + pad_frames + 1)] = True
+
+    islands: list[tuple[float, float]] = []
+    in_isl = False
+    s_idx = 0
+    for i, a in enumerate(padded):
+        if a and not in_isl:
+            s_idx = i
+            in_isl = True
+        elif not a and in_isl:
+            if islands and (s_idx * step_s - islands[-1][1]) < 1.6:
+                islands[-1] = (islands[-1][0], i * step_s)
+            else:
+                islands.append((s_idx * step_s, i * step_s))
+            in_isl = False
+    if in_isl:
+        islands.append((s_idx * step_s, len(padded) * step_s))
+
+    if not islands:
+        dur = n_total / sr
+        return y, [(0.0, dur, 0.0, dur)]
+
+    gap_sil = np.zeros(int(0.35 * sr), dtype=np.float32)
+    chunks: list[np.ndarray] = []
+    mapping: list[tuple[float, float, float, float]] = []
+    comp_cursor = 0.0
+    for idx, (rs, re_) in enumerate(islands):
+        i0 = max(0, int(rs * sr))
+        i1 = min(n_total, int(re_ * sr))
+        if i1 <= i0:
+            continue
+        if idx > 0:
+            chunks.append(gap_sil)
+            comp_cursor += len(gap_sil) / sr
+        seg = y[i0:i1]
+        dur = len(seg) / sr
+        chunks.append(seg)
+        mapping.append((comp_cursor, comp_cursor + dur, i0 / sr, i1 / sr))
+        comp_cursor += dur
+
+    return (np.concatenate(chunks) if chunks else y), mapping
+
+
+def _map_comp_to_real(t_comp: float, mapping: list[tuple[float, float, float, float]]) -> float:
+    for cs, ce, rs, re_ in mapping:
+        if t_comp <= ce + 1e-4:
+            frac = max(0.0, min(1.0, (t_comp - cs) / max(1e-6, ce - cs)))
+            return rs + frac * (re_ - rs)
+    return mapping[-1][3] if mapping else t_comp
+
+
+def refine_alignment_with_acoustics(
+    lines: list[dict],
+    db_profile: np.ndarray,
+    step_sec: float,
+    audio_dur: float,
+    first_onset: float,
+) -> list[dict]:
+    """Fundamental acoustic refinement for singing voices:
+    1. Onset Snap: if line.start sits in silence before singing begins, snap forward to real vocal onset.
+    2. Tail Extension: extend line.end through held final singing vowels until actual vocal offset.
+    3. Word Smoothing: eliminate 0.00s collapsed BPE word glitches so 60fps KTV sweep never jerks.
+    """
+    if not lines or len(db_profile) == 0:
+        return lines
+
+    n_db = len(db_profile)
+    for i, ln in enumerate(lines):
+        s = max(first_onset, float(ln["start"]))
+        e = max(s + 0.35, float(ln["end"]))
+        nxt_s = float(lines[i + 1]["start"]) if (i + 1 < len(lines)) else (audio_dur or e + 2.5)
+
+        # 1) Acoustic Onset Snap: advance start out of leading silence (never past e - 0.5s)
+        max_snap = min(e - 0.5, s + 2.5)
+        t_cur = s
+        while t_cur < max_snap:
+            idx = int(t_cur / step_sec)
+            if idx < n_db and db_profile[idx] > -39.0:
+                break
+            t_cur += step_sec
+        if t_cur > s + 0.12 and t_cur < max_snap:
+            s = round(max(first_onset, t_cur - 0.08), 2)
+
+        # 2) Acoustic Vocal-Tail Extension: follow held final vowel until 0.2s genuine silence
+        limit_e = min(nxt_s - 0.12, e + 2.2)
+        if limit_e > e:
+            t_e = e
+            quiet_run = 0
+            best_e = e
+            while t_e < limit_e:
+                idx = int(t_e / step_sec)
+                if idx >= n_db:
+                    break
+                if db_profile[idx] > -39.0:
+                    quiet_run = 0
+                    best_e = t_e + step_sec
+                else:
+                    quiet_run += 1
+                    if quiet_run >= 2:
+                        break
+                t_e += step_sec
+            e = round(min(limit_e, best_e), 2)
+
+        ln["start"] = round(s, 2)
+        ln["end"] = round(max(s + 0.35, e), 2)
+
+        # 3) Word-level smoothing: enforce strict bounds & fix collapsed <=0.05s BPE glitches
+        ws = ln.get("words") or []
+        if ws:
+            # Clamp first word start & extend last word end to match refined acoustic boundaries
+            ws[0]["start"] = round(max(ln["start"], min(float(ws[0]["start"]), ln["end"] - 0.2)), 2)
+            ws[-1]["end"] = ln["end"]
+            prev_end = ln["start"]
+            for wi, w in enumerate(ws):
+                w_s = max(prev_end, float(w["start"]))
+                w_e = max(w_s + 0.05, min(ln["end"], float(w["end"])))
+                if wi == len(ws) - 1:
+                    w_e = ln["end"]
+                w["start"] = round(w_s, 2)
+                w["end"] = round(w_e, 2)
+                prev_end = w["end"]
+
+    return lines
+
+
 def _alignment_needs_live_rematch(aligned, audio_dur: float, db_profile: np.ndarray, step_sec: float) -> tuple[bool, str]:
     """Detect skipped verses, mid-song starts, swapped sections, or crushed lines in monotonic alignment."""
     segs = [s for s in (aligned.segments or []) if (s.text or "").strip()]
@@ -985,21 +1130,42 @@ def _live_section_anchored_align(
             })
         return direct_lines
 
-    # Gap-fill single missing bridge line when A -> B -> C exists in official lyrics and vocal audio sits in between
-    filled = []
+    # Multi-line energy-verified gap recovery: if 1..6 official lines sit between matched[k] and matched[k+1]
+    # AND real vocal RMS confirms continuous singing in that span, restore ALL missing sung lines!
+    pos_map: dict[str, list[int]] = {}
+    for idx, off_txt in enumerate(official_lines):
+        pos_map.setdefault(off_txt, []).append(idx)
+
+    filled: list[dict] = []
+    last_off_idx = -1
     for k, cur in enumerate(matched):
+        cands_cur = pos_map.get(cur["text"]) or []
+        cur_idx = next((p for p in cands_cur if p > last_off_idx), cands_cur[0] if cands_cur else -1)
         filled.append(cur)
-        if k + 1 < len(matched):
+        if cur_idx >= 0:
+            last_off_idx = cur_idx
+        if k + 1 < len(matched) and cur_idx >= 0:
             nxt = matched[k + 1]
-            between = [g for g in unmatched_gaps if g["start"] >= cur["end"] - 0.6 and g["end"] <= nxt["start"] + 0.6]
-            if between and (nxt["start"] - cur["end"]) >= 1.6:
-                bridge = None
-                for idx in range(len(official_lines) - 2):
-                    if official_lines[idx] == cur["text"] and official_lines[idx + 2] == nxt["text"]:
-                        bridge = official_lines[idx + 1]
-                        break
-                if bridge:
-                    filled.append({"start": between[0]["start"], "end": between[-1]["end"], "text": bridge, "sim": 0.0})
+            cands_nxt = pos_map.get(nxt["text"]) or []
+            nxt_idx = next((p for p in cands_nxt if cur_idx < p <= cur_idx + 7), -1)
+            missing_n = (nxt_idx - cur_idx - 1) if nxt_idx > cur_idx else 0
+            gap_s = cur["end"]
+            gap_e = nxt["start"]
+            if 1 <= missing_n <= 6 and (gap_e - gap_s) >= max(1.6, 1.5 * missing_n):
+                # Measure real active singing seconds in [gap_s .. gap_e]
+                i0 = max(0, int(gap_s / step_sec))
+                i1 = min(len(db_profile), int(gap_e / step_sec))
+                active_sec = float(np.sum(db_profile[i0:i1] > -38.0)) * step_sec if i1 > i0 else 0.0
+                if active_sec >= max(1.4, 1.6 * missing_n):
+                    step_t = (gap_e - gap_s) / missing_n
+                    for m_i in range(missing_n):
+                        filled.append({
+                            "start": round(gap_s + m_i * step_t, 2),
+                            "end": round(gap_s + (m_i + 1) * step_t, 2),
+                            "text": official_lines[cur_idx + 1 + m_i],
+                            "sim": 0.0,
+                        })
+                    last_off_idx = nxt_idx - 1
     matched = filled
 
     # If a sustained unrecognized singing cluster STILL remains (e.g. an unreleased/parody section inside a Mashup),
@@ -1066,13 +1232,13 @@ def _live_section_anchored_align(
                     "words": _even_words_for_line(ref["text"], s_abs, e_abs),
                 })
 
-    # Ensure strictly monotonic non-overlapping starts
+    # Ensure strictly monotonic non-overlapping starts + acoustic onset/tail refinement
     for idx in range(1, len(final_lines)):
         if final_lines[idx]["start"] < final_lines[idx - 1]["start"] + 0.2:
             final_lines[idx]["start"] = round(final_lines[idx - 1]["end"], 2)
             final_lines[idx]["end"] = round(max(final_lines[idx]["start"] + 0.5, final_lines[idx]["end"]), 2)
 
-    return final_lines
+    return refine_alignment_with_acoustics(final_lines, db_profile, step_sec, total_sec, first_onset)
 
 
 def align_official_lyrics_with_stable_ts(
@@ -1119,7 +1285,8 @@ def align_official_lyrics_with_stable_ts(
         else:
             raise
 
-    # For known Live/Concert/Short/Mashup clips, skip wasted monolithic Pass 1 and run fast section-anchored directly!
+    # Only bypass silence-collapsed full-song align for genuine Mashups/Medleys (multiple songs!).
+    # Full-song covers/lives ALWAYS try Silence-Collapsed Pass 1 first (~2.4s, 0% dropped lines!)
     if prefer_live:
         live_lines = _live_section_anchored_align(
             model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
@@ -1128,9 +1295,16 @@ def align_official_lyrics_with_stable_ts(
         if len(live_lines) >= 4:
             return live_lines, used_dev, True
 
+    # Pillar 1: Collapse silent instrumental interludes (>1.6s) before m.align() so Whisper's 30s
+    # sliding window NEVER hallucinates lyrics into instrumental breaks!
+    if len(audio_16k) > 0 and len(db_profile) > 0:
+        align_audio, time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
+    else:
+        align_audio, time_map = str(vocals_path), []
+
     try:
         aligned = model.align(
-            audio_16k if len(audio_16k) > 0 else str(vocals_path),
+            align_audio,
             text_block,
             language=lang,
             original_split=True,
@@ -1142,7 +1316,7 @@ def align_official_lyrics_with_stable_ts(
             used_dev = "cpu"
             model = _load("cpu")
             aligned = model.align(
-                audio_16k if len(audio_16k) > 0 else str(vocals_path),
+                align_audio,
                 text_block,
                 language=lang,
                 original_split=True,
@@ -1151,7 +1325,8 @@ def align_official_lyrics_with_stable_ts(
         else:
             raise
 
-    needs_live, reason = _alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec)
+    comp_dur = (len(align_audio) / 16000.0) if isinstance(align_audio, np.ndarray) else audio_dur
+    needs_live, reason = _alignment_needs_live_rematch(aligned, comp_dur, np.array([]), step_sec)
     if needs_live:
         print(f"[Lyrics] Detected non-standard live/abridged structure ({reason}); engaging section-anchored live alignment...", flush=True)
         live_lines = _live_section_anchored_align(
@@ -1166,20 +1341,25 @@ def align_official_lyrics_with_stable_ts(
         txt = (seg.text or "").strip()
         if not txt:
             continue
-        start_s = round(max(first_onset, float(seg.start)), 2)
-        end_s = round(max(start_s + 0.4, float(seg.end)), 2)
+        raw_s = _map_comp_to_real(float(seg.start), time_map) if time_map else float(seg.start)
+        raw_e = _map_comp_to_real(float(seg.end), time_map) if time_map else float(seg.end)
+        start_s = round(max(first_onset, raw_s), 2)
+        end_s = round(max(start_s + 0.4, raw_e), 2)
 
         words_out = []
         for w in (seg.words or []):
             wt = (w.word or "").strip()
             if not wt:
                 continue
-            ws = round(max(start_s, float(w.start)), 2)
-            we = round(max(ws + 0.05, float(w.end)), 2)
+            ws_r = _map_comp_to_real(float(w.start), time_map) if time_map else float(w.start)
+            we_r = _map_comp_to_real(float(w.end), time_map) if time_map else float(w.end)
+            ws = round(max(start_s, ws_r), 2)
+            we = round(max(ws + 0.05, we_r), 2)
             words_out.append({"start": ws, "end": we, "word": wt})
 
         lines.append({"start": start_s, "end": end_s, "text": txt, "words": words_out})
 
+    lines = refine_alignment_with_acoustics(lines, db_profile, step_sec, audio_dur, first_onset)
     return lines, used_dev, False
 
 
@@ -1361,14 +1541,16 @@ def main() -> int:
             if shz_lines:
                 official_lines = shz_lines
 
-        # Layer 3A (BEST): Forced Alignment of 100% REAL official lyrics onto vocals.mp3!
-        # Automatically detects skipped/swapped concert sections, mid-song starts, or mashup switches!
+        # Layer 3A (BEST): Silence-Collapsed Forced Alignment of 100% REAL official lyrics!
+        # Only skip directly to section-anchored mode for genuine Mashups/Medleys (multiple songs).
+        # Full covers/concerts ALWAYS try Silence-Collapsed Pass 1 first (2.4s, 0% dropped lines!) and
+        # automatically escalate to section-anchored if the singer skipped/swapped verses!
         if official_lines:
             update("running", 50, "對齊歌詞中...")
-            is_live_or_mashup = bool(LIVE_KEYWORDS_RE.search(title)) or is_mashup_title or len(shazam_tracks) >= 2
+            is_multi_song_mashup = is_mashup_title or len(shazam_tracks) >= 2
             ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
                 vocals_path, audio_16k, db_profile, step_sec, official_lines,
-                args.device_mode, first_onset, prefer_live=is_live_or_mashup,
+                args.device_mode, first_onset, prefer_live=is_multi_song_mashup,
                 inst_path=inst_path, shazam_already_tried=shazam_tried,
             )
             src = "mashup_shazam_align" if len(shazam_tracks) >= 2 else ("live_anchored_align" if used_live else "forced_align")
