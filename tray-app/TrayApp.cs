@@ -1035,6 +1035,7 @@ namespace YtKaraokeTray
             {
                 @"C:\Program Files\Mozilla Firefox\firefox.exe",
                 @"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\WindowsApps\firefox.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Mozilla Firefox\firefox.exe")
             };
             foreach (var c in candidates)
