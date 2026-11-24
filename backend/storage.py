@@ -164,7 +164,7 @@ class GoogleDriveStorage:
                 [exe, "cat", remote_file],
                 text=True,
                 encoding="utf-8",
-                timeout=12,
+                timeout=45,
                 creationflags=CREATE_NO_WINDOW,
             )
             return json.loads(out)

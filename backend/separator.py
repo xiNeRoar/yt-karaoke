@@ -92,6 +92,8 @@ class KaraokeSeparatorManager:
         self._active_procs: Dict[str, subprocess.Popen] = {}
         self._queued_keys: set[str] = set()
         self._rate_history: Dict[str, list[float]] = {}
+        self._lyrics_mem_cache: Dict[str, dict] = {}
+        self._lyrics_gdrive_missing: set[str] = set()
 
         self.cuda_available, self.gpu_name, _, _ = query_nvidia_gpu()
         env_mode = os.environ.get("KARAOKE_DEVICE", "auto").strip().lower()
@@ -658,26 +660,50 @@ class KaraokeSeparatorManager:
         return JOBS_DIR / f"lyrics__{video_id}.json"
 
     def get_lyrics(self, video_id: str, mode: str = "pure") -> dict:
+        # 1) Ultra-fast in-memory cache (~4KB/song, 0 MB local disk, <1ms response!)
+        with self._lock:
+            mem = self._lyrics_mem_cache.get(video_id)
+            if mem and mem.get("lines"):
+                return {"status": "ready", "progress": 100, "stage_text": mem.get("source_label", "歌詞已就緒"), **mem}
+            key = f"lyrics__{video_id}"
+            proc = self._active_procs.get(key)
+            is_running = proc is not None and proc.poll() is None
+
+        # 2) If worker is currently running, return status immediately without hitting Google Drive!
+        sf = self._lyrics_status_file(video_id)
+        if is_running and sf.exists():
+            try:
+                return json.loads(sf.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # 3) Check local temp lyrics file if present
         lf = self._lyrics_file(video_id)
         if lf.exists():
             try:
                 data = json.loads(lf.read_text(encoding="utf-8"))
-                return {"status": "ready", "progress": 100, "stage_text": data.get("source_label", "歌詞已就緒"), **data}
+                if data.get("lines"):
+                    with self._lock:
+                        self._lyrics_mem_cache[video_id] = data
+                    return {"status": "ready", "progress": 100, "stage_text": data.get("source_label", "歌詞已就緒"), **data}
             except Exception:
                 pass
 
-        # Also check Google Drive if stored there
-        if self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
+        # 4) Fetch once from Google Drive (skip if already known absent this session)
+        if (
+            not is_running
+            and video_id not in self._lyrics_gdrive_missing
+            and self.gdrive.is_configured()
+            and self.gdrive.has_song(video_id, mode)
+        ):
             remote_data = self.gdrive.read_json(video_id, mode, "lyrics.json")
             if remote_data and remote_data.get("lines"):
-                lf.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    lf.write_text(json.dumps(remote_data, ensure_ascii=False), encoding="utf-8")
-                except Exception:
-                    pass
+                with self._lock:
+                    self._lyrics_mem_cache[video_id] = remote_data
                 return {"status": "ready", "progress": 100, "stage_text": remote_data.get("source_label", "歌詞已就緒"), **remote_data}
+            else:
+                self._lyrics_gdrive_missing.add(video_id)
 
-        sf = self._lyrics_status_file(video_id)
         if sf.exists():
             try:
                 return json.loads(sf.read_text(encoding="utf-8"))
@@ -691,6 +717,10 @@ class KaraokeSeparatorManager:
             existing = self.get_lyrics(video_id, mode)
             if existing.get("status") == "ready":
                 return existing
+        else:
+            with self._lock:
+                self._lyrics_mem_cache.pop(video_id, None)
+                self._lyrics_gdrive_missing.discard(video_id)
 
         key = f"lyrics__{video_id}"
         with self._lock:
@@ -775,16 +805,28 @@ class KaraokeSeparatorManager:
                         self._active_procs.pop(key, None)
 
                 if proc.returncode == 0 and out_file.exists():
-                    # Sync tiny lyrics.json (~4KB) to Google Drive and remove local copy when in cloud mode
+                    # Load into RAM cache immediately so Extension gets lyrics in <1ms!
+                    try:
+                        data = json.loads(out_file.read_text(encoding="utf-8"))
+                        if data.get("lines"):
+                            with self._lock:
+                                self._lyrics_mem_cache[video_id] = data
+                                self._lyrics_gdrive_missing.discard(video_id)
+                    except Exception:
+                        pass
+
+                    # Sync tiny lyrics.json (~4KB) to Google Drive in background and remove local copy (0 MB disk!)
                     if self.storage_mode == "gdrive" and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
-                        if self.gdrive.upload_single_file(video_id, mode, out_file):
-                            try:
-                                out_file.unlink()
-                                parent = self.cache_dir / video_id
-                                if parent.exists() and not any(parent.iterdir()):
-                                    parent.rmdir()
-                            except Exception:
-                                pass
+                        def _bg_upload_lyrics(vid=video_id, m=mode, path=out_file):
+                            if self.gdrive.upload_single_file(vid, m, path):
+                                try:
+                                    path.unlink()
+                                    parent = self.cache_dir / vid
+                                    if parent.exists() and not any(parent.iterdir()):
+                                        parent.rmdir()
+                                except Exception:
+                                    pass
+                        threading.Thread(target=_bg_upload_lyrics, daemon=True, name=f"ul-lyrics-{video_id}").start()
                     self.log.info("Lyrics", f"Ready for {video_id} (force_ai={force_ai})")
                     self.log.trigger_sync_async()
                 elif proc.returncode != 0:
