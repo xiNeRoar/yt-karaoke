@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install curl, unzip, ca-certificates and rclone (tiny static binary for Google Drive streaming)
+# Install latest rclone binary, then strip build helpers
 RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates \
     && curl -fsSL https://rclone.org/install.sh | bash \
     && apt-get purge -y curl unzip \
@@ -13,6 +13,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+
+# Hardened non-root container runtime (Zero-Trust best practice)
+RUN groupadd -r appuser && useradd -r -g appuser -m appuser \
+    && mkdir -p /app/data /home/appuser/.config/rclone \
+    && chown -R appuser:appuser /app /home/appuser
+
+USER appuser
 
 ENV PORT=8080
 EXPOSE 8080

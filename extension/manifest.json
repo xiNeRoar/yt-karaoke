@@ -1,14 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "YouTube AI 唱K 去人聲 (BS-RoFormer)",
-  "version": "1.0.0",
-  "description": "用本機 GPU AI 模型（BS-RoFormer / Mel-Band RoFormer）精準去除 YouTube MV 人聲，支援導唱音量滑桿及即時升降 Key。",
+  "name": "YouTube AI 唱K 去人聲",
+  "version": "1.1.0",
+  "description": "一鍵去除 YouTube 歌曲人聲，支援導唱音量滑桿、即時升降 Key 及 KTV 同步歌詞。",
   "permissions": [
     "storage"
   ],
   "host_permissions": [
-    "http://127.0.0.1:18765/*",
-    "http://localhost:18765/*",
+    "https://karaoke.xinehub.com/*",
     "https://www.youtube.com/*"
   ],
   "background": {

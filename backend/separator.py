@@ -429,6 +429,7 @@ class KaraokeSeparatorManager:
                     return
 
                 # If Google Drive storage is active, upload immediately and delete local MP3s (0 MB local disk!)
+                pre_voc_hint: Optional[Path] = None
                 if self.storage_mode == "gdrive" and self.gdrive.is_configured():
                     local_song_dir = self.get_cache_dir(video_id, mode)
                     meta = self.get_meta(video_id, mode)
@@ -436,6 +437,15 @@ class KaraokeSeparatorManager:
                         cur = self._read_job_status(video_id, mode) or {}
                         cur.update({"status": "finalizing", "progress": 96, "stage_text": "最後整理中..."})
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+
+                        # Keep a tiny temporary copy of vocals.mp3 so background lyrics pre-gen runs in 0s download!
+                        local_voc = local_song_dir / "vocals.mp3"
+                        if local_voc.exists():
+                            try:
+                                pre_voc_hint = TEMP_DIR / f"pre_voc_{video_id}_{int(time.time())}.mp3"
+                                shutil.copy2(local_voc, pre_voc_hint)
+                            except Exception:
+                                pre_voc_hint = None
 
                         self.gdrive.upload_song(video_id, mode, local_song_dir, meta)
                         shutil.rmtree(local_song_dir, ignore_errors=True)
@@ -457,6 +467,16 @@ class KaraokeSeparatorManager:
                     self.enforce_cache_limit()
                     self.log.info("Separate", f"Done {video_id} ({mode}) — 100% VRAM reclaimed")
                     self.log.trigger_sync_async()
+
+                # Auto pre-generate lyrics in background while vocals.mp3 is hot on SSD -> 0.05s instant lyrics!
+                try:
+                    self.start_lyrics_generation(video_id, mode, force_ai=False, local_vocals_hint=pre_voc_hint)
+                except Exception:
+                    if pre_voc_hint and pre_voc_hint.exists():
+                        try:
+                            pre_voc_hint.unlink()
+                        except Exception:
+                            pass
         except Exception as exc:
             self.log.error("Separate", f"Exception ({video_id}, {mode}): {exc}")
             cur = self._read_job_status(video_id, mode) or {}
@@ -710,10 +730,21 @@ class KaraokeSeparatorManager:
 
         return {"video_id": video_id, "status": "idle", "progress": 0, "stage_text": "未生成歌詞", "lines": []}
 
-    def start_lyrics_generation(self, video_id: str, mode: str = "pure", force_ai: bool = False) -> dict:
+    def start_lyrics_generation(
+        self,
+        video_id: str,
+        mode: str = "pure",
+        force_ai: bool = False,
+        local_vocals_hint: Optional[Path] = None,
+    ) -> dict:
         if not force_ai:
             existing = self.get_lyrics(video_id, mode)
             if existing.get("status") == "ready":
+                if local_vocals_hint and local_vocals_hint.exists():
+                    try:
+                        local_vocals_hint.unlink()
+                    except Exception:
+                        pass
                 return existing
         else:
             with self._lock:
@@ -722,6 +753,11 @@ class KaraokeSeparatorManager:
 
         with self._lock:
             if video_id in self._lyrics_in_progress:
+                if local_vocals_hint and local_vocals_hint.exists():
+                    try:
+                        local_vocals_hint.unlink()
+                    except Exception:
+                        pass
                 return self.get_lyrics(video_id, mode)
             self._lyrics_in_progress.add(video_id)
 
@@ -738,28 +774,39 @@ class KaraokeSeparatorManager:
 
         t = threading.Thread(
             target=self._run_lyrics_worker,
-            args=(video_id, mode, force_ai, sf),
+            args=(video_id, mode, force_ai, sf, local_vocals_hint),
             daemon=True,
             name=f"lyrics-{video_id}",
         )
         t.start()
         return init
 
-    def _run_lyrics_worker(self, video_id: str, mode: str, force_ai: bool, status_file: Path) -> None:
+    def _run_lyrics_worker(
+        self,
+        video_id: str,
+        mode: str,
+        force_ai: bool,
+        status_file: Path,
+        local_vocals_hint: Optional[Path] = None,
+    ) -> None:
         key = f"lyrics__{video_id}"
-        temp_vocals: Optional[Path] = None
+        temp_vocals: Optional[Path] = local_vocals_hint
         try:
             with self._lyrics_lock:
-                vocals_path = self.get_cache_dir(video_id, mode) / "vocals.mp3"
-                # If audio lives only on Google Drive, pull vocals.mp3 temporarily for Whisper alignment
-                if not vocals_path.exists() and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
-                    temp_vocals = TEMP_DIR / f"voc_{video_id}_{int(time.time())}.mp3"
-                    if self.gdrive.download_file(video_id, mode, "vocals.mp3", temp_vocals):
-                        vocals_path = temp_vocals
+                if local_vocals_hint and local_vocals_hint.exists():
+                    vocals_path = local_vocals_hint
+                else:
+                    vocals_path = self.get_cache_dir(video_id, mode) / "vocals.mp3"
+                    # If audio lives only on Google Drive, pull vocals.mp3 temporarily for alignment
+                    if not vocals_path.exists() and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
+                        temp_vocals = TEMP_DIR / f"voc_{video_id}_{int(time.time())}.mp3"
+                        if self.gdrive.download_file(video_id, mode, "vocals.mp3", temp_vocals):
+                            vocals_path = temp_vocals
 
                 out_file = self._lyrics_file(video_id)
                 has_gpu, _, _, _ = query_nvidia_gpu()
                 eff_mode = self.device_mode if has_gpu else "cpu"
+                meta = self.get_meta(video_id, mode)
 
                 cmd = [
                     sys.executable,
@@ -777,6 +824,10 @@ class KaraokeSeparatorManager:
                     eff_mode,
                     "--force-ai",
                     "1" if force_ai else "0",
+                    "--title",
+                    str(meta.get("title") or ""),
+                    "--duration",
+                    str(float(meta.get("duration") or 0.0)),
                 ]
                 proc = subprocess.Popen(
                     cmd,

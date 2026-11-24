@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const API_BASE = "http://127.0.0.1:18765";
+  const API_BASE = "https://karaoke.xinehub.com";
   const CLIENT_ID = `yt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 
   // Trusted-Types-safe inline SVG icon factory (minimalist Lucide stroke icons)
@@ -69,10 +69,10 @@
   }
 
   async function fetchAudioArrayBuffer(path) {
-    // 1) Try direct localhost fetch first (fastest, zero serialization)
+    // 1) Direct HTTPS fetch (zero Base64 overhead, fast native browser streaming!)
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 6000);
+      const timer = setTimeout(() => ctrl.abort(), 30000);
       const res = await fetch(`${API_BASE}${path}`, { signal: ctrl.signal });
       clearTimeout(timer);
       if (res.ok) {

@@ -1,4 +1,4 @@
-const API_BASE = "http://127.0.0.1:18765";
+const API_BASE = "https://karaoke.xinehub.com";
 let lastReloadNonce = null;
 
 // Right after auto-reload finishes, gently refresh open YouTube watch tabs so new content.js takes effect
@@ -26,7 +26,7 @@ function checkReloadNonce(nonce) {
   }
 }
 
-// Gentle background watcher so clicking "Auto-Update Extension" in Desktop Tray App works within 3 seconds
+// Gentle background health check (no-op on public gateway unless reload nonce increments)
 setInterval(async () => {
   try {
     const res = await fetch(`${API_BASE}/api/health`);
@@ -35,7 +35,7 @@ setInterval(async () => {
       checkReloadNonce(data.extension_reload_nonce);
     }
   } catch (_e) {}
-}, 3000);
+}, 30000);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) return false;
