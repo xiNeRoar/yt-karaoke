@@ -928,6 +928,91 @@ def _map_comp_to_real(t_comp: float, mapping: list[tuple[float, float, float, fl
     return mapping[-1][3] if mapping else t_comp
 
 
+def _smooth_bunched_words(
+    ws: list[dict],
+    line_start: float,
+    line_end: float,
+    db_profile: np.ndarray,
+    step_sec: float,
+) -> list[dict]:
+    """Eliminate forced-aligner word-bunching glitches (e.g. 6 chars slammed into 0.30s followed by a 2.8s freeze).
+
+    Detects any contiguous run of >=2 words whose pace is physically impossible for singing (<=0.09s/char)
+    adjacent to an unused time gap inside the same line, and redistributes those words across the actual
+    available singing envelope [span_start, span_end] weighted by character count + vocal RMS energy.
+    """
+    if not ws:
+        return ws
+
+    n = len(ws)
+    # Pass 1: Normalize bounds monotonically WITHOUT forcing 0.05s staircase yet
+    ws[0]["start"] = round(max(line_start, min(float(ws[0]["start"]), line_end - 0.15)), 2)
+    ws[-1]["end"] = round(line_end, 2)
+    prev_e = line_start
+    for idx, w in enumerate(ws):
+        s_i = max(prev_e, min(line_end, float(w["start"])))
+        e_i = max(s_i, min(line_end, float(w["end"])))
+        if idx == n - 1:
+            e_i = line_end
+        w["start"] = round(s_i, 2)
+        w["end"] = round(e_i, 2)
+        prev_e = e_i
+
+    def _char_w(w_obj: dict) -> int:
+        return max(1, len(re.sub(r"\s+", "", str(w_obj.get("word") or ""))))
+
+    # Pass 2: Find bunched runs (per-word <= 0.13s and run average <= 0.09s/char) & redistribute across real span
+    i = 0
+    while i < n:
+        dur_i = ws[i]["end"] - ws[i]["start"]
+        if dur_i / _char_w(ws[i]) <= 0.13:
+            j = i + 1
+            while j < n and (ws[j]["end"] - ws[j]["start"]) / _char_w(ws[j]) <= 0.13 and (ws[j]["start"] - ws[j - 1]["end"]) <= 0.15:
+                j += 1
+            run_len = j - i
+            if run_len >= 2:
+                run_chars = sum(_char_w(ws[k]) for k in range(i, j))
+                run_dur = ws[j - 1]["end"] - ws[i]["start"]
+                if run_dur / max(1, run_chars) <= 0.095:
+                    span_s = ws[i - 1]["end"] if i > 0 else line_start
+                    span_e = ws[j]["start"] if j < n else line_end
+                    span_dur = span_e - span_s
+                    if span_dur > max(run_dur * 1.5, 0.35):
+                        # Refine [span_s, span_e] to active vocal envelope if db_profile is available
+                        act_s, act_e = span_s, span_e
+                        if len(db_profile) > 0 and step_sec > 0:
+                            f0 = max(0, int(span_s / step_sec))
+                            f1 = min(len(db_profile), max(f0 + 1, int(span_e / step_sec)))
+                            active_frames = [f for f in range(f0, f1) if db_profile[f] > -41.0]
+                            if len(active_frames) >= 3:
+                                cand_s = max(span_s, active_frames[0] * step_sec)
+                                cand_e = min(span_e, (active_frames[-1] + 1) * step_sec)
+                                if cand_e - cand_s >= max(0.35, span_dur * 0.45):
+                                    act_s, act_e = cand_s, cand_e
+                        total_cw = max(1, run_chars)
+                        acc = 0
+                        for k in range(i, j):
+                            cw = _char_w(ws[k])
+                            ws[k]["start"] = round(act_s + (act_e - act_s) * (acc / total_cw), 2)
+                            acc += cw
+                            ws[k]["end"] = round(act_s + (act_e - act_s) * (acc / total_cw), 2)
+            i = j
+        else:
+            i += 1
+
+    # Pass 3: Final strict monotonic >=0.05s clamp
+    prev_e = line_start
+    for idx, w in enumerate(ws):
+        w_s = max(prev_e, float(w["start"]))
+        w_e = max(w_s + 0.05, min(line_end, float(w["end"])))
+        if idx == n - 1:
+            w_e = max(w_s + 0.05, line_end)
+        w["start"] = round(w_s, 2)
+        w["end"] = round(w_e, 2)
+        prev_e = w["end"]
+    return ws
+
+
 def refine_alignment_with_acoustics(
     lines: list[dict],
     db_profile: np.ndarray,
@@ -983,21 +1068,10 @@ def refine_alignment_with_acoustics(
         ln["start"] = round(s, 2)
         ln["end"] = round(max(s + 0.35, e), 2)
 
-        # 3) Word-level smoothing: enforce strict bounds & fix collapsed <=0.05s BPE glitches
+        # 3) Word-level smoothing: eliminate bunched/collapsed word glitches so 60fps KTV sweep never shoots ahead
         ws = ln.get("words") or []
         if ws:
-            # Clamp first word start & extend last word end to match refined acoustic boundaries
-            ws[0]["start"] = round(max(ln["start"], min(float(ws[0]["start"]), ln["end"] - 0.2)), 2)
-            ws[-1]["end"] = ln["end"]
-            prev_end = ln["start"]
-            for wi, w in enumerate(ws):
-                w_s = max(prev_end, float(w["start"]))
-                w_e = max(w_s + 0.05, min(ln["end"], float(w["end"])))
-                if wi == len(ws) - 1:
-                    w_e = ln["end"]
-                w["start"] = round(w_s, 2)
-                w["end"] = round(w_e, 2)
-                prev_end = w["end"]
+            ln["words"] = _smooth_bunched_words(ws, ln["start"], ln["end"], db_profile, step_sec)
 
     return lines
 

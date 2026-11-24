@@ -126,6 +126,32 @@ def test_generic_title_decomposition() -> None:
     print("[PASS] Generic zero-blacklist title decomposition")
 
 
+def test_word_bunching_deglitcher() -> None:
+    import numpy as np
+    import lyrics_worker as lw
+
+    # Exact real-world failure captured on Panther Chan《念》L21 (7 chars slammed into 0.42s + 2.82s dead freeze!)
+    bunched = [
+        {"word": "不", "start": 142.53, "end": 142.65},
+        {"word": "需", "start": 142.65, "end": 142.70},
+        {"word": "急", "start": 142.70, "end": 142.75},
+        {"word": "切", "start": 142.75, "end": 142.80},
+        {"word": "一", "start": 142.80, "end": 142.85},
+        {"word": "息", "start": 142.85, "end": 142.90},
+        {"word": "間", "start": 142.90, "end": 142.95},
+        {"word": "變", "start": 145.77, "end": 146.55},
+        {"word": "好", "start": 146.55, "end": 149.15},
+    ]
+    fixed = lw._smooth_bunched_words(bunched, 142.53, 149.15, np.array([]), 0.1)
+    # Check all 7 previously-bunched chars now span smoothly up to 145.77s (~0.46s/char, zero dead freeze!)
+    for w in fixed[:7]:
+        dur = w["end"] - w["start"]
+        assert dur >= 0.35, f"Word still bunched: {w}"
+    assert abs(fixed[6]["end"] - 145.77) < 0.05, f"Gap before 變 not closed: {fixed[6]}"
+    assert fixed[7]["start"] == 145.77 and fixed[8]["end"] == 149.15
+    print(f"[PASS] Word-bunching deglitcher (7 chars smoothed from 0.05s -> {fixed[1]['end']-fixed[1]['start']:.2f}s/char)")
+
+
 def test_sidecar_watcher_cp1252_safety() -> None:
     if not WATCHER.exists():
         print("[SKIP] watcher.py not installed")
@@ -161,6 +187,7 @@ def main() -> int:
     test_atomic_json_concurrency()
     test_worker_and_separator_invariants()
     test_generic_title_decomposition()
+    test_word_bunching_deglitcher()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()
     print("\nALL REGRESSION TESTS PASSED!")
