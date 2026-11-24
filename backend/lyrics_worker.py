@@ -174,6 +174,27 @@ def clean_search_title(title: str) -> str:
     return t or title
 
 
+def _split_long_official_line(line: str) -> list[str]:
+    """Split LRCLIB/NetEase compound multi-phrase CJK lines (e.g. '讓我對這世界好奇 讓我信自己的真理')
+    on spaces/commas into natural single-breath KTV phrases (<= 11 CJK chars) so forced alignment NEVER
+    crushes two separate musical phrases into one 3-second window!
+    """
+    non_sp = re.sub(r"\s+", "", line)
+    cjk_cnt = len(re.findall(r"[\u4e00-\u9fff]", non_sp))
+    if cjk_cnt < 10 or len(non_sp) <= 11:
+        return [line]
+    parts = [p.strip() for p in re.split(r"[\s,，、；;]+", line) if p.strip()]
+    if len(parts) <= 1:
+        return [line]
+    merged: list[str] = []
+    for p in parts:
+        if merged and len(re.sub(r"\s+", "", merged[-1] + p)) <= 11:
+            merged[-1] = f"{merged[-1]} {p}"
+        else:
+            merged.append(p)
+    return merged
+
+
 def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
     out = []
     for raw in raw_lines:
@@ -184,7 +205,8 @@ def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
             continue
         if s in ("純音樂，請欣賞", "纯音乐，请欣赏", "♪", "♫", "~"):
             continue
-        out.append(to_hk_traditional(s))
+        hk = to_hk_traditional(s)
+        out.extend(_split_long_official_line(hk))
     return out
 
 
@@ -335,7 +357,7 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
 
                 pl = (it.get("plainLyrics") or "").strip()
                 sl = (it.get("syncedLyrics") or "").strip()
-                cand_lines = clean_lyric_lines(pl.splitlines()) if pl else [x["text"] for x in parse_lrc(sl)]
+                cand_lines = clean_lyric_lines(pl.splitlines()) if pl else clean_lyric_lines([x["text"] for x in parse_lrc(sl)])
                 if len(cand_lines) >= 6 and match_sc > best_score:
                     best_score = match_sc
                     best_lines = cand_lines
@@ -381,7 +403,7 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
                     parsed = parse_lrc(lrc)
                     if len(parsed) >= 6:
                         best_score = match_sc
-                        best_lines = [x["text"] for x in parsed]
+                        best_lines = clean_lyric_lines([x["text"] for x in parsed])
                         best_source = f"NetEase ({tr_name})"
                 if best_score >= 1.35:
                     break
@@ -874,7 +896,10 @@ def _live_section_anchored_align(
                 _, off, raw_sim, _ = chosen
                 ts = asr_segs[idx_i]["start"]
                 te = asr_segs[idx_i + chosen_span - 1]["end"]
-                if not (m_out and m_out[-1]["text"] == off and (ts - m_out[-1]["end"]) < 2.5):
+                if m_out and m_out[-1]["text"] == off and (ts - m_out[-1]["end"]) < 7.5:
+                    # Extend the existing line's end timestamp instead of discarding its second half!
+                    m_out[-1]["end"] = max(m_out[-1]["end"], te)
+                else:
                     m_out.append({"start": ts, "end": te, "text": off, "sim": raw_sim})
                     prev_l = off
                 idx_i += chosen_span
@@ -996,9 +1021,11 @@ def _live_section_anchored_align(
 
     total_sec = len(audio_16k) / 16000.0 if len(audio_16k) > 0 else 0.0
     final_lines: list[dict] = []
-    for blk in blocks:
-        b_start = max(first_onset, blk[0]["start"] - 1.0)
-        b_end = min(total_sec, blk[-1]["end"] + 1.0) if total_sec > 0 else (blk[-1]["end"] + 1.0)
+    for b_idx, blk in enumerate(blocks):
+        prev_end_bound = (blocks[b_idx - 1][-1]["end"] + 0.15) if b_idx > 0 else first_onset
+        next_start_bound = (blocks[b_idx + 1][0]["start"] - 0.15) if (b_idx + 1 < len(blocks)) else total_sec
+        b_start = max(first_onset, prev_end_bound, blk[0]["start"] - 1.5)
+        b_end = min(total_sec, next_start_bound, blk[-1]["end"] + 4.5) if total_sec > 0 else (blk[-1]["end"] + 4.5)
         if len(audio_16k) > 0 and b_end > b_start + 0.5:
             chunk = audio_16k[int(b_start * 16000) : int(b_end * 16000)]
             blk_text = "\n".join(x["text"] for x in blk)
