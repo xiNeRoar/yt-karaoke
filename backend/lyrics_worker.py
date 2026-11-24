@@ -928,6 +928,69 @@ def _map_comp_to_real(t_comp: float, mapping: list[tuple[float, float, float, fl
     return mapping[-1][3] if mapping else t_comp
 
 
+def _adaptive_vocal_threshold_db(db_profile: np.ndarray) -> float:
+    """Compute a song-adaptive vocal activity threshold from the track's own loudness distribution.
+    Eliminates hardcoded dBFS constants so quiet live recordings (-21 dB) and loud rock (-11 dB) behave identically.
+    """
+    if len(db_profile) < 10:
+        return -40.0
+    p15 = float(np.percentile(db_profile, 15))
+    p90 = float(np.percentile(db_profile, 90))
+    if p90 - p15 < 8.0:
+        return p90 - 10.0
+    return max(p15 + 6.0, p90 - 22.0)
+
+
+def _distribute_by_vocal_energy_cdf(
+    ws_slice: list[dict],
+    span_s: float,
+    span_e: float,
+    db_profile: np.ndarray,
+    step_sec: float,
+) -> None:
+    """Distribute collapsed zero-duration words across [span_s, span_e] using the cumulative vocal energy CDF.
+    Where the singer is silent inside the span, energy ~ 0 so the CDF stays flat (natural pause);
+    where the singer is vocalizing, the CDF rises smoothly so characters track real singing energy.
+    """
+    if not ws_slice or span_e <= span_s:
+        return
+
+    weights = [max(1, len(re.sub(r"\s+", "", str(w.get("word") or "")))) for w in ws_slice]
+    total_w = float(sum(weights))
+
+    # Build piecewise-linear time(u) inverse CDF for u in [0, 1]
+    use_cdf = False
+    if len(db_profile) >= 10 and step_sec > 0:
+        thr_db = _adaptive_vocal_threshold_db(db_profile)
+        f0 = max(0, int(span_s / step_sec))
+        f1 = min(len(db_profile), max(f0 + 1, int(np.ceil(span_e / step_sec))))
+        seg_db = db_profile[f0:f1]
+        if len(seg_db) >= 2:
+            # Linear excess vocal energy above adaptive floor (0 in silence, >0 when singing)
+            energy = np.maximum(0.0, 10.0 ** ((seg_db - thr_db) / 20.0) - 1.0)
+            if float(np.sum(energy)) > 1e-4:
+                # Tiny baseline epsilon prevents division issues while keeping silent gaps nearly flat
+                energy = energy + 1e-3 * float(np.mean(energy))
+                cdf = np.concatenate(([0.0], np.cumsum(energy)))
+                cdf = cdf / float(cdf[-1])
+                times = np.linspace(span_s, span_e, len(cdf))
+                use_cdf = True
+
+    def _u_to_time(u: float) -> float:
+        u = max(0.0, min(1.0, u))
+        if use_cdf:
+            return float(np.interp(u, cdf, times))
+        return span_s + (span_e - span_s) * u
+
+    acc = 0.0
+    for w, wt in zip(ws_slice, weights):
+        u0 = acc / total_w
+        acc += wt
+        u1 = acc / total_w
+        w["start"] = round(_u_to_time(u0), 2)
+        w["end"] = round(_u_to_time(u1), 2)
+
+
 def _smooth_bunched_words(
     ws: list[dict],
     line_start: float,
@@ -935,17 +998,24 @@ def _smooth_bunched_words(
     db_profile: np.ndarray,
     step_sec: float,
 ) -> list[dict]:
-    """Eliminate forced-aligner word-bunching glitches (e.g. 6 chars slammed into 0.30s followed by a 2.8s freeze).
+    """Generic, first-principles recovery for degenerate zero-duration aligner collapses (`raw_start == raw_end`).
 
-    Detects any contiguous run of >=2 words whose pace is physically impossible for singing (<=0.09s/char)
-    adjacent to an unused time gap inside the same line, and redistributes those words across the actual
-    available singing envelope [span_start, span_end] weighted by character count + vocal RMS energy.
+    Unlike hardcoded speaking-rate heuristics (which can distort fast rap), this triggers ONLY on tokens
+    where the aligner mathematically failed to assign a distinct frame span (raw_dur <= 0.02s before clamping),
+    and redistributes the collapsed run across its bounded acoustic span via vocal-energy CDF integration.
     """
     if not ws:
         return ws
 
     n = len(ws)
-    # Pass 1: Normalize bounds monotonically WITHOUT forcing 0.05s staircase yet
+    # Record exact pre-clamp raw durations BEFORE normalizing so real fast speech (e.g. 0.07s rap) is never confused
+    # with aligner degeneracy (0.00s - 0.02s collapsed tokens).
+    raw_collapsed = [
+        (float(w.get("end", 0.0)) - float(w.get("start", 0.0))) <= 0.021
+        for w in ws
+    ]
+
+    # Pass 1: Normalize bounds monotonically without inflating collapsed tokens yet
     ws[0]["start"] = round(max(line_start, min(float(ws[0]["start"]), line_end - 0.15)), 2)
     ws[-1]["end"] = round(line_end, 2)
     prev_e = line_start
@@ -958,55 +1028,28 @@ def _smooth_bunched_words(
         w["end"] = round(e_i, 2)
         prev_e = e_i
 
-    def _char_w(w_obj: dict) -> int:
-        return max(1, len(re.sub(r"\s+", "", str(w_obj.get("word") or ""))))
-
-    # Pass 2: Find bunched runs (per-word <= 0.13s and run average <= 0.09s/char) & redistribute across real span
+    # Pass 2: Redistribute contiguous collapsed runs across their true bounded acoustic span via Energy CDF
     i = 0
     while i < n:
-        dur_i = ws[i]["end"] - ws[i]["start"]
-        if dur_i / _char_w(ws[i]) <= 0.13:
+        if raw_collapsed[i]:
             j = i + 1
-            while j < n and (ws[j]["end"] - ws[j]["start"]) / _char_w(ws[j]) <= 0.13 and (ws[j]["start"] - ws[j - 1]["end"]) <= 0.15:
+            while j < n and raw_collapsed[j]:
                 j += 1
-            run_len = j - i
-            if run_len >= 2:
-                run_chars = sum(_char_w(ws[k]) for k in range(i, j))
-                run_dur = ws[j - 1]["end"] - ws[i]["start"]
-                if run_dur / max(1, run_chars) <= 0.095:
-                    span_s = ws[i - 1]["end"] if i > 0 else line_start
-                    span_e = ws[j]["start"] if j < n else line_end
-                    span_dur = span_e - span_s
-                    if span_dur > max(run_dur * 1.5, 0.35):
-                        # Refine [span_s, span_e] to active vocal envelope if db_profile is available
-                        act_s, act_e = span_s, span_e
-                        if len(db_profile) > 0 and step_sec > 0:
-                            f0 = max(0, int(span_s / step_sec))
-                            f1 = min(len(db_profile), max(f0 + 1, int(span_e / step_sec)))
-                            active_frames = [f for f in range(f0, f1) if db_profile[f] > -41.0]
-                            if len(active_frames) >= 3:
-                                cand_s = max(span_s, active_frames[0] * step_sec)
-                                cand_e = min(span_e, (active_frames[-1] + 1) * step_sec)
-                                if cand_e - cand_s >= max(0.35, span_dur * 0.45):
-                                    act_s, act_e = cand_s, cand_e
-                        total_cw = max(1, run_chars)
-                        acc = 0
-                        for k in range(i, j):
-                            cw = _char_w(ws[k])
-                            ws[k]["start"] = round(act_s + (act_e - act_s) * (acc / total_cw), 2)
-                            acc += cw
-                            ws[k]["end"] = round(act_s + (act_e - act_s) * (acc / total_cw), 2)
+            span_s = ws[i - 1]["end"] if i > 0 else line_start
+            span_e = ws[j]["start"] if j < n else line_end
+            if span_e > span_s + 0.05:
+                _distribute_by_vocal_energy_cdf(ws[i:j], span_s, span_e, db_profile, step_sec)
             i = j
         else:
             i += 1
 
-    # Pass 3: Final strict monotonic >=0.05s clamp
+    # Pass 3: Enforce strict monotonic continuity
     prev_e = line_start
     for idx, w in enumerate(ws):
         w_s = max(prev_e, float(w["start"]))
-        w_e = max(w_s + 0.05, min(line_end, float(w["end"])))
+        w_e = max(w_s + 0.04, min(line_end, float(w["end"])))
         if idx == n - 1:
-            w_e = max(w_s + 0.05, line_end)
+            w_e = max(w_s + 0.04, line_end)
         w["start"] = round(w_s, 2)
         w["end"] = round(w_e, 2)
         prev_e = w["end"]
@@ -1578,8 +1621,8 @@ def refine_lines_with_qwen3(
                     wt = (it.text or "").strip()
                     if not wt:
                         continue
-                    ws = round(max(abs_s, w_t0 + float(it.start_time)), 2)
-                    we = round(max(ws + 0.05, w_t0 + float(it.end_time)), 2)
+                    ws = round(max(abs_s, w_t0 + float(it.start_time)), 3)
+                    we = round(max(ws, w_t0 + float(it.end_time)), 3)
                     words_out.append({"start": ws, "end": we, "word": wt})
                 cand_updates.append((idx, {"start": abs_s, "end": abs_e, "text": txt, "words": words_out}))
 
@@ -1730,6 +1773,8 @@ def align_official_lyrics_with_stable_ts(
         start_s = round(max(first_onset, raw_s), 2)
         end_s = round(max(start_s + 0.4, raw_e), 2)
 
+        # Preserve raw aligner timestamps (including 0.00s collapsed tokens!) so refine_alignment_with_acoustics
+        # can detect exact aligner degeneracy (raw_dur <= 0.02s) without confusing it with fast singing/rap!
         words_out = []
         for w in (seg.words or []):
             wt = (w.word or "").strip()
@@ -1737,8 +1782,8 @@ def align_official_lyrics_with_stable_ts(
                 continue
             ws_r = _map_comp_to_real(float(w.start), time_map) if time_map else float(w.start)
             we_r = _map_comp_to_real(float(w.end), time_map) if time_map else float(w.end)
-            ws = round(max(start_s, ws_r), 2)
-            we = round(max(ws + 0.05, we_r), 2)
+            ws = round(max(start_s, ws_r), 3)
+            we = round(max(ws, we_r), 3)
             words_out.append({"start": ws, "end": we, "word": wt})
 
         lines.append({"start": start_s, "end": end_s, "text": txt, "words": words_out})
