@@ -1,9 +1,10 @@
 const API_BASE = "http://127.0.0.1:18765";
+const IS_LOCAL_DEV = API_BASE.startsWith("http://127.0.0.1") || API_BASE.startsWith("http://localhost");
 let lastReloadNonce = null;
 
-// Right after auto-reload finishes, gently refresh open YouTube watch tabs so new content.js takes effect
+// Right after local dev auto-reload finishes, gently refresh open YouTube watch tabs so new content.js takes effect
 chrome.runtime.onInstalled.addListener((details) => {
-  if (details.reason === "update" || details.reason === "install") {
+  if (IS_LOCAL_DEV && (details.reason === "update" || details.reason === "install")) {
     chrome.tabs.query({ url: "https://www.youtube.com/watch*" }, (tabs) => {
       for (const tab of tabs || []) {
         if (tab.id) {
@@ -15,7 +16,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 function checkReloadNonce(nonce) {
-  if (typeof nonce !== "number") return;
+  if (!IS_LOCAL_DEV || typeof nonce !== "number") return;
   if (lastReloadNonce === null) {
     lastReloadNonce = nonce;
     return;
@@ -26,16 +27,18 @@ function checkReloadNonce(nonce) {
   }
 }
 
-// Gentle background health check (no-op on public gateway unless reload nonce increments)
-setInterval(async () => {
-  try {
-    const res = await fetch(`${API_BASE}/api/health`);
-    if (res.ok) {
-      const data = await res.json();
-      checkReloadNonce(data.extension_reload_nonce);
-    }
-  } catch (_e) {}
-}, 30000);
+// Local dev auto-reload watcher (skipped in production Chrome Web Store builds)
+if (IS_LOCAL_DEV) {
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/health`);
+      if (res.ok) {
+        const data = await res.json();
+        checkReloadNonce(data.extension_reload_nonce);
+      }
+    } catch (_e) {}
+  }, 30000);
+}
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) return false;
@@ -48,9 +51,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse({ ok: false, error: "Invalid API path" });
           return;
         }
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 20000);
         const init = {
           method,
           headers: {},
+          signal: ctrl.signal,
         };
         if (clientId) {
           init.headers["X-Karaoke-Client"] = clientId;
@@ -59,12 +65,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           init.headers["Content-Type"] = "application/json";
           init.body = JSON.stringify(body);
         }
-        const res = await fetch(`${API_BASE}${path}`, init);
-        const data = await res.json().catch(() => ({}));
-        if (data && typeof data.extension_reload_nonce === "number") {
-          checkReloadNonce(data.extension_reload_nonce);
+        try {
+          const res = await fetch(`${API_BASE}${path}`, init);
+          const data = await res.json().catch(() => ({}));
+          if (data && typeof data.extension_reload_nonce === "number") {
+            checkReloadNonce(data.extension_reload_nonce);
+          }
+          sendResponse({ ok: res.ok, status: res.status, data });
+        } finally {
+          clearTimeout(timer);
         }
-        sendResponse({ ok: res.ok, status: res.status, data });
         return;
       }
 
@@ -80,21 +90,36 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // Stream audio binary over a long-lived Port in 256KB chunks (immune to sendMessage size limits)
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "AUDIO_STREAM") return;
+  let activeCtrl = null;
+  let disconnected = false;
+
+  port.onDisconnect.addListener(() => {
+    disconnected = true;
+    if (activeCtrl) {
+      try { activeCtrl.abort(); } catch (_e) {}
+    }
+  });
 
   port.onMessage.addListener(async (msg) => {
     if (!msg || typeof msg.path !== "string" || !msg.path.startsWith("/api/")) return;
+    const ctrl = new AbortController();
+    activeCtrl = ctrl;
+    const timer = setTimeout(() => ctrl.abort(), 60000);
     try {
-      const res = await fetch(`${API_BASE}${msg.path}`);
+      const res = await fetch(`${API_BASE}${msg.path}`, { signal: ctrl.signal });
+      if (disconnected) return;
       if (!res.ok) {
         port.postMessage({ type: "error", error: `HTTP ${res.status}` });
         return;
       }
       const buf = await res.arrayBuffer();
+      if (disconnected) return;
       const bytes = new Uint8Array(buf);
       const CHUNK = 262144;
       port.postMessage({ type: "meta", totalBytes: bytes.length });
 
       for (let off = 0; off < bytes.length; off += CHUNK) {
+        if (disconnected) return;
         const slice = bytes.subarray(off, Math.min(off + CHUNK, bytes.length));
         let bin = "";
         const sub = 0x8000;
@@ -103,11 +128,16 @@ chrome.runtime.onConnect.addListener((port) => {
         }
         port.postMessage({ type: "chunk", b64: btoa(bin) });
       }
-      port.postMessage({ type: "done" });
+      if (!disconnected) port.postMessage({ type: "done" });
     } catch (err) {
-      try {
-        port.postMessage({ type: "error", error: String(err && err.message ? err.message : err) });
-      } catch (_e) {}
+      if (!disconnected) {
+        try {
+          port.postMessage({ type: "error", error: String(err && err.message ? err.message : err) });
+        } catch (_e) {}
+      }
+    } finally {
+      clearTimeout(timer);
+      if (activeCtrl === ctrl) activeCtrl = null;
     }
   });
 });

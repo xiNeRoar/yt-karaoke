@@ -28,6 +28,7 @@ namespace YtKaraokeTray
         {
             try { SetProcessDPIAware(); } catch { }
             ServicePointManager.Expect100Continue = false;
+            ServicePointManager.DefaultConnectionLimit = 16;
 
             bool createdNew;
             using (var mutex = new Mutex(true, MutexName, out createdNew))
@@ -157,14 +158,18 @@ namespace YtKaraokeTray
             return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @".gemini\antigravity\scratch\yt-karaoke");
         }
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
         private readonly ProcessJobTracker _jobTracker = new ProcessJobTracker();
         private readonly EventWaitHandle _showWindowEvent;
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
-        private readonly JavaScriptSerializer _json = new JavaScriptSerializer();
+        private readonly JavaScriptSerializer _json = new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024 };
 
         private Process _backendProcess;
         private readonly object _procLock = new object();
         private bool _isExiting = false;
+        private bool _pollInFlight = false;
         private bool _trayHintShown = false;
         private bool _backendOnline = false;
         private bool _starting = false;
@@ -302,7 +307,18 @@ namespace YtKaraokeTray
                     g.FillEllipse(border, 21, 21, 11, 11);
                     g.FillEllipse(dot, 23, 23, 7, 7);
                 }
-                return Icon.FromHandle(bmp.GetHicon());
+                IntPtr hIcon = bmp.GetHicon();
+                try
+                {
+                    using (var temp = Icon.FromHandle(hIcon))
+                    {
+                        return (Icon)temp.Clone();
+                    }
+                }
+                finally
+                {
+                    DestroyIcon(hIcon);
+                }
             }
         }
 
@@ -660,7 +676,7 @@ namespace YtKaraokeTray
             {
                 while (!_cts.IsCancellationRequested)
                 {
-                    try { if (_showWindowEvent.WaitOne(500) && !IsDisposed) BeginInvoke((Action)RestoreFromTray); }
+                    try { if (_showWindowEvent.WaitOne(500) && !IsDisposed && IsHandleCreated) BeginInvoke((Action)RestoreFromTray); }
                     catch { break; }
                 }
             });
@@ -676,11 +692,12 @@ namespace YtKaraokeTray
 
         private void AppendLog(string line)
         {
-            if (string.IsNullOrEmpty(line) || IsDisposed) return;
+            if (string.IsNullOrEmpty(line) || IsDisposed || !IsHandleCreated) return;
             try
             {
                 BeginInvoke((Action)(() =>
                 {
+                    if (IsDisposed) return;
                     if (_txtLogs.TextLength > 20000) _txtLogs.Text = _txtLogs.Text.Substring(_txtLogs.TextLength - 12000);
                     _txtLogs.AppendText(line + Environment.NewLine);
                 }));
@@ -725,7 +742,7 @@ namespace YtKaraokeTray
                     _starting = false;
                     _backendOnline = false;
                     AppendLog("[System] Backend process exited.");
-                    if (!IsDisposed) BeginInvoke((Action)UpdateOfflineUI);
+                    if (!IsDisposed && IsHandleCreated) BeginInvoke((Action)UpdateOfflineUI);
                 };
 
                 proc.Start();
@@ -773,6 +790,8 @@ namespace YtKaraokeTray
 
         private async Task PollAllAsync()
         {
+            if (_pollInFlight || IsDisposed) return;
+            _pollInFlight = true;
             try
             {
                 string healthRaw = await HttpRequestAsync("GET", "/api/health", null, 1800, false);
@@ -882,6 +901,10 @@ namespace YtKaraokeTray
                 }
             }
             catch { }
+            finally
+            {
+                _pollInFlight = false;
+            }
         }
 
         private void PopulateSongsList(string cacheRaw)
@@ -1324,6 +1347,10 @@ namespace YtKaraokeTray
             StopBackend();
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
+            if (_iconRunning != null) { _iconRunning.Dispose(); _iconRunning = null; }
+            if (_iconStopped != null) { _iconStopped.Dispose(); _iconStopped = null; }
+            if (_fontModeActive != null) { _fontModeActive.Dispose(); _fontModeActive = null; }
+            if (_fontModeNormal != null) { _fontModeNormal.Dispose(); _fontModeNormal = null; }
             _jobTracker.Dispose();
             Application.Exit();
         }

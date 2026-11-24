@@ -356,8 +356,14 @@ def get_audio(
 
     # 2) Stream directly from Google Drive cloud cache (0 MB local disk!)
     if manager.gdrive.has_song(video_id, mode):
+        try:
+            stream = manager.gdrive.open_audio_stream(video_id, mode, stem)
+        except FileNotFoundError:
+            raise HTTPException(status_code=502, detail="Cloud audio temporarily unavailable")
+        except Exception:
+            raise HTTPException(status_code=502, detail="Cloud audio stream error")
         return StreamingResponse(
-            manager.gdrive.stream_audio(video_id, mode, stem),
+            stream,
             media_type="audio/mpeg",
             headers={"Cache-Control": "public, max-age=86400"},
         )
@@ -372,8 +378,20 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
 
 
 @app.post("/api/lyrics")
-def generate_lyrics(req: LyricsRequest):
+def generate_lyrics(req: LyricsRequest, request: Request):
     _validate_video_id(req.video_id)
+    if not req.force_ai:
+        existing = manager.get_lyrics(req.video_id, req.mode)
+        if existing.get("status") == "ready":
+            return existing
+    if manager.pause_new_jobs:
+        raise HTTPException(status_code=503, detail="AI 伺服器休息中，現有歌庫仍可免費唱")
+    ip = request.client.host if request.client else "127.0.0.1"
+    if ip not in ("127.0.0.1", "::1") and not manager.check_rate_limit(ip):
+        raise HTTPException(
+            status_code=429,
+            detail=f"請求過於頻繁（每 10 分鐘上限 {manager.rate_limit_per_10min} 次），請稍後再試。",
+        )
     return manager.start_lyrics_generation(req.video_id, req.mode, force_ai=req.force_ai)
 
 

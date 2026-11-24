@@ -1198,7 +1198,7 @@
     if (!res.ok) {
       state.lyricsLoading = false;
       const friendlyErr =
-        res.status === 503 && res.data && res.data.detail
+        (res.status === 503 || res.status === 429) && res.data && res.data.detail
           ? res.data.detail
           : "暫未能載入歌詞";
       if (ov) ov.statusEl.textContent = friendlyErr;
@@ -1222,6 +1222,7 @@
       inFlight = true;
       try {
         const stRes = await apiRequest(`/api/lyrics/${targetVideoId}?mode=${targetMode}`);
+        if (state.videoId !== targetVideoId || !state.lyricsEnabled) return;
         if (!stRes.ok || !stRes.data) return;
         const d = stRes.data;
         if (d.status === "ready" && d.lines) {
@@ -1294,6 +1295,7 @@
       inFlight = true;
       try {
         const stRes = await apiRequest(`/api/status/${targetVideoId}?mode=${targetMode}`);
+        if (state.videoId !== targetVideoId || state.mode !== targetMode) return;
         if (!stRes.ok || !stRes.data) return;
         const st = stRes.data;
         state.cachedModes = st.cached_modes || state.cachedModes;
@@ -1376,7 +1378,10 @@
   }
 
   async function refreshBackendAndVideoStatus() {
+    const targetVideoId = state.videoId;
+    const targetMode = state.mode;
     const health = await apiRequest("/api/health");
+    if (state.videoId !== targetVideoId) return;
     if (health.ok && health.data && health.data.status === "ok") {
       state.backendOnline = true;
       state.gpuOnline = health.data.gpu_online !== false;
@@ -1390,8 +1395,9 @@
       return;
     }
 
-    if (state.videoId) {
-      const stRes = await apiRequest(`/api/status/${state.videoId}?mode=${state.mode}`);
+    if (targetVideoId) {
+      const stRes = await apiRequest(`/api/status/${targetVideoId}?mode=${targetMode}`);
+      if (state.videoId !== targetVideoId || state.mode !== targetMode) return;
       if (stRes.ok && stRes.data) {
         const st = stRes.data;
         state.cachedModes = st.cached_modes || [];

@@ -117,7 +117,40 @@ def test_worker_and_separator_invariants() -> None:
     assert "require_all_windows=True" in lw_src, "0-word scaffolds must require 100% window coverage from Qwen3"
     assert "if lrc_synced and not force_ai and len(lrc_synced)" in lw_src, "force_ai=True must bypass LRC scaffold shortcut"
     assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
-    print("[PASS] Structural lifecycle, concurrency & ALL-6-exit-path invariants")
+    # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
+    assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
+    assert "OrderedDict" in gw_src and "_lyrics_ram_max" in gw_src, "Gateway lyrics cache must be bounded LRU"
+    assert "_lyrics_refresh_ttl" in gw_src, "Gateway _lyrics_refreshing must have TTL auto-expiry"
+    assert "open_gdrive_audio_stream" in gw_src, "Gateway must pre-read first chunk before returning 200 OK"
+    st_src = (BACKEND / "storage.py").read_text(encoding="utf-8")
+    assert "open_audio_stream" in st_src, "Backend storage must pre-read first chunk before returning 200 OK"
+    print("[PASS] Structural lifecycle, 24/7 memory bounds & ALL-6-exit-path invariants")
+
+
+def test_store_builder_parity() -> None:
+    """Verify build-store-package.py produces syntactically valid prod extension with /api/ validation & zero dev polling."""
+    builder = ROOT / "scripts" / "build-store-package.py"
+    with tempfile.TemporaryDirectory() as td:
+        out_zip = Path(td) / "store.zip"
+        unpacked = Path(td) / "unpacked"
+        res = subprocess.run(
+            [sys.executable, str(builder), "--api-base", "https://karaoke.example.com", "--out", str(out_zip), "--unpacked-dir", str(unpacked)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert res.returncode == 0, f"Store builder failed: {res.stderr}"
+        bg = (unpacked / "background.js").read_text(encoding="utf-8")
+        ct = (unpacked / "content.js").read_text(encoding="utf-8")
+        mf = json.loads((unpacked / "manifest.json").read_text(encoding="utf-8"))
+        assert 'const API_BASE = "https://karaoke.example.com";' in bg
+        assert '!path.startsWith("/api/")' in bg, "Production background.js lost /api/ path guard!"
+        assert "AbortController" in bg, "Production background.js lost fetch timeout guard!"
+        assert 'const API_BASE = "https://karaoke.example.com";' in ct
+        assert mf["host_permissions"] == ["https://karaoke.example.com/*"]
+        node = subprocess.run(["node", "--check", str(unpacked / "background.js")], capture_output=True, text=True)
+        assert node.returncode == 0, f"Prod background.js syntax error: {node.stderr}"
+    print("[PASS] Chrome Web Store builder single-source parity & syntax check")
 
 
 def test_generic_title_decomposition() -> None:
@@ -202,6 +235,7 @@ def main() -> int:
     test_extension_js_syntax()
     test_atomic_json_concurrency()
     test_worker_and_separator_invariants()
+    test_store_builder_parity()
     test_generic_title_decomposition()
     test_word_bunching_deglitcher()
     test_sidecar_watcher_cp1252_safety()

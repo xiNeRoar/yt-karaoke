@@ -172,7 +172,7 @@ class GoogleDriveStorage:
                 "updated_at": time.time(),
                 "songs": dict(self._index),
             }
-        tmp_catalog = self.index_file.parent / f".{CATALOG_FILENAME}.tmp"
+        tmp_catalog = self.index_file.parent / f".{CATALOG_FILENAME}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
         try:
             tmp_catalog.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
             res = subprocess.run(
@@ -273,7 +273,8 @@ class GoogleDriveStorage:
         except Exception:
             return None
 
-    def stream_audio(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
+    def open_audio_stream(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
+        """Pre-reads the first chunk before returning an iterator so Drive errors never send HTTP 200 + 0-byte MP3."""
         exe = self.refresh_binary()
         if not exe:
             raise RuntimeError("rclone not found")
@@ -284,17 +285,11 @@ class GoogleDriveStorage:
             stderr=subprocess.DEVNULL,
             creationflags=CREATE_NO_WINDOW,
         )
-        try:
-            assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
+        assert proc.stdout is not None
+        first_chunk = proc.stdout.read(65536)
+        if not first_chunk:
             try:
-                if proc.stdout:
-                    proc.stdout.close()
+                proc.stdout.close()
             except Exception:
                 pass
             try:
@@ -305,6 +300,35 @@ class GoogleDriveStorage:
                     proc.kill()
                 except Exception:
                     pass
+            raise FileNotFoundError(f"Empty or missing Drive audio stream: {video_id}/{mode}/{stem}.mp3")
+
+        def _gen() -> Iterator[bytes]:
+            try:
+                yield first_chunk
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        return _gen()
+
+    def stream_audio(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
+        return self.open_audio_stream(video_id, mode, stem)
 
     def sync_index_from_remote(self, force_full_scan: bool = False) -> int:
         """Sync Google Drive index cleanly (fast _catalog.json first, --fast-list full scan fallback)."""

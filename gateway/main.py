@@ -15,6 +15,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterator, Literal, Optional
 
@@ -74,11 +75,19 @@ class GatewayState:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._index: dict[str, dict] = {}
-        self._lyrics_ram: dict[str, dict] = {}
-        self._lyrics_missing: set[str] = set()
-        self._lyrics_refreshing: set[str] = set()
+        self._lyrics_ram: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+        self._lyrics_ram_max = 500
+        self._lyrics_ram_ttl = 600.0  # 10 min soft TTL so updated Drive lyrics propagate automatically
+        self._lyrics_missing: "OrderedDict[str, float]" = OrderedDict()
+        self._lyrics_missing_max = 2000
+        self._lyrics_refreshing: dict[str, float] = {}
+        self._lyrics_refresh_ttl = 300.0
         self._clients: dict[str, dict] = {}
         self._rate_hist: dict[str, list[float]] = {}
+        self._http = httpx.Client(
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            follow_redirects=False,
+        )
 
         self.gpu_online: bool = False
         self.gpu_queue_count: int = 0
@@ -90,6 +99,32 @@ class GatewayState:
         threading.Thread(target=self._bg_gpu_probe_loop, daemon=True, name="gpu-probe").start()
         threading.Thread(target=self._bg_index_sync_loop, daemon=True, name="gdrive-sync").start()
 
+    def _put_lyrics_ram(self, video_id: str, data: dict) -> None:
+        with self._lock:
+            self._lyrics_ram[video_id] = (time.time(), data)
+            self._lyrics_ram.move_to_end(video_id)
+            while len(self._lyrics_ram) > self._lyrics_ram_max:
+                self._lyrics_ram.popitem(last=False)
+            self._lyrics_missing.pop(video_id, None)
+
+    def _mark_lyrics_missing(self, video_id: str) -> None:
+        with self._lock:
+            self._lyrics_missing[video_id] = time.time()
+            self._lyrics_missing.move_to_end(video_id)
+            while len(self._lyrics_missing) > self._lyrics_missing_max:
+                self._lyrics_missing.popitem(last=False)
+
+    def _is_lyrics_refreshing(self, video_id: str) -> bool:
+        now = time.time()
+        with self._lock:
+            ts = self._lyrics_refreshing.get(video_id)
+            if ts is None:
+                return False
+            if now - ts > self._lyrics_refresh_ttl:
+                self._lyrics_refreshing.pop(video_id, None)
+                return False
+            return True
+
     def _load_index(self) -> None:
         if INDEX_FILE.exists():
             try:
@@ -99,7 +134,7 @@ class GatewayState:
 
     def _save_index(self) -> None:
         try:
-            tmp = INDEX_FILE.with_suffix(".tmp")
+            tmp = INDEX_FILE.with_name(f".{INDEX_FILE.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
             tmp.write_text(json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, INDEX_FILE)
         except Exception:
@@ -121,7 +156,7 @@ class GatewayState:
             self.gpu_online = False
             return False
         try:
-            r = httpx.get(f"{GPU_NODE_URL}/api/health", headers=self._worker_headers(), timeout=2.5)
+            r = self._http.get(f"{GPU_NODE_URL}/api/health", headers=self._worker_headers(), timeout=2.5)
             if r.status_code == 200:
                 d = r.json()
                 self.gpu_online = d.get("status") == "ok"
@@ -199,7 +234,7 @@ class GatewayState:
                                         pass
                                 with self._lock:
                                     self._lyrics_ram.pop(evid, None)
-                                    self._lyrics_missing.discard(evid)
+                                    self._lyrics_missing.pop(evid, None)
                                 print(f"[Gateway] Evicted stale NAS audio + lyrics cache for upgraded HQ song {evid}", flush=True)
                             print(f"[Gateway] Synced {len(cleaned)} songs via _catalog.json (fast path)", flush=True)
                             return len(cleaned)
@@ -340,51 +375,17 @@ class GatewayState:
         except Exception:
             pass
 
-    def stream_and_cache_gdrive_audio(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
+    def open_gdrive_audio_stream(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
+        """Pre-reads the first chunk before returning an iterator so Drive errors never poison cache with HTTP 200 0-byte MP3."""
         remote_file = f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{video_id}/{mode}/{stem}.mp3"
         dest = AUDIO_CACHE_DIR / f"{video_id}_{mode}_{stem}.mp3"
-        tmp = AUDIO_CACHE_DIR / f".{video_id}_{mode}_{stem}.{int(time.time() * 1000)}.tmp"
+        tmp = AUDIO_CACHE_DIR / f".{video_id}_{mode}_{stem}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
         proc = subprocess.Popen(["rclone", "cat", remote_file], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        fh = None
-        written = 0
-        completed = False
-        try:
-            if MAX_NAS_CACHE_MB > 0:
-                try:
-                    fh = open(tmp, "wb")
-                except Exception:
-                    fh = None
-            assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    break
-                if fh is not None:
-                    try:
-                        fh.write(chunk)
-                    except Exception:
-                        pass
-                written += len(chunk)
-                yield chunk
-            proc.wait(timeout=5)
-            completed = (proc.returncode == 0 and written > 16384)
-        finally:
-            if fh is not None:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
-            if completed and tmp.exists():
-                try:
-                    os.replace(tmp, dest)
-                    threading.Thread(target=self._enforce_nas_cache_limit, daemon=True).start()
-                except Exception:
-                    tmp.unlink(missing_ok=True)
-            elif tmp.exists():
-                tmp.unlink(missing_ok=True)
+        assert proc.stdout is not None
+        first_chunk = proc.stdout.read(65536)
+        if not first_chunk:
             try:
-                if proc.stdout:
-                    proc.stdout.close()
+                proc.stdout.close()
             except Exception:
                 pass
             try:
@@ -395,11 +396,74 @@ class GatewayState:
                     proc.kill()
                 except Exception:
                     pass
+            raise FileNotFoundError(f"Empty or missing Drive audio stream: {video_id}/{mode}/{stem}.mp3")
+
+        def _gen() -> Iterator[bytes]:
+            fh = None
+            written = 0
+            completed = False
+            try:
+                if MAX_NAS_CACHE_MB > 0:
+                    try:
+                        fh = open(tmp, "wb")
+                        fh.write(first_chunk)
+                    except Exception:
+                        fh = None
+                written += len(first_chunk)
+                yield first_chunk
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    if fh is not None:
+                        try:
+                            fh.write(chunk)
+                        except Exception:
+                            pass
+                    written += len(chunk)
+                    yield chunk
+                proc.wait(timeout=5)
+                completed = (proc.returncode == 0 and written > 16384)
+            finally:
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                if completed and tmp.exists():
+                    try:
+                        os.replace(tmp, dest)
+                        threading.Thread(target=self._enforce_nas_cache_limit, daemon=True).start()
+                    except Exception:
+                        tmp.unlink(missing_ok=True)
+                elif tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        return _gen()
 
     def get_cached_lyrics(self, video_id: str, mode: str = "pure") -> Optional[dict]:
+        now = time.time()
         with self._lock:
-            if video_id in self._lyrics_ram:
-                return self._lyrics_ram[video_id]
+            entry = self._lyrics_ram.get(video_id)
+            if entry is not None:
+                cached_at, data = entry
+                if now - cached_at < self._lyrics_ram_ttl:
+                    self._lyrics_ram.move_to_end(video_id)
+                    return data
+                self._lyrics_ram.pop(video_id, None)
             if video_id in self._lyrics_missing:
                 return None
 
@@ -408,14 +472,12 @@ class GatewayState:
             raw = subprocess.check_output(["rclone", "cat", remote_file], text=True, encoding="utf-8", timeout=25)
             data = json.loads(raw)
             if data and data.get("lines"):
-                with self._lock:
-                    self._lyrics_ram[video_id] = data
+                self._put_lyrics_ram(video_id, data)
                 return data
         except Exception:
             pass
 
-        with self._lock:
-            self._lyrics_missing.add(video_id)
+        self._mark_lyrics_missing(video_id)
         return None
 
     def touch_client(self, client_id: Optional[str], ip: str, video_id: Optional[str] = None, singing: Optional[bool] = None) -> bool:
@@ -624,7 +686,7 @@ def get_status(video_id: str, mode: Literal["pure"] = "pure"):
     # Proxy live progress from GPU node when online
     if gw.gpu_online and GPU_NODE_URL:
         try:
-            r = httpx.get(
+            r = gw._http.get(
                 f"{GPU_NODE_URL}/api/status/{video_id}",
                 params={"mode": mode},
                 headers=gw._worker_headers(),
@@ -665,7 +727,7 @@ def separate(req: SeparateRequest, request: Request):
         raise HTTPException(status_code=429, detail=f"請求過於頻繁（每 10 分鐘上限 {RATE_LIMIT_PER_10MIN} 首新歌），請稍後再試。")
 
     try:
-        r = httpx.post(
+        r = gw._http.post(
             f"{GPU_NODE_URL}/api/separate",
             json={"video_id": req.video_id, "mode": req.mode},
             headers=gw._worker_headers(),
@@ -695,8 +757,14 @@ def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental"
         )
     # 2) Cache miss -> stream from Google Drive while populating NAS LRU cache automatically!
     if gw.has_song(video_id, mode):
+        try:
+            stream = gw.open_gdrive_audio_stream(video_id, mode, stem)
+        except FileNotFoundError:
+            raise HTTPException(status_code=502, detail="Cloud audio temporarily unavailable")
+        except Exception:
+            raise HTTPException(status_code=502, detail="Cloud audio stream error")
         return StreamingResponse(
-            gw.stream_and_cache_gdrive_audio(video_id, mode, stem),
+            stream,
             media_type="audio/mpeg",
             headers={"Cache-Control": "public, max-age=86400"},
         )
@@ -732,8 +800,7 @@ def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental"
 @app.get("/api/lyrics/{video_id}")
 def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
     _validate_vid(video_id)
-    with gw._lock:
-        is_refreshing = video_id in gw._lyrics_refreshing
+    is_refreshing = gw._is_lyrics_refreshing(video_id)
 
     if not is_refreshing:
         cached = gw.get_cached_lyrics(video_id, mode)
@@ -742,7 +809,7 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
 
     if gw.gpu_online and GPU_NODE_URL:
         try:
-            r = httpx.get(
+            r = gw._http.get(
                 f"{GPU_NODE_URL}/api/lyrics/{video_id}",
                 params={"mode": mode},
                 headers=gw._worker_headers(),
@@ -751,17 +818,16 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
             if r.status_code == 200:
                 d = r.json()
                 if d.get("status") == "ready" and d.get("lines"):
+                    gw._put_lyrics_ram(video_id, d)
                     with gw._lock:
-                        gw._lyrics_ram[video_id] = d
-                        gw._lyrics_missing.discard(video_id)
-                        gw._lyrics_refreshing.discard(video_id)
+                        gw._lyrics_refreshing.pop(video_id, None)
                 elif d.get("status") in ("error", "idle"):
                     with gw._lock:
-                        gw._lyrics_refreshing.discard(video_id)
+                        gw._lyrics_refreshing.pop(video_id, None)
                 return d
         except Exception:
             with gw._lock:
-                gw._lyrics_refreshing.discard(video_id)
+                gw._lyrics_refreshing.pop(video_id, None)
 
     return {"video_id": video_id, "status": "idle", "progress": 0, "stage_text": OFFLINE_MSG if not gw.gpu_online else "未生成歌詞", "lines": []}
 
@@ -783,17 +849,20 @@ def generate_lyrics(req: LyricsRequest, request: Request):
     if req.force_ai:
         with gw._lock:
             gw._lyrics_ram.pop(req.video_id, None)
-            gw._lyrics_missing.discard(req.video_id)
-            gw._lyrics_refreshing.add(req.video_id)
+            gw._lyrics_missing.pop(req.video_id, None)
+            gw._lyrics_refreshing[req.video_id] = time.time()
 
     try:
-        r = httpx.post(
+        r = gw._http.post(
             f"{GPU_NODE_URL}/api/lyrics",
             json={"video_id": req.video_id, "mode": req.mode, "force_ai": req.force_ai},
             headers=gw._worker_headers(),
             timeout=10.0,
         )
         if r.status_code >= 400:
+            if req.force_ai:
+                with gw._lock:
+                    gw._lyrics_refreshing.pop(req.video_id, None)
             detail = None
             if r.status_code < 500 and r.headers.get("content-type", "").startswith("application/json"):
                 try:
@@ -805,4 +874,7 @@ def generate_lyrics(req: LyricsRequest, request: Request):
     except HTTPException:
         raise
     except Exception:
+        if req.force_ai:
+            with gw._lock:
+                gw._lyrics_refreshing.pop(req.video_id, None)
         raise HTTPException(status_code=503, detail=OFFLINE_MSG)

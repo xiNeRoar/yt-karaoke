@@ -24,6 +24,9 @@ class CloudSyncedLogger:
         self._find_rclone = rclone_finder
         self._is_gdrive_ready = gdrive_check
         self._sync_lock = threading.Lock()
+        self._sync_sched_lock = threading.Lock()
+        self._sync_pending = False
+        self._sync_running = False
         self._last_sync_ts = 0.0
         self._dirty = False
 
@@ -62,7 +65,28 @@ class CloudSyncedLogger:
         self.trigger_sync_async()
 
     def trigger_sync_async(self) -> None:
-        threading.Thread(target=self.sync_to_gdrive, daemon=True, name="cloud-log-flush").start()
+        """Coalesced background log flush — never spawns a thread storm during error bursts."""
+        with self._sync_sched_lock:
+            self._sync_pending = True
+            if self._sync_running:
+                return
+            self._sync_running = True
+
+        def _worker() -> None:
+            try:
+                while True:
+                    time.sleep(1.0)
+                    with self._sync_sched_lock:
+                        if not self._sync_pending:
+                            self._sync_running = False
+                            return
+                        self._sync_pending = False
+                    self.sync_to_gdrive()
+            except Exception:
+                with self._sync_sched_lock:
+                    self._sync_running = False
+
+        threading.Thread(target=_worker, daemon=True, name="cloud-log-flush").start()
 
     def _bg_sync_loop(self) -> None:
         while True:

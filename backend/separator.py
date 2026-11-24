@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -89,8 +90,10 @@ class KaraokeSeparatorManager:
         self._active_procs: Dict[str, subprocess.Popen] = {}
         self._queued_keys: set[str] = set()
         self._rate_history: Dict[str, list[float]] = {}
-        self._lyrics_mem_cache: Dict[str, dict] = {}
-        self._lyrics_gdrive_missing: set[str] = set()
+        self._lyrics_mem_cache: "OrderedDict[str, dict]" = OrderedDict()
+        self._lyrics_mem_max = 500
+        self._lyrics_gdrive_missing: "OrderedDict[str, float]" = OrderedDict()
+        self._lyrics_missing_max = 2000
         self._lyrics_in_progress: set[str] = set()
         self._hq_upgrade_backoff: Dict[str, float] = {}
         self._hq_upgrade_min_vram_mb = int(os.environ.get("KARAOKE_HQ_UPGRADE_VRAM_MB", "3500"))
@@ -154,8 +157,23 @@ class KaraokeSeparatorManager:
         threading.Thread(target=self._bg_gdrive_reaper_loop, daemon=True, name="gdrive-auto-reaper").start()
 
         # Background idle HQ upgrader: when GPU has ample free VRAM (>= 3.5 GB) and no user jobs are active,
-        # silently re-separates any 'cpu_fast' (MDX-Net HQ3) songs with BS-RoFormer 1297 and replaces them in cache!
+        # silently re-separates older/CPU songs with MelBand RoFormer Inst FVX and replaces them in cache!
         threading.Thread(target=self._bg_gpu_hq_upgrader_loop, daemon=True, name="hq-idle-upgrader").start()
+
+    def _put_lyrics_mem(self, video_id: str, data: dict) -> None:
+        with self._lock:
+            self._lyrics_mem_cache[video_id] = data
+            self._lyrics_mem_cache.move_to_end(video_id)
+            while len(self._lyrics_mem_cache) > self._lyrics_mem_max:
+                self._lyrics_mem_cache.popitem(last=False)
+            self._lyrics_gdrive_missing.pop(video_id, None)
+
+    def _mark_lyrics_missing(self, video_id: str) -> None:
+        with self._lock:
+            self._lyrics_gdrive_missing[video_id] = time.time()
+            self._lyrics_gdrive_missing.move_to_end(video_id)
+            while len(self._lyrics_gdrive_missing) > self._lyrics_missing_max:
+                self._lyrics_gdrive_missing.popitem(last=False)
 
     def _needs_hq_upgrade(self, item: dict) -> bool:
         if item.get("quality_tier") == "cpu_fast":
@@ -188,12 +206,17 @@ class KaraokeSeparatorManager:
             return False
 
         now = time.time()
+        with self._lock:
+            expired_bo = [k for k, ts in self._hq_upgrade_backoff.items() if ts <= now]
+            for k in expired_bo:
+                self._hq_upgrade_backoff.pop(k, None)
+            backoff_snap = dict(self._hq_upgrade_backoff)
         candidate = None
         for item in self.list_cache():
             if not self._needs_hq_upgrade(item):
                 continue
             key = self._job_key(item["video_id"], item["mode"])
-            if self._hq_upgrade_backoff.get(key, 0.0) > now:
+            if backoff_snap.get(key, 0.0) > now:
                 continue
             candidate = item
             break
@@ -210,6 +233,7 @@ class KaraokeSeparatorManager:
         staging_status = TEMP_DIR / f"hq_upgrade_{vid}_{int(now)}.json"
         pre_voc_hint: Optional[Path] = None
         pre_inst_hint: Optional[Path] = None
+        upgraded_ok = False
         try:
             # Re-verify idle state & VRAM right after acquiring lock
             with self._lock:
@@ -253,7 +277,8 @@ class KaraokeSeparatorManager:
             except subprocess.TimeoutExpired:
                 proc.kill()
                 _, stderr_text = proc.communicate()
-                self._hq_upgrade_backoff[key] = time.time() + 21600
+                with self._lock:
+                    self._hq_upgrade_backoff[key] = time.time() + 21600
                 self.log.warning("HQUpgrade", f"Timed out upgrading {vid} ({mode}); will retry in 6h")
                 return False
 
@@ -261,7 +286,8 @@ class KaraokeSeparatorManager:
                 # VRAM dipped before model load — skip cleanly without backoff
                 return False
             if proc.returncode != 0:
-                self._hq_upgrade_backoff[key] = time.time() + 21600
+                with self._lock:
+                    self._hq_upgrade_backoff[key] = time.time() + 21600
                 self.log.warning(
                     "HQUpgrade",
                     f"Upgrade skipped for {vid} ({mode}, rc={proc.returncode}), retry in 6h: {(stderr_text or '')[-400:]}",
@@ -270,7 +296,8 @@ class KaraokeSeparatorManager:
 
             staged_song_dir = staging_root / vid / mode
             if not (staged_song_dir / "instrumental.mp3").exists() or not (staged_song_dir / "vocals.mp3").exists():
-                self._hq_upgrade_backoff[key] = time.time() + 21600
+                with self._lock:
+                    self._hq_upgrade_backoff[key] = time.time() + 21600
                 return False
 
             # Preserve original created_at so library ordering stays intact
@@ -309,49 +336,60 @@ class KaraokeSeparatorManager:
                     if src.exists():
                         os.replace(src, local_dir / fname)
 
-            self._hq_upgrade_backoff.pop(key, None)
+            with self._lock:
+                self._hq_upgrade_backoff.pop(key, None)
             self.log.info(
                 "HQUpgrade",
                 f"Upgraded {vid} ({mode}) -> gpu_hq (MelBand Inst FVX) in {upgraded_meta.get('elapsed_sec', '?')}s",
             )
             self.log.trigger_sync_async()
-
-            # Also unify old AI-aligned lyrics to Qwen3-ForcedAligner-0.6B (skip human YouTube subs / exact studio LRC)
-            try:
-                cur_ly = self.get_lyrics(vid, mode)
-                cur_src = str(cur_ly.get("source") or "")
-                keep_sources = {
-                    "youtube_sub_qwen3", "lrclib_qwen3_align",
-                    "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align",
-                    "qwen3_phrase_rescue_align", "whisper_qwen3_ai",
-                }
-                if cur_src not in keep_sources:
-                    self.start_lyrics_generation(
-                        vid, mode, force_ai=True,
-                        local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
-                    )
-                    pre_voc_hint = None
-                    pre_inst_hint = None
-            except Exception:
-                pass
-            return True
+            upgraded_ok = True
         except Exception as exc:
-            self._hq_upgrade_backoff[key] = time.time() + 21600
+            with self._lock:
+                self._hq_upgrade_backoff[key] = time.time() + 21600
             self.log.warning("HQUpgrade", f"Failed upgrading {vid} ({mode}), retry in 6h: {str(exc)[:240]}")
             return False
         finally:
             self._worker_lock.release()
             shutil.rmtree(staging_root, ignore_errors=True)
+            try:
+                staging_status.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if not upgraded_ok:
+                for _p in (pre_voc_hint, pre_inst_hint):
+                    if _p and _p.exists():
+                        try:
+                            _p.unlink()
+                        except Exception:
+                            pass
+
+        # Run optional Qwen3 lyrics upgrade AFTER releasing _worker_lock so user separation jobs are NEVER blocked!
+        try:
+            cur_ly = self.get_lyrics(vid, mode)
+            cur_src = str(cur_ly.get("source") or "")
+            keep_sources = {
+                "youtube_sub_qwen3", "lrclib_qwen3_align",
+                "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align",
+                "qwen3_phrase_rescue_align", "whisper_qwen3_ai",
+            }
+            if cur_src not in keep_sources:
+                self.start_lyrics_generation(
+                    vid, mode, force_ai=True,
+                    local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                )
+                pre_voc_hint = None
+                pre_inst_hint = None
+        except Exception:
+            pass
+        finally:
             for _p in (pre_voc_hint, pre_inst_hint):
                 if _p and _p.exists():
                     try:
                         _p.unlink()
                     except Exception:
                         pass
-            try:
-                staging_status.unlink(missing_ok=True)
-            except Exception:
-                pass
+        return True
 
     def _bg_gdrive_reaper_loop(self) -> None:
         time.sleep(20)
@@ -507,6 +545,12 @@ class KaraokeSeparatorManager:
         now = time.time()
         window = 600.0
         with self._lock:
+            if len(self._rate_history) > 500:
+                self._rate_history = {
+                    k: [t for t in v if now - t < window]
+                    for k, v in self._rate_history.items()
+                    if any(now - t < window for t in v)
+                }
             hist = [t for t in self._rate_history.get(client_ip, []) if now - t < window]
             if len(hist) >= self.rate_limit_per_10min:
                 self._rate_history[client_ip] = hist
@@ -938,6 +982,16 @@ class KaraokeSeparatorManager:
                 removed += 1
             if self.gdrive.is_configured():
                 removed += self.gdrive.delete_song(video_id, mode)
+            with self._lock:
+                self._lyrics_mem_cache.pop(video_id, None)
+                self._lyrics_gdrive_missing.pop(video_id, None)
+                for m in ([mode] if mode else list(MODELS.keys())):
+                    self._hq_upgrade_backoff.pop(self._job_key(video_id, m), None)
+            for jf in (self._lyrics_status_file(video_id), self._status_file(video_id, mode or "pure")):
+                try:
+                    jf.unlink(missing_ok=True)
+                except Exception:
+                    pass
         else:
             if self.cache_dir.exists():
                 for child in self.cache_dir.iterdir():
@@ -946,6 +1000,15 @@ class KaraokeSeparatorManager:
                         removed += 1
             if self.gdrive.is_configured():
                 removed += self.gdrive.purge_all()
+            with self._lock:
+                self._lyrics_mem_cache.clear()
+                self._lyrics_gdrive_missing.clear()
+                self._hq_upgrade_backoff.clear()
+            for jf in JOBS_DIR.glob("*.json"):
+                try:
+                    jf.unlink(missing_ok=True)
+                except Exception:
+                    pass
         return removed
 
     # -------------------- 3-Layer Hybrid Lyrics (On-Demand) --------------------
@@ -956,12 +1019,14 @@ class KaraokeSeparatorManager:
         return JOBS_DIR / f"lyrics__{video_id}.json"
 
     def get_lyrics(self, video_id: str, mode: str = "pure") -> dict:
-        # 1) Ultra-fast in-memory cache (~4KB/song, 0 MB local disk, <1ms response!)
+        # 1) Ultra-fast bounded LRU in-memory cache (~4KB/song, 0 MB local disk, <1ms response!)
         with self._lock:
             is_running = video_id in self._lyrics_in_progress
+            is_known_missing = video_id in self._lyrics_gdrive_missing
             if not is_running:
                 mem = self._lyrics_mem_cache.get(video_id)
                 if mem and mem.get("lines"):
+                    self._lyrics_mem_cache.move_to_end(video_id)
                     return {"status": "ready", "progress": 100, "stage_text": mem.get("source_label", "歌詞已就緒"), **mem}
 
         # 2) If worker is currently running, return status immediately without hitting Google Drive!
@@ -978,8 +1043,7 @@ class KaraokeSeparatorManager:
             try:
                 data = json.loads(lf.read_text(encoding="utf-8"))
                 if data.get("lines"):
-                    with self._lock:
-                        self._lyrics_mem_cache[video_id] = data
+                    self._put_lyrics_mem(video_id, data)
                     return {"status": "ready", "progress": 100, "stage_text": data.get("source_label", "歌詞已就緒"), **data}
             except Exception:
                 pass
@@ -987,17 +1051,16 @@ class KaraokeSeparatorManager:
         # 4) Fetch once from Google Drive (skip if already known absent this session)
         if (
             not is_running
-            and video_id not in self._lyrics_gdrive_missing
+            and not is_known_missing
             and self.gdrive.is_configured()
             and self.gdrive.has_song(video_id, mode)
         ):
             remote_data = self.gdrive.read_json(video_id, mode, "lyrics.json")
             if remote_data and remote_data.get("lines"):
-                with self._lock:
-                    self._lyrics_mem_cache[video_id] = remote_data
+                self._put_lyrics_mem(video_id, remote_data)
                 return {"status": "ready", "progress": 100, "stage_text": remote_data.get("source_label", "歌詞已就緒"), **remote_data}
             else:
-                self._lyrics_gdrive_missing.add(video_id)
+                self._mark_lyrics_missing(video_id)
 
         if sf.exists():
             try:
@@ -1032,7 +1095,7 @@ class KaraokeSeparatorManager:
         else:
             with self._lock:
                 self._lyrics_mem_cache.pop(video_id, None)
-                self._lyrics_gdrive_missing.discard(video_id)
+                self._lyrics_gdrive_missing.pop(video_id, None)
 
         with self._lock:
             if video_id in self._lyrics_in_progress:
@@ -1169,9 +1232,7 @@ class KaraokeSeparatorManager:
                     try:
                         data = json.loads(out_file.read_text(encoding="utf-8"))
                         if data.get("lines"):
-                            with self._lock:
-                                self._lyrics_mem_cache[video_id] = data
-                                self._lyrics_gdrive_missing.discard(video_id)
+                            self._put_lyrics_mem(video_id, data)
                     except Exception:
                         pass
 
