@@ -69,17 +69,23 @@
   }
 
   async function fetchAudioArrayBuffer(path) {
-    // 1) Direct HTTPS fetch (zero Base64 overhead, fast native browser streaming!)
-    try {
+    // 1) Direct HTTPS fetch with full-body timeout + 1 auto-retry (zero Base64 overhead!)
+    for (let attempt = 0; attempt < 2; attempt++) {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      const res = await fetch(`${API_BASE}${path}`, { signal: ctrl.signal });
-      clearTimeout(timer);
-      if (res.ok) {
-        return await res.arrayBuffer();
+      const timer = setTimeout(() => ctrl.abort(), 45000);
+      try {
+        const res = await fetch(`${API_BASE}${path}`, { signal: ctrl.signal });
+        if (res.ok) {
+          const buf = await res.arrayBuffer();
+          if (buf && buf.byteLength > 8192) {
+            return buf;
+          }
+        }
+      } catch (_err) {
+        // Retry once, then fall through to chunked Port stream via Service Worker
+      } finally {
+        clearTimeout(timer);
       }
-    } catch (_err) {
-      // Fall through to chunked Port stream via Service Worker
     }
 
     // 2) Chunked Port streaming via background service worker (immune to PNA & sendMessage size limits)
@@ -102,7 +108,7 @@
           try { port.disconnect(); } catch (_e) {}
           reject(new Error("載入音軌逾時，請重試"));
         }
-      }, 20000);
+      }, 45000);
 
       port.onMessage.addListener((msg) => {
         if (settled) return;
@@ -323,9 +329,11 @@
       }
 
       if (onProgress) onProgress("載入伴奏中...", 95);
-      const instRaw = await fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`);
-      if (onProgress) onProgress("載入伴奏中...", 97);
-      const vocRaw = await fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`);
+      // Download instrumental & guide-vocal tracks in PARALLEL (2x faster!)
+      const [instRaw, vocRaw] = await Promise.all([
+        fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`),
+        fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`),
+      ]);
 
       if (onProgress) onProgress("載入伴奏中...", 99);
       const [instBuf, vocBuf] = await Promise.all([
