@@ -116,6 +116,49 @@ def to_hk_traditional(text: str) -> str:
         return text
 
 
+def to_simplified(text: str) -> str:
+    if not text:
+        return text
+    try:
+        from opencc import OpenCC
+        if not hasattr(to_simplified, "_cc"):
+            to_simplified._cc = OpenCC("hk2s")
+        return to_simplified._cc.convert(text)
+    except Exception:
+        return text
+
+
+def extract_lyrics_from_description(yt_desc: str) -> list[str]:
+    """Extract pasted lyrics from YouTube video descriptions (crucial for 改詞版 / parodies / indie covers!)."""
+    if not yt_desc or len(yt_desc) < 80:
+        return []
+    url_re = re.compile(r"(https?://|www\.|@|#|\bfb\.com\b|\big\b|instagram|facebook|spotify|apple\s*music|kkbox|joox|moov|訂閱|頻道|商業合作|email)", re.IGNORECASE)
+    best_block: list[str] = []
+    cur_block: list[str] = []
+    for raw in yt_desc.splitlines():
+        s = raw.strip()
+        if not s:
+            if len(cur_block) > len(best_block):
+                best_block = cur_block
+            cur_block = []
+            continue
+        if url_re.search(s) or CREDIT_LINE_RE.match(s) or len(s) > 46 or len(s) < 3:
+            if len(cur_block) > len(best_block):
+                best_block = cur_block
+            cur_block = []
+            continue
+        # Must contain real text (CJK or alphabetic words)
+        if re.search(r"[\u4e00-\u9fff]{2,}|[A-Za-z]{3,}", s):
+            cur_block.append(to_hk_traditional(s))
+        else:
+            if len(cur_block) > len(best_block):
+                best_block = cur_block
+            cur_block = []
+    if len(cur_block) > len(best_block):
+        best_block = cur_block
+    return best_block if len(best_block) >= 8 else []
+
+
 def clean_search_title(title: str) -> str:
     t = re.sub(r"[\[\(【（][^\]\)】）]*[\]\)】）]", " ", title)
     t = re.sub(r"[_|\-/]+", " ", t)
@@ -302,10 +345,17 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
         except Exception:
             continue
 
-    # 2) NetEase Cloud Music fallback (massive HK Cantopop / Mandopop library!)
+    # 2) NetEase Cloud Music fallback (massive HK Cantopop / Mandopop library — query in BOTH hk2s Simplified & original!)
     if not best_lines:
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
+        ne_queries: list[str] = []
         for q in queries[:3]:
+            qs = to_simplified(q)
+            if qs and qs not in ne_queries:
+                ne_queries.append(qs)
+            if q not in ne_queries:
+                ne_queries.append(q)
+        for q in ne_queries[:4]:
             try:
                 r = httpx.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 8}, headers=headers, timeout=8)
                 songs = (r.json().get("result") or {}).get("songs") or []
@@ -328,6 +378,13 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
                     break
             except Exception:
                 continue
+
+    # 3) YouTube description fallback (catches 改詞版 / parodies / brand-new indie tracks that paste lyrics in description!)
+    if not best_lines and yt_desc:
+        desc_lines = extract_lyrics_from_description(yt_desc)
+        if desc_lines:
+            best_lines = desc_lines
+            best_source = "YouTube Description"
 
     return best_synced, best_lines, best_source
 
@@ -826,13 +883,16 @@ def fallback_free_transcribe(
     db_profile: np.ndarray,
     step_sec: float,
     first_onset: float,
+    title_hint: str = "",
 ) -> tuple[list[dict], str]:
-    """Only used when NO official lyrics exist anywhere online; strictly gated by RMS silence detector."""
+    """Only used when NO official or description lyrics exist; strictly gated by RMS silence detector."""
     add_nvidia_dll_dirs()
     from faster_whisper import WhisperModel
 
     free_mb = query_free_vram_mb()
     use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
+    is_cjk_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or ""))
+    prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_cjk_title else None
 
     def _run(dev: str):
         ctype = "float16" if dev == "cuda" else "int8"
@@ -845,6 +905,9 @@ def fallback_free_transcribe(
             beam_size=5,
             word_timestamps=True,
             vad_filter=False,
+            initial_prompt=prompt,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
             no_speech_threshold=0.65,
             log_prob_threshold=-1.0,
             compression_ratio_threshold=2.0,
@@ -987,10 +1050,10 @@ def main() -> int:
             src = "live_anchored_align" if used_live else "forced_align"
             label = "同步歌詞"
         else:
-            # Layer 3B: Free transcription with strict RMS silence gate
+            # Layer 3B: Free transcription with strict RMS silence gate & HK Traditional prompt
             update("running", 50, "辨識歌詞中...")
             ai_lines, used_dev = fallback_free_transcribe(
-                vocals_path, args.device_mode, db_profile, step_sec, first_onset
+                vocals_path, args.device_mode, db_profile, step_sec, first_onset, title_hint=title
             )
             src = "whisper_ai"
             label = "同步歌詞"
