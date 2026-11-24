@@ -9,7 +9,8 @@ Last updated: 2026-11-24
 
 ## Permissions Justification
 - This extension requests **zero** special browser API permissions (no `storage`, `tabs`, `cookies`, or `webRequest`).
-- `host_permissions` (`https://www.youtube.com/*` and the configured karaoke backend origin): Injects the karaoke control bar and KTV lyrics overlay onto YouTube watch pages, refreshes open YouTube tabs upon installation/update, and streams separated accompaniment tracks and synchronized lyrics from the backend.
+- `host_permissions` (only the configured karaoke server origin): Streams separated instrumental/vocal accompaniment tracks and synchronized lyrics for in-browser playback (never downloads or saves video/audio files to disk).
+- `content_scripts` (`https://www.youtube.com/*`): Displays the karaoke control bar and KTV lyrics overlay inside the YouTube player while leaving video playback and ads intact.
 
 ## Self-Hosting
 This project is 100% open source (MIT License). You may run the entire backend and gateway on your own PC or NAS without connecting to any external hosted server.

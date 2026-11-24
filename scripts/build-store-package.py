@@ -25,20 +25,96 @@ def build_package(api_base: str, out_zip: Path, unpacked_dir: Path | None = None
         shutil.rmtree(staging)
     shutil.copytree(EXT_SRC, staging)
 
-    # 1. Patch manifest.json host_permissions cleanly (only target origin + YouTube)
+    # 1. Patch manifest.json with strictly minimal Chrome Web Store permissions:
+    #    - Zero special API permissions (no storage, tabs, cookies, webRequest)
+    #    - host_permissions strictly limited to the karaoke gateway origin only
+    #      (content_scripts.matches already handles injecting the UI on https://www.youtube.com/*)
     m_path = staging / "manifest.json"
     manifest = json.loads(m_path.read_text(encoding="utf-8"))
-    manifest["host_permissions"] = [f"{api_base}/*", "https://www.youtube.com/*"]
+    manifest.pop("permissions", None)
+    manifest["host_permissions"] = [f"{api_base}/*"]
     m_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    # 2. Patch API_BASE in background.js and content.js
-    for fname in ("background.js", "content.js"):
-        p = staging / fname
-        txt = p.read_text(encoding="utf-8")
-        replaced = txt.replace("http://127.0.0.1:18765", api_base)
-        if api_base not in replaced:
-            raise SystemExit(f"ERROR: failed to patch API_BASE in {fname}")
-        p.write_text(replaced, encoding="utf-8")
+    # 2. Write ultra-clean production background.js (zero dev auto-reload polling, zero chrome.tabs calls)
+    prod_bg = f'''const API_BASE = "{api_base}";
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {{
+  if (!message || !message.type) return false;
+
+  (async () => {{
+    try {{
+      if (message.type === "API_REQUEST") {{
+        const {{ path, method = "GET", body = null, clientId = null }} = message;
+        const init = {{
+          method,
+          headers: {{}},
+        }};
+        if (clientId) {{
+          init.headers["X-Karaoke-Client"] = clientId;
+        }}
+        if (body !== null) {{
+          init.headers["Content-Type"] = "application/json";
+          init.body = JSON.stringify(body);
+        }}
+        const res = await fetch(`${{API_BASE}}${{path}}`, init);
+        const data = await res.json().catch(() => ({{}}));
+        sendResponse({{ ok: res.ok, status: res.status, data }});
+        return;
+      }}
+
+      sendResponse({{ ok: false, error: "Unknown message type" }});
+    }} catch (err) {{
+      sendResponse({{ ok: false, error: String(err && err.message ? err.message : err) }});
+    }}
+  }})();
+
+  return true;
+}});
+
+// Stream separated audio binary over a long-lived Port in 256KB chunks (immune to sendMessage size limits)
+chrome.runtime.onConnect.addListener((port) => {{
+  if (port.name !== "AUDIO_STREAM") return;
+
+  port.onMessage.addListener(async (msg) => {{
+    if (!msg || !msg.path) return;
+    try {{
+      const res = await fetch(`${{API_BASE}}${{msg.path}}`);
+      if (!res.ok) {{
+        port.postMessage({{ type: "error", error: `HTTP ${{res.status}}` }});
+        return;
+      }}
+      const buf = await res.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const CHUNK = 262144;
+      port.postMessage({{ type: "meta", totalBytes: bytes.length }});
+
+      for (let off = 0; off < bytes.length; off += CHUNK) {{
+        const slice = bytes.subarray(off, Math.min(off + CHUNK, bytes.length));
+        let bin = "";
+        const sub = 0x8000;
+        for (let i = 0; i < slice.length; i += sub) {{
+          bin += String.fromCharCode.apply(null, slice.subarray(i, i + sub));
+        }}
+        port.postMessage({{ type: "chunk", b64: btoa(bin) }});
+      }}
+      port.postMessage({{ type: "done" }});
+    }} catch (err) {{
+      try {{
+        port.postMessage({{ type: "error", error: String(err && err.message ? err.message : err) }});
+      }} catch (_e) {{}}
+    }}
+  }});
+}});
+'''
+    (staging / "background.js").write_text(prod_bg, encoding="utf-8")
+
+    # 3. Patch API_BASE in content.js
+    c_path = staging / "content.js"
+    c_txt = c_path.read_text(encoding="utf-8")
+    c_replaced = c_txt.replace("http://127.0.0.1:18765", api_base)
+    if api_base not in c_replaced:
+        raise SystemExit("ERROR: failed to patch API_BASE in content.js")
+    c_path.write_text(c_replaced, encoding="utf-8")
 
     # 3. Pack clean Chrome Web Store .zip
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
