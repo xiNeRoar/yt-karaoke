@@ -146,6 +146,53 @@ class KaraokeSeparatorManager:
             except Exception:
                 pass
 
+        # Background zero-local-disk reaper: automatically retries & migrates any song stranded on local disk
+        # (e.g. after a transient Google Drive 403 rate-limit spike) so local disk ALWAYS returns to 0.0 MB!
+        threading.Thread(target=self._bg_gdrive_reaper_loop, daemon=True, name="gdrive-auto-reaper").start()
+
+    def _bg_gdrive_reaper_loop(self) -> None:
+        time.sleep(20)
+        while True:
+            try:
+                if self.storage_mode == "gdrive" and self.gdrive.is_configured():
+                    with self._lock:
+                        busy_mig = bool(self._migration_state.get("running"))
+                        queued = set(self._queued_keys)
+                    if not busy_mig:
+                        local_items = self._list_local_cache()
+                        for it in local_items:
+                            vid, mode = it["video_id"], it["mode"]
+                            if self._job_key(vid, mode) in queued:
+                                continue
+                            local_dir = self.get_cache_dir(vid, mode)
+                            if not local_dir.exists():
+                                continue
+                            meta = self.get_meta(vid, mode)
+                            try:
+                                self.gdrive.upload_song(vid, mode, local_dir, meta)
+                                ly = self._lyrics_file(vid)
+                                if ly.exists():
+                                    self.gdrive.upload_single_file(vid, mode, ly)
+                                    try:
+                                        ly.unlink()
+                                    except Exception:
+                                        pass
+                                shutil.rmtree(local_dir, ignore_errors=True)
+                                parent = self.cache_dir / vid
+                                if parent.exists() and not any(parent.iterdir()):
+                                    try:
+                                        parent.rmdir()
+                                    except Exception:
+                                        pass
+                                self.log.info("GDrive", f"Auto-reaper uploaded {vid} ({mode}) & freed local disk")
+                                self.log.trigger_sync_async()
+                            except Exception as exc:
+                                self.log.warning("GDrive", f"Auto-reaper will retry {vid} later: {str(exc)[:180]}")
+                                time.sleep(15)
+            except Exception:
+                pass
+            time.sleep(90)
+
     def _load_config(self) -> None:
         if CONFIG_FILE.exists():
             try:
