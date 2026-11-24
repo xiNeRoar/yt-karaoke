@@ -1448,9 +1448,15 @@ def refine_lines_with_qwen3(
         for wi, idx_list in enumerate(windows):
             prev_end = float(lines[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
             next_start = float(lines[idx_list[-1] + 1]["start"]) if (idx_list[-1] + 1) < len(lines) else audio_dur
-            # Pad window boundaries safely without crossing into neighboring sung lines
-            pad_left = min(max_pad_sec, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * 0.45))
-            pad_right = min(max_pad_sec, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * 0.45))
+            # Structural drift rescue: if Stage 1 compressed any line (<0.12s/char), expand the audio window
+            # across the full available gap so Qwen3 can pull drifted lines back to their real sung positions!
+            has_compressed = any(
+                (float(lines[i]["end"]) - float(lines[i]["start"])) / max(1, len(re.sub(r"\s+", "", lines[i].get("text", "")))) < 0.12
+                for i in idx_list
+            )
+            eff_pad = 15.0 if has_compressed else max_pad_sec
+            pad_left = min(eff_pad, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * (0.9 if has_compressed else 0.45)))
+            pad_right = min(eff_pad, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * (0.9 if has_compressed else 0.45)))
             w_t0 = max(0.0, float(lines[idx_list[0]]["start"]) - pad_left)
             w_t1 = min(audio_dur, float(lines[idx_list[-1]]["end"]) + pad_right)
             if w_t1 - w_t0 < 1.0 or w_t1 - w_t0 > 120.0:
