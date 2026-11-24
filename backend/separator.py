@@ -721,8 +721,14 @@ class KaraokeSeparatorManager:
                     except Exception as gerr:
                         self.log.error("GDrive", f"Upload fallback to local ({video_id}): {gerr}")
                         self.enforce_cache_limit()
+                        cur = self._read_job_status(video_id, mode) or {}
+                        cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
+                        status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
                 else:
                     self.enforce_cache_limit()
+                    cur = self._read_job_status(video_id, mode) or {}
+                    cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
+                    status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
                     self.log.info("Separate", f"Done {video_id} ({mode}) — 100% VRAM reclaimed")
                     self.log.trigger_sync_async()
 
@@ -1067,13 +1073,31 @@ class KaraokeSeparatorManager:
                 if local_vocals_hint and local_vocals_hint.exists():
                     vocals_path = local_vocals_hint
                 else:
-                    vocals_path = self.get_cache_dir(video_id, mode) / "vocals.mp3"
-                    if not vocals_path.exists() and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
+                    local_voc = self.get_cache_dir(video_id, mode) / "vocals.mp3"
+                    if local_voc.exists():
+                        # Snapshot into a private temp file so Drive upload cleanup can NEVER delete it mid-run!
+                        temp_vocals = TEMP_DIR / f"voc_{video_id}_{int(time.time())}.mp3"
+                        shutil.copy2(local_voc, temp_vocals)
+                        vocals_path = temp_vocals
+                    elif self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
                         temp_vocals = TEMP_DIR / f"voc_{video_id}_{int(time.time())}.mp3"
                         if self.gdrive.download_file(video_id, mode, "vocals.mp3", temp_vocals):
                             vocals_path = temp_vocals
+                        else:
+                            vocals_path = local_voc
+                    else:
+                        vocals_path = local_voc
 
-                inst_path = local_inst_hint if (local_inst_hint and local_inst_hint.exists()) else (self.get_cache_dir(video_id, mode) / "instrumental.mp3")
+                if local_inst_hint and local_inst_hint.exists():
+                    inst_path = local_inst_hint
+                else:
+                    local_inst = self.get_cache_dir(video_id, mode) / "instrumental.mp3"
+                    if local_inst.exists():
+                        temp_inst = TEMP_DIR / f"inst_{video_id}_{int(time.time())}.mp3"
+                        shutil.copy2(local_inst, temp_inst)
+                        inst_path = temp_inst
+                    else:
+                        inst_path = local_inst
                 out_file = self._lyrics_file(video_id)
                 has_gpu, _, _, _ = query_nvidia_gpu()
                 eff_mode = self.device_mode if has_gpu else "cpu"

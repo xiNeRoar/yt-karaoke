@@ -505,11 +505,13 @@ def main() -> int:
         }
         (cache_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        # Leave status at finalizing (95%) — separator.py atomically flips to "ready" (100%)
+        # AFTER Google Drive upload & local cleanup finish, preventing premature /api/lyrics races!
         update(
-            status="ready",
-            progress=100,
+            status="finalizing",
+            progress=95,
             elapsed_sec=elapsed,
-            stage_text="伴奏已就緒",
+            stage_text="最後整理中...",
         )
         return 0
     except Exception as exc:
