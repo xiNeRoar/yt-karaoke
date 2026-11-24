@@ -99,7 +99,9 @@ class GatewayState:
 
     def _save_index(self) -> None:
         try:
-            INDEX_FILE.write_text(json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp = INDEX_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, INDEX_FILE)
         except Exception:
             pass
 
@@ -381,10 +383,18 @@ class GatewayState:
             elif tmp.exists():
                 tmp.unlink(missing_ok=True)
             try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            try:
                 proc.terminate()
                 proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def get_cached_lyrics(self, video_id: str, mode: str = "pure") -> Optional[dict]:
         with self._lock:

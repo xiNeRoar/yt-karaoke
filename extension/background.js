@@ -44,6 +44,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     try {
       if (message.type === "API_REQUEST") {
         const { path, method = "GET", body = null, clientId = null } = message;
+        if (typeof path !== "string" || !path.startsWith("/api/")) {
+          sendResponse({ ok: false, error: "Invalid API path" });
+          return;
+        }
         const init = {
           method,
           headers: {},
@@ -78,7 +82,7 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "AUDIO_STREAM") return;
 
   port.onMessage.addListener(async (msg) => {
-    if (!msg || !msg.path) return;
+    if (!msg || typeof msg.path !== "string" || !msg.path.startsWith("/api/")) return;
     try {
       const res = await fetch(`${API_BASE}${msg.path}`);
       if (!res.ok) {

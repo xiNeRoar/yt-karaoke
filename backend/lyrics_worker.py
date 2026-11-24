@@ -234,6 +234,19 @@ def parse_lrc(lrc_text: str) -> list[dict]:
     return lines
 
 
+def _adaptive_vocal_threshold_db(db_profile: np.ndarray, margin_db: float = 0.0) -> float:
+    """Compute a song-adaptive vocal activity threshold from the track's own loudness distribution.
+    Eliminates hardcoded dBFS constants so quiet live recordings (-21 dB) and loud rock (-11 dB) behave identically.
+    """
+    if len(db_profile) < 10:
+        return -40.0 + margin_db
+    p15 = float(np.percentile(db_profile, 15))
+    p90 = float(np.percentile(db_profile, 90))
+    if p90 - p15 < 8.0:
+        return (p90 - 10.0) + margin_db
+    return max(p15 + 6.0, p90 - 22.0) + margin_db
+
+
 def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, np.ndarray, float, float]:
     """Load 16kHz mono vocals + per-100ms RMS dBFS profile so we know exact silent vs singing regions."""
     try:
@@ -247,10 +260,11 @@ def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, np.ndarr
             for i in range(n_frames)
         ])
         db = 20.0 * np.log10(rms + 1e-12)
-        # Find first sustained vocal onset (> -38 dBFS for at least 0.3s)
+        thr = _adaptive_vocal_threshold_db(db)
+        # Find first sustained vocal onset (> adaptive threshold for at least 0.2s)
         first_onset = 0.0
         for i in range(len(db) - 2):
-            if db[i] > -38.0 and db[i + 1] > -38.0:
+            if db[i] > thr and db[i + 1] > thr:
                 first_onset = max(0.0, i * 0.1 - 0.15)
                 break
         return y.astype(np.float32), db, 0.1, first_onset
@@ -266,8 +280,8 @@ def segment_has_vocal_energy(db_profile: np.ndarray, step_sec: float, start_s: f
     seg_db = db_profile[i0:i1]
     if len(seg_db) == 0:
         return False
-    # At least 90th-percentile energy in segment must exceed -38 dBFS (real singing, not silence!)
-    return float(np.percentile(seg_db, 85)) > -38.0
+    # 85th-percentile energy in segment must exceed song-adaptive vocal threshold
+    return float(np.percentile(seg_db, 85)) > _adaptive_vocal_threshold_db(db_profile)
 
 
 def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str) -> float:
@@ -872,7 +886,8 @@ def build_silence_collapsed_audio(
         dur = n_total / sr
         return y, [(0.0, dur, 0.0, dur)]
 
-    active = db_prof > -39.0
+    thr_db = _adaptive_vocal_threshold_db(db_prof, margin_db=-1.0)
+    active = db_prof > thr_db
     pad_frames = max(1, int(round(0.35 / step_s)))
     padded = np.zeros_like(active, dtype=bool)
     for i, a in enumerate(active):
@@ -926,19 +941,6 @@ def _map_comp_to_real(t_comp: float, mapping: list[tuple[float, float, float, fl
             frac = max(0.0, min(1.0, (t_comp - cs) / max(1e-6, ce - cs)))
             return rs + frac * (re_ - rs)
     return mapping[-1][3] if mapping else t_comp
-
-
-def _adaptive_vocal_threshold_db(db_profile: np.ndarray) -> float:
-    """Compute a song-adaptive vocal activity threshold from the track's own loudness distribution.
-    Eliminates hardcoded dBFS constants so quiet live recordings (-21 dB) and loud rock (-11 dB) behave identically.
-    """
-    if len(db_profile) < 10:
-        return -40.0
-    p15 = float(np.percentile(db_profile, 15))
-    p90 = float(np.percentile(db_profile, 90))
-    if p90 - p15 < 8.0:
-        return p90 - 10.0
-    return max(p15 + 6.0, p90 - 22.0)
 
 
 def _distribute_by_vocal_energy_cdf(
@@ -1072,6 +1074,7 @@ def refine_alignment_with_acoustics(
         return lines
 
     n_db = len(db_profile)
+    thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=-1.0)
     for i, ln in enumerate(lines):
         s = max(first_onset, float(ln["start"]))
         e = max(s + 0.35, float(ln["end"]))
@@ -1082,7 +1085,7 @@ def refine_alignment_with_acoustics(
         t_cur = s
         while t_cur < max_snap:
             idx = int(t_cur / step_sec)
-            if idx < n_db and db_profile[idx] > -39.0:
+            if idx < n_db and db_profile[idx] > thr_db:
                 break
             t_cur += step_sec
         if t_cur > s + 0.12 and t_cur < max_snap:
@@ -1098,7 +1101,7 @@ def refine_alignment_with_acoustics(
                 idx = int(t_e / step_sec)
                 if idx >= n_db:
                     break
-                if db_profile[idx] > -39.0:
+                if db_profile[idx] > thr_db:
                     quiet_run = 0
                     best_e = t_e + step_sec
                 else:
@@ -1151,7 +1154,8 @@ def _alignment_needs_live_rematch(aligned, audio_dur: float, db_profile: np.ndar
         last_end = float(segs[-1].end)
         tail_idx = int((last_end + 4.0) / step_sec)
         if tail_idx < len(db_profile):
-            active_tail_sec = float(np.sum(db_profile[tail_idx:] > -35.0)) * step_sec
+            tail_thr = _adaptive_vocal_threshold_db(db_profile, margin_db=3.0)
+            active_tail_sec = float(np.sum(db_profile[tail_idx:] > tail_thr)) * step_sec
             if active_tail_sec >= 18.0:
                 return True, f"unaligned_tail={active_tail_sec:.1f}s"
 
@@ -1205,7 +1209,7 @@ def _live_section_anchored_align(
                     language=lang,
                     batch_size=8,
                     beam_size=2,
-                    vad_filter=False,
+                    vad_filter=True,
                     condition_on_previous_text=False,
                 )
                 raw_segments = list(b_segs)
@@ -1360,9 +1364,11 @@ def _live_section_anchored_align(
                 wt = (w.word or "").strip()
                 if not wt or GARBAGE_CHARS_RE.search(wt):
                     continue
+                ws = round(max(first_onset, float(w.start)), 3)
+                we = round(max(ws, float(w.end)), 3)
                 words_out.append({
-                    "start": round(max(first_onset, float(w.start)), 2),
-                    "end": round(max(first_onset + 0.05, float(w.end)), 2),
+                    "start": ws,
+                    "end": we,
                     "word": to_hk_traditional(wt) if lang == "zh" else wt,
                 })
             s_clamped = round(max(first_onset, s_start), 2)
@@ -1373,7 +1379,8 @@ def _live_section_anchored_align(
                 "text": txt,
                 "words": words_out or _even_words_for_line(txt, s_clamped, e_clamped),
             })
-        return direct_lines
+        audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
+        return refine_alignment_with_acoustics(direct_lines, db_profile, step_sec, audio_dur, first_onset)
 
     # Multi-line energy-verified gap recovery: if 1..6 official lines sit between matched[k] and matched[k+1]
     # AND real vocal RMS confirms continuous singing in that span, restore ALL missing sung lines!
@@ -1400,7 +1407,8 @@ def _live_section_anchored_align(
                 # Measure real active singing seconds in [gap_s .. gap_e]
                 i0 = max(0, int(gap_s / step_sec))
                 i1 = min(len(db_profile), int(gap_e / step_sec))
-                active_sec = float(np.sum(db_profile[i0:i1] > -38.0)) * step_sec if i1 > i0 else 0.0
+                gap_thr = _adaptive_vocal_threshold_db(db_profile)
+                active_sec = float(np.sum(db_profile[i0:i1] > gap_thr)) * step_sec if i1 > i0 else 0.0
                 if active_sec >= max(1.4, 1.6 * missing_n):
                     step_t = (gap_e - gap_s) / missing_n
                     for m_i in range(missing_n):
@@ -2014,7 +2022,7 @@ def main() -> int:
                 "created_at": time.time(),
             }
             out_file.parent.mkdir(parents=True, exist_ok=True)
-            out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_json_atomic(out_file, result, stamp_updated_at=False)
             update("ready", 100, "歌詞已就緒")
             return 0
 
@@ -2042,7 +2050,7 @@ def main() -> int:
                 "created_at": time.time(),
             }
             out_file.parent.mkdir(parents=True, exist_ok=True)
-            out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_json_atomic(out_file, result, stamp_updated_at=False)
             update("ready", 100, "歌詞已就緒")
             return 0
 
@@ -2076,7 +2084,7 @@ def main() -> int:
                         "created_at": time.time(),
                     }
                     out_file.parent.mkdir(parents=True, exist_ok=True)
-                    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    write_json_atomic(out_file, result, stamp_updated_at=False)
                     update("ready", 100, "歌詞已就緒")
                     return 0
 
@@ -2157,7 +2165,7 @@ def main() -> int:
             "created_at": time.time(),
         }
         out_file.parent.mkdir(parents=True, exist_ok=True)
-        out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(out_file, result, stamp_updated_at=False)
         update("ready", 100, "歌詞已就緒")
         return 0
     except Exception as exc:

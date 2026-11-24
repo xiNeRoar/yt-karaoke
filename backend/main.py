@@ -309,7 +309,7 @@ def gdrive_sync(x_admin_token: Optional[str] = Header(default=None)):
 def get_status(
     video_id: str,
     request: Request,
-    mode: Literal["pure", "karaoke"] = "pure",
+    mode: Literal["pure"] = "pure",
     x_karaoke_client: Optional[str] = Header(default=None),
 ):
     _validate_video_id(video_id)
@@ -340,7 +340,7 @@ def separate(
 @app.get("/api/audio/{video_id}/{mode}/{stem}")
 def get_audio(
     video_id: str,
-    mode: Literal["pure", "karaoke"],
+    mode: Literal["pure"],
     stem: Literal["instrumental", "vocals"],
 ):
     _validate_video_id(video_id)
@@ -366,7 +366,7 @@ def get_audio(
 
 
 @app.get("/api/lyrics/{video_id}")
-def get_lyrics(video_id: str, mode: Literal["pure", "karaoke"] = "pure"):
+def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
     _validate_video_id(video_id)
     return manager.get_lyrics(video_id, mode)
 
@@ -423,7 +423,7 @@ def clear_all_cache(x_admin_token: Optional[str] = Header(default=None)):
 @app.delete("/api/cache/{video_id}")
 def clear_video_cache(
     video_id: str,
-    mode: Optional[Literal["pure", "karaoke"]] = None,
+    mode: Optional[Literal["pure"]] = None,
     x_admin_token: Optional[str] = Header(default=None),
 ):
     _require_admin(x_admin_token)

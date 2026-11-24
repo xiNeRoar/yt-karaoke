@@ -239,6 +239,7 @@
       this.semitones = 0;
       this.masterVolume = 1.0;
       this.loadedKey = null; // `${videoId}_${mode}`
+      this._loadSeq = 0;
     }
 
     async ensureContext() {
@@ -321,8 +322,10 @@
     }
 
     async loadTracks(videoId, mode, onProgress) {
+      const seq = ++this._loadSeq;
       if (onProgress) onProgress("載入伴奏中...", 94);
       await this.ensureContext();
+      if (seq !== this._loadSeq) return;
       const key = `${videoId}_${mode}`;
       if (this.loadedKey === key && this.instBuffer && this.vocBuffer) {
         return;
@@ -334,12 +337,14 @@
         fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`),
         fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`),
       ]);
+      if (seq !== this._loadSeq) return;
 
       if (onProgress) onProgress("載入伴奏中...", 99);
       const [instBuf, vocBuf] = await Promise.all([
-        this.ctx.decodeAudioData(instRaw.slice(0)),
-        this.ctx.decodeAudioData(vocRaw.slice(0)),
+        this.ctx.decodeAudioData(instRaw),
+        this.ctx.decodeAudioData(vocRaw),
       ]);
+      if (seq !== this._loadSeq) return;
 
       this.instBuffer = instBuf;
       this.vocBuffer = vocBuf;
@@ -428,6 +433,7 @@
     }
 
     clearBuffers() {
+      this._loadSeq++;
       this.stopSources();
       this.instBuffer = null;
       this.vocBuffer = null;

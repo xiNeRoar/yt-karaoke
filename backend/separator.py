@@ -280,7 +280,7 @@ class KaraokeSeparatorManager:
                 upgraded_meta["created_at"] = candidate["created_at"]
             upgraded_meta["quality_tier"] = "gpu_hq"
             upgraded_meta["upgraded_at"] = time.time()
-            meta_file.write_text(json.dumps(upgraded_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            _write_json_atomic(meta_file, upgraded_meta, stamp_updated_at=False)
 
             # Prepare hot stem copies before uploading/deleting staging so Qwen3 lyrics upgrade runs with 0s download!
             try:
@@ -421,21 +421,18 @@ class KaraokeSeparatorManager:
 
     def save_config(self) -> None:
         try:
-            CONFIG_FILE.write_text(
-                json.dumps(
-                    {
-                        "cache_dir": str(self.cache_dir),
-                        "max_cache_mb": self.max_cache_mb,
-                        "storage_mode": self.storage_mode,
-                        "pause_new_jobs": self.pause_new_jobs,
-                        "max_queue_size": self.max_queue_size,
-                        "rate_limit_per_10min": self.rate_limit_per_10min,
-                        "max_clients": self.max_clients,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
+            _write_json_atomic(
+                CONFIG_FILE,
+                {
+                    "cache_dir": str(self.cache_dir),
+                    "max_cache_mb": self.max_cache_mb,
+                    "storage_mode": self.storage_mode,
+                    "pause_new_jobs": self.pause_new_jobs,
+                    "max_queue_size": self.max_queue_size,
+                    "rate_limit_per_10min": self.rate_limit_per_10min,
+                    "max_clients": self.max_clients,
+                },
+                stamp_updated_at=False,
             )
         except Exception:
             pass

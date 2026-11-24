@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Iterator, Optional
 
+from atomic_io import write_json_atomic
+
 RCLONE_REMOTE = "ytkaraoke_gdrive"
 RCLONE_FOLDER = "YT-Karaoke-Cache"
 CATALOG_FILENAME = "_catalog.json"
@@ -68,7 +70,7 @@ class GoogleDriveStorage:
 
     def _save_index(self) -> None:
         try:
-            self.index_file.write_text(json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_json_atomic(self.index_file, self._index, stamp_updated_at=False)
         except Exception:
             pass
 
@@ -291,10 +293,18 @@ class GoogleDriveStorage:
                 yield chunk
         finally:
             try:
+                if proc.stdout:
+                    proc.stdout.close()
+            except Exception:
+                pass
+            try:
                 proc.terminate()
                 proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def sync_index_from_remote(self, force_full_scan: bool = False) -> int:
         """Sync Google Drive index cleanly (fast _catalog.json first, --fast-list full scan fallback)."""

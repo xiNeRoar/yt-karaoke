@@ -522,7 +522,7 @@ def main() -> int:
             "elapsed_sec": elapsed,
             "created_at": time.time(),
         }
-        (cache_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json_atomic(cache_dir / "meta.json", meta, stamp_updated_at=False)
 
         # Leave status at finalizing (95%) — separator.py atomically flips to "ready" (100%)
         # AFTER Google Drive upload & local cleanup finish, preventing premature /api/lyrics races!
