@@ -166,7 +166,19 @@ def main() -> int:
             torch.cuda.is_available = lambda: False
 
         cuda_ok = (device_mode != "cpu") and torch.cuda.is_available()
-        gpu_name = torch.cuda.get_device_name(0) if cuda_ok else "CPU"
+        gpu_name = "GPU" if cuda_ok else "CPU"
+        if cuda_ok:
+            try:
+                _gn = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    text=True,
+                    timeout=2,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                ).strip().splitlines()
+                if _gn:
+                    gpu_name = _gn[0].strip()
+            except Exception:
+                pass
 
         from audio_separator.separator import Separator
         import tqdm as tqdm_mod
