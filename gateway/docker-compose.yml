@@ -9,7 +9,7 @@ services:
       - .env
     volumes:
       # Mount your rclone.conf containing the least-privilege ytkaraoke_gdrive remote
-      - ./rclone.conf:/root/.config/rclone/rclone.conf:ro
+      - ./rclone.conf:/home/appuser/.config/rclone/rclone.conf:ro
       # Persist cached song index across container restarts
       - ./data:/app/data
     healthcheck:

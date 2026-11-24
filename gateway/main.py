@@ -383,6 +383,12 @@ class GatewayState:
     def check_rate_limit(self, ip: str) -> bool:
         now = time.time()
         with self._lock:
+            if len(self._rate_hist) > 2000:
+                self._rate_hist = {
+                    k: [t for t in v if now - t < 600.0]
+                    for k, v in self._rate_hist.items()
+                    if any(now - t < 600.0 for t in v)
+                }
             hist = [t for t in self._rate_hist.get(ip, []) if now - t < 600.0]
             if len(hist) >= RATE_LIMIT_PER_10MIN:
                 self._rate_hist[ip] = hist
@@ -444,6 +450,13 @@ def _validate_vid(video_id: str) -> str:
 
 
 def _client_ip(request: Request) -> str:
+    # Prefer Cloudflare's verified edge header (cannot be spoofed when behind Cloudflare Proxy)
+    cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+    if cf_ip:
+        return cf_ip
+    real_ip = (request.headers.get("x-real-ip") or "").strip()
+    if real_ip:
+        return real_ip
     xff = request.headers.get("x-forwarded-for")
     if xff:
         return xff.split(",")[0].strip()
@@ -638,20 +651,24 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
 
 
 @app.post("/api/lyrics")
-def generate_lyrics(req: LyricsRequest):
+def generate_lyrics(req: LyricsRequest, request: Request):
     _validate_vid(req.video_id)
     if not req.force_ai:
         cached = gw.get_cached_lyrics(req.video_id, req.mode)
         if cached:
             return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
-    else:
+
+    if not gw.gpu_online or gw.gpu_pause_new or not GPU_NODE_URL:
+        raise HTTPException(status_code=503, detail=OFFLINE_MSG)
+
+    if not gw.check_rate_limit(_client_ip(request)):
+        raise HTTPException(status_code=429, detail=f"請求過於頻繁（每 10 分鐘上限 {RATE_LIMIT_PER_10MIN} 次），請稍後再試。")
+
+    if req.force_ai:
         with gw._lock:
             gw._lyrics_ram.pop(req.video_id, None)
             gw._lyrics_missing.discard(req.video_id)
             gw._lyrics_refreshing.add(req.video_id)
-
-    if not gw.gpu_online or not GPU_NODE_URL:
-        raise HTTPException(status_code=503, detail=OFFLINE_MSG)
 
     try:
         r = httpx.post(
@@ -661,7 +678,13 @@ def generate_lyrics(req: LyricsRequest):
             timeout=10.0,
         )
         if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
+            detail = None
+            if r.status_code < 500 and r.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    detail = r.json().get("detail")
+                except Exception:
+                    detail = None
+            raise HTTPException(status_code=r.status_code, detail=detail or OFFLINE_MSG)
         return r.json()
     except HTTPException:
         raise
