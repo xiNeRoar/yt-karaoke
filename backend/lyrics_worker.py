@@ -807,11 +807,9 @@ def _live_section_anchored_align(
     # Fast GPU BatchedInferencePipeline (~2-4s for a 4-min concert on RTX 5060 Ti!)
     if use_cuda and len(audio_16k) > 0:
         try:
-            from faster_whisper import BatchedInferencePipeline
-            # stable-ts load_faster_whisper wraps a faster_whisper.WhisperModel instance
-            inner_model = getattr(model, "_model", None) or getattr(model, "model", None) or model
-            if hasattr(inner_model, "transcribe") and hasattr(inner_model, "model"):
-                batched = BatchedInferencePipeline(model=inner_model)
+            from faster_whisper import BatchedInferencePipeline, WhisperModel
+            if isinstance(model, WhisperModel):
+                batched = BatchedInferencePipeline(model=model)
                 b_segs, _ = batched.transcribe(
                     audio_16k,
                     language=lang,
