@@ -56,6 +56,18 @@ def find_ffmpeg_dir() -> Optional[str]:
     return None
 
 
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Atomically write JSON status files via tmp + os.replace so concurrent /api/status reads never see torn JSON."""
+    payload["updated_at"] = time.time()
+    tmp = path.with_suffix(".tmp")
+    text = json.dumps(payload, ensure_ascii=False)
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        os.replace(tmp, path)
+    except Exception:
+        path.write_text(text, encoding="utf-8")
+
+
 def query_nvidia_gpu() -> tuple[bool, str, float, float]:
     """Query GPU name and live free/total VRAM via nvidia-smi without importing PyTorch (0 MB VRAM!)."""
     try:
@@ -589,7 +601,7 @@ class KaraokeSeparatorManager:
                 "duration": 0,
                 "updated_at": time.time(),
             }
-            sf.write_text(json.dumps(init_payload, ensure_ascii=False), encoding="utf-8")
+            _write_json_atomic(sf, init_payload)
 
         target_url = f"https://www.youtube.com/watch?v={video_id}"
         t = threading.Thread(
@@ -671,7 +683,7 @@ class KaraokeSeparatorManager:
                                 "updated_at": time.time(),
                             }
                         )
-                        status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                        _write_json_atomic(status_file, cur)
                     self.log.error(
                         "Separate",
                         f"Worker failed ({video_id}, {mode}, rc={proc.returncode}): {(stderr_text or '')[-1500:]}",
@@ -681,13 +693,15 @@ class KaraokeSeparatorManager:
                 # If Google Drive storage is active, upload immediately and delete local MP3s (0 MB local disk!)
                 pre_voc_hint: Optional[Path] = None
                 pre_inst_hint: Optional[Path] = None
+                pre_meta_hint: Optional[dict] = None
                 if self.storage_mode == "gdrive" and self.gdrive.is_configured():
                     local_song_dir = self.get_cache_dir(video_id, mode)
                     meta = self.get_meta(video_id, mode)
+                    pre_meta_hint = meta
                     try:
                         cur = self._read_job_status(video_id, mode) or {}
                         cur.update({"status": "finalizing", "progress": 96, "stage_text": "最後整理中..."})
-                        status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                        _write_json_atomic(status_file, cur)
 
                         # Keep tiny temporary copies of vocals & instrumental so background lyrics & Shazam run at 0s download!
                         local_voc = local_song_dir / "vocals.mp3"
@@ -715,7 +729,7 @@ class KaraokeSeparatorManager:
                                 pass
 
                         cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
-                        status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                        _write_json_atomic(status_file, cur)
                         self.log.info("GDrive", f"Uploaded {video_id} ({mode}) & freed local disk")
                         self.log.trigger_sync_async()
                     except Exception as gerr:
@@ -723,20 +737,22 @@ class KaraokeSeparatorManager:
                         self.enforce_cache_limit()
                         cur = self._read_job_status(video_id, mode) or {}
                         cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
-                        status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                        _write_json_atomic(status_file, cur)
                 else:
+                    pre_meta_hint = self.get_meta(video_id, mode)
                     self.enforce_cache_limit()
                     cur = self._read_job_status(video_id, mode) or {}
                     cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
-                    status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                    _write_json_atomic(status_file, cur)
                     self.log.info("Separate", f"Done {video_id} ({mode}) — 100% VRAM reclaimed")
                     self.log.trigger_sync_async()
 
-                # Auto pre-generate lyrics in background while stems are hot on SSD -> 0.05s instant lyrics!
+                # Auto pre-generate lyrics in background while stems & YouTube metadata are hot -> 0 extra yt-dlp calls!
                 try:
                     self.start_lyrics_generation(
                         video_id, mode, force_ai=False,
                         local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                        meta_hint=pre_meta_hint,
                     )
                 except Exception:
                     for _p in (pre_voc_hint, pre_inst_hint):
@@ -759,7 +775,7 @@ class KaraokeSeparatorManager:
                 }
             )
             try:
-                status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+                _write_json_atomic(status_file, cur)
             except Exception:
                 pass
         finally:
@@ -1011,6 +1027,7 @@ class KaraokeSeparatorManager:
         force_ai: bool = False,
         local_vocals_hint: Optional[Path] = None,
         local_inst_hint: Optional[Path] = None,
+        meta_hint: Optional[dict] = None,
     ) -> dict:
         def _cleanup_hints():
             for _p in (local_vocals_hint, local_inst_hint):
@@ -1045,11 +1062,11 @@ class KaraokeSeparatorManager:
                 "error": None,
                 "updated_at": time.time(),
             }
-            sf.write_text(json.dumps(init, ensure_ascii=False), encoding="utf-8")
+            _write_json_atomic(sf, init)
 
         t = threading.Thread(
             target=self._run_lyrics_worker,
-            args=(video_id, mode, force_ai, sf, local_vocals_hint, local_inst_hint),
+            args=(video_id, mode, force_ai, sf, local_vocals_hint, local_inst_hint, meta_hint),
             daemon=True,
             name=f"lyrics-{video_id}",
         )
@@ -1064,10 +1081,12 @@ class KaraokeSeparatorManager:
         status_file: Path,
         local_vocals_hint: Optional[Path] = None,
         local_inst_hint: Optional[Path] = None,
+        meta_hint: Optional[dict] = None,
     ) -> None:
         key = f"lyrics__{video_id}"
         temp_vocals: Optional[Path] = local_vocals_hint
         temp_inst: Optional[Path] = local_inst_hint
+        temp_meta_file: Optional[Path] = None
         try:
             with self._lyrics_lock:
                 if local_vocals_hint and local_vocals_hint.exists():
@@ -1101,7 +1120,13 @@ class KaraokeSeparatorManager:
                 out_file = self._lyrics_file(video_id)
                 has_gpu, _, _, _ = query_nvidia_gpu()
                 eff_mode = self.device_mode if has_gpu else "cpu"
-                meta = self.get_meta(video_id, mode)
+                meta = meta_hint if (meta_hint and meta_hint.get("yt_meta_present")) else self.get_meta(video_id, mode)
+                if meta:
+                    try:
+                        temp_meta_file = TEMP_DIR / f"meta_{video_id}_{int(time.time())}.json"
+                        temp_meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+                    except Exception:
+                        temp_meta_file = None
 
                 # Use --flag=value syntax so video IDs or song titles starting with '-' (e.g. -8HPO9tXnZU) never break argparse!
                 cmd = [
@@ -1119,6 +1144,8 @@ class KaraokeSeparatorManager:
                 ]
                 if inst_path and inst_path.exists():
                     cmd.append(f"--inst-path={inst_path}")
+                if temp_meta_file and temp_meta_file.exists():
+                    cmd.append(f"--meta-file={temp_meta_file}")
                 ly_env = os.environ.copy()
                 if eff_mode == "cpu":
                     ly_env["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -1183,26 +1210,22 @@ class KaraokeSeparatorManager:
         except Exception as exc:
             self.log.error("Lyrics", f"Exception ({video_id}): {exc}")
             try:
-                status_file.write_text(
-                    json.dumps(
-                        {
-                            "video_id": video_id,
-                            "status": "error",
-                            "progress": 0,
-                            "stage_text": f"歌詞生成失敗：{exc}",
-                            "error": str(exc),
-                            "updated_at": time.time(),
-                        },
-                        ensure_ascii=False,
-                    ),
-                    encoding="utf-8",
+                _write_json_atomic(
+                    status_file,
+                    {
+                        "video_id": video_id,
+                        "status": "error",
+                        "progress": 0,
+                        "stage_text": f"歌詞生成失敗：{exc}",
+                        "error": str(exc),
+                    },
                 )
             except Exception:
                 pass
         finally:
             with self._lock:
                 self._lyrics_in_progress.discard(video_id)
-            for _tf in (temp_vocals, temp_inst):
+            for _tf in (temp_vocals, temp_inst, temp_meta_file):
                 if _tf and _tf.exists():
                     try:
                         _tf.unlink()

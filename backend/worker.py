@@ -218,6 +218,21 @@ def main() -> int:
             if duration > 900:
                 raise RuntimeError(f"影片長度超過 15 分鐘（{int(duration // 60)} 分鐘），為保護磁碟同資源已暫停處理。")
             title = info.get("title") or args.video_id
+            yt_track = (info.get("track") or "").strip()
+            yt_artist = (info.get("artist") or info.get("creator") or "").strip()
+            yt_channel = (info.get("channel") or info.get("uploader") or "").strip()
+            yt_desc = (info.get("description") or "")[:4000]
+            yt_sub_lang = ""
+            yt_sub_url = ""
+            _subs = info.get("subtitles") or {}
+            if isinstance(_subs, dict) and _subs:
+                _pref = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko", "en"]
+                _chosen = next((l for l in _pref if l in _subs), next(iter(_subs.keys()), ""))
+                _fmts = _subs.get(_chosen) or []
+                _j3 = next((f.get("url") for f in _fmts if f.get("ext") == "json3" and f.get("url")), "")
+                if _j3:
+                    yt_sub_lang = _chosen
+                    yt_sub_url = _j3
 
         wav_path = work_dir / "source.wav"
         if not wav_path.exists():
@@ -499,6 +514,13 @@ def main() -> int:
             "quality_tier": "cpu_fast" if use_cpu_fast_model else "gpu_hq",
             "title": title,
             "duration": duration,
+            "track": yt_track,
+            "artist": yt_artist,
+            "channel": yt_channel,
+            "description": yt_desc,
+            "subtitles_lang": yt_sub_lang,
+            "subtitles_url": yt_sub_url,
+            "yt_meta_present": True,
             "device_used": state["device_used"],
             "elapsed_sec": elapsed,
             "created_at": time.time(),

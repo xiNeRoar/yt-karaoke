@@ -15,6 +15,7 @@ Priority:
 
 import argparse
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 import io
 import json
@@ -315,38 +316,76 @@ def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str)
     return score
 
 
-CONCERT_NOISE_PART_RE = re.compile(
-    r"^(世界)?巡[迴回]?(演唱|音樂)[會会]$|^(演唱|音樂)[會会]$|^特別版$|^完整版$|^高清版?$|^純享版?$|^現場版?$|^第[一二三四五六七八九十百0-9]+場$|^[\u4e00-\u9fff]{2,4}站$",
-)
+def _extract_query_candidates(
+    title: str,
+    track: str = "",
+    artist: str = "",
+    channel: str = "",
+) -> list[str]:
+    """Language-agnostic structural title decomposition (zero hardcoded word blacklists).
+
+    1) Structured YouTube Content-ID metadata (`artist + track`, `track`) if present.
+    2) Quoted title tokens inside universal quotation brackets (`《》`, `「」`, `『』`, `〈〉`, `"..."`).
+    3) Atomic delimiter-split segments (`｜`, `|`, `—`, `–`, ` - `, `/`, `【】`) + cleaned full title.
+    """
+    out: list[str] = []
+
+    def _add(s: str) -> None:
+        val = re.sub(r"\s+", " ", (s or "")).strip()
+        if len(val) >= 2 and val not in out:
+            out.append(val)
+
+    # 1) Structured metadata from YouTube (highest signal when populated!)
+    if track:
+        if artist:
+            _add(f"{artist} {track}")
+        _add(track)
+
+    # 2) Explicitly quoted song titles
+    for m in re.finditer(r'[《「『〈"]([^》」』〉"]{2,48})[》」』〉"]', title or ""):
+        _add(clean_search_title(m.group(1)))
+
+    # 3) Full cleaned title (keeps artist + song together for standard "Artist - Song" MVs)
+    cleaned = clean_search_title(title)
+    _add(cleaned)
+
+    # 4) Structural delimiter split (works for ANY concert/TV/cover/multi-language title!)
+    # Split on pipes, dashes, slashes, and bracket boundaries — iterate in reverse too since song names often sit at the end!
+    raw_segs = re.split(r"[｜|—–/]+|\s+-\s+|[《》「」『』【】\[\]()（）]", title or "")
+    seg_cands = []
+    for seg in raw_segs:
+        cs = clean_search_title(seg)
+        # Skip pure digits/dates or overly tiny fragments
+        if len(cs) >= 2 and not re.fullmatch(r"[\d\s.,:-]+", cs):
+            seg_cands.append(cs)
+    for cs in reversed(seg_cands):
+        _add(cs)
+    for cs in seg_cands:
+        _add(cs)
+
+    # 5) Also include longest CJK spans as fallback for unspaced titles
+    for p in sorted(set(re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)), key=len, reverse=True):
+        _add(p)
+
+    return out[:10]
 
 
-def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tuple[Optional[list[dict]], list[str], str]:
-    """Search LRCLIB + NetEase Cloud Music for 100% official lyrics text (even for live covers!).
-    Strictly validates that the returned trackName matches the YouTube video title so artist-name queries
-    NEVER pull the wrong song (e.g. '斷點' for '張敬軒 - 春秋').
+def fetch_official_lyrics(
+    title: str,
+    duration: float,
+    yt_desc: str = "",
+    yt_track: str = "",
+    yt_artist: str = "",
+    yt_channel: str = "",
+) -> tuple[Optional[list[dict]], list[str], str]:
+    """Search LRCLIB + NetEase Cloud Music in PARALLEL across all structural title segments.
+
+    Zero hardcoded noise blacklists and zero sequential timeout stalls: all candidate segments
+    are queried concurrently (~0.8-1.5s total) and strictly scored against the full title + metadata.
     """
     cleaned = clean_search_title(title)
-    queries: list[str] = []
-
-    # 1) Highest priority: song titles explicitly wrapped in 《...》 / 「...」 / 『...』 (e.g. concert ENCORE titles!)
-    for m in re.finditer(r"[《「『〈]([^》」』〉]{2,40})[》」』〉]", title or ""):
-        quoted = clean_search_title(m.group(1)).strip()
-        if quoted and quoted not in queries:
-            queries.append(quoted)
-
-    # 2) Full cleaned title ("張敬軒 春秋") so artist + song stay together for studio/MV titles
-    if cleaned and cleaned not in queries:
-        queries.append(cleaned)
-
-    # 3) Meaningful CJK segments (skipping tour/city/venue filler like '世界巡迴演唱會', '武漢站', '第六場')
-    cjk_parts = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
-    for p in cjk_parts:
-        if CONCERT_NOISE_PART_RE.match(p):
-            continue
-        if p not in queries:
-            queries.append(p)
-    if title and title not in queries:
-        queries.append(title)
+    match_context = " ".join(x for x in (cleaned, yt_track, yt_artist, yt_channel) if x).strip()
+    queries = _extract_query_candidates(title, track=yt_track, artist=yt_artist, channel=yt_channel)
 
     is_live_or_alt = bool(LIVE_KEYWORDS_RE.search(title)) or bool(LIVE_KEYWORDS_RE.search(yt_desc[:200]))
     best_synced = None
@@ -354,75 +393,104 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
     best_source = ""
     best_score = 0.0
 
-    # 1) LRCLIB (cleanest Traditional/English/Japanese lyrics)
-    for q in queries[:4]:
+    # 1) Parallel LRCLIB search across all structural segments (~0.8s wall clock!)
+    def _query_lrclib(q: str) -> list[dict]:
         try:
-            r = httpx.get("https://lrclib.net/api/search", params={"q": q}, timeout=8)
-            if r.status_code != 200:
-                continue
-            items = r.json()
-            if not isinstance(items, list) or not items:
-                continue
-            for it in items[:10]:
-                tr_name = it.get("trackName") or ""
-                ar_name = it.get("artistName") or ""
-                match_sc = _track_matches_title(tr_name, ar_name, cleaned)
-                if match_sc <= 0.0:
-                    continue
-
-                pl = (it.get("plainLyrics") or "").strip()
-                sl = (it.get("syncedLyrics") or "").strip()
-                cand_lines = clean_lyric_lines(pl.splitlines()) if pl else clean_lyric_lines([x["text"] for x in parse_lrc(sl)])
-                if len(cand_lines) >= 6 and match_sc > best_score:
-                    best_score = match_sc
-                    best_lines = cand_lines
-                    best_source = f"LRCLIB ({tr_name})"
-
-                if not is_live_or_alt and sl and duration > 0 and match_sc >= best_score:
-                    it_dur = float(it.get("duration") or 0)
-                    if abs(it_dur - duration) <= 2.0:
-                        parsed = parse_lrc(sl)
-                        if len(parsed) >= 6:
-                            best_synced = parsed
-                            best_source = "LRCLIB"
-                            best_score = match_sc
-            if best_synced or best_score >= 1.35:
-                break
+            r = httpx.get("https://lrclib.net/api/search", params={"q": q}, timeout=5.0)
+            if r.status_code == 200:
+                items = r.json()
+                return items[:10] if isinstance(items, list) else []
         except Exception:
+            pass
+        return []
+
+    lrc_pool: list[dict] = []
+    if queries:
+        with ThreadPoolExecutor(max_workers=min(6, len(queries))) as ex:
+            futs = [ex.submit(_query_lrclib, q) for q in queries[:8]]
+            for f in as_completed(futs):
+                lrc_pool.extend(f.result())
+
+    seen_lrc_ids: set = set()
+    for it in lrc_pool:
+        lid = it.get("id")
+        if lid is not None:
+            if lid in seen_lrc_ids:
+                continue
+            seen_lrc_ids.add(lid)
+        tr_name = it.get("trackName") or ""
+        ar_name = it.get("artistName") or ""
+        match_sc = _track_matches_title(tr_name, ar_name, match_context)
+        if match_sc <= 0.0:
             continue
 
-    # 2) NetEase Cloud Music fallback (massive HK Cantopop / Mandopop library — query in BOTH hk2s Simplified & original!)
-    if not best_lines:
+        pl = (it.get("plainLyrics") or "").strip()
+        sl = (it.get("syncedLyrics") or "").strip()
+        cand_lines = clean_lyric_lines(pl.splitlines()) if pl else clean_lyric_lines([x["text"] for x in parse_lrc(sl)])
+        if len(cand_lines) >= 6 and match_sc > best_score:
+            best_score = match_sc
+            best_lines = cand_lines
+            best_source = f"LRCLIB ({tr_name})"
+
+        if not is_live_or_alt and sl and duration > 0 and match_sc >= best_score:
+            it_dur = float(it.get("duration") or 0)
+            if abs(it_dur - duration) <= 2.0:
+                parsed = parse_lrc(sl)
+                if len(parsed) >= 6:
+                    best_synced = parsed
+                    best_source = "LRCLIB"
+                    best_score = match_sc
+
+    # 2) Parallel NetEase Cloud Music fallback (massive Cantopop / Mandopop catalog)
+    if not best_lines and queries:
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
         ne_queries: list[str] = []
-        for q in queries[:3]:
+        for q in queries[:6]:
             qs = to_simplified(q)
             if qs and qs not in ne_queries:
                 ne_queries.append(qs)
             if q not in ne_queries:
                 ne_queries.append(q)
-        for q in ne_queries[:4]:
+
+        def _query_netease(q: str) -> list[dict]:
             try:
-                r = httpx.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 8}, headers=headers, timeout=8)
-                songs = (r.json().get("result") or {}).get("songs") or []
-                for s in songs[:8]:
+                r = httpx.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 6}, headers=headers, timeout=5.0)
+                return ((r.json().get("result") or {}).get("songs") or [])[:6]
+            except Exception:
+                return []
+
+        ne_candidates: list[tuple[float, dict]] = []
+        seen_ne_ids: set = set()
+        with ThreadPoolExecutor(max_workers=min(6, len(ne_queries))) as ex:
+            futs = [ex.submit(_query_netease, q) for q in ne_queries[:8]]
+            for f in as_completed(futs):
+                for s in f.result():
+                    sid = s.get("id")
+                    if not sid or sid in seen_ne_ids:
+                        continue
+                    seen_ne_ids.add(sid)
                     tr_name = s.get("name") or ""
                     ar_name = " ".join((a.get("name") or "") for a in (s.get("artists") or []))
-                    match_sc = _track_matches_title(tr_name, ar_name, cleaned)
-                    if match_sc <= 0.0 or match_sc <= best_score:
-                        continue
-                    lr = httpx.get("https://music.163.com/api/song/lyric", params={"id": s["id"], "lv": 1, "tv": -1}, headers=headers, timeout=8)
-                    lrc = (lr.json().get("lrc") or {}).get("lyric", "")
-                    if not lrc:
-                        continue
-                    parsed = parse_lrc(lrc)
-                    if len(parsed) >= 6:
-                        best_score = match_sc
-                        best_lines = clean_lyric_lines([x["text"] for x in parsed])
-                        best_source = f"NetEase ({tr_name})"
-                        if not best_synced and not is_live_or_alt:
-                            best_synced = parsed
-                if best_score >= 1.35:
+                    sc = _track_matches_title(tr_name, ar_name, match_context)
+                    if sc > 0.0:
+                        ne_candidates.append((sc, s))
+
+        ne_candidates.sort(key=lambda x: x[0], reverse=True)
+        for sc, s in ne_candidates[:5]:
+            if sc <= best_score:
+                break
+            try:
+                lr = httpx.get("https://music.163.com/api/song/lyric", params={"id": s["id"], "lv": 1, "tv": -1}, headers=headers, timeout=5.0)
+                lrc = (lr.json().get("lrc") or {}).get("lyric", "")
+                if not lrc:
+                    continue
+                parsed = parse_lrc(lrc)
+                if len(parsed) >= 6:
+                    best_score = sc
+                    best_lines = clean_lyric_lines([x["text"] for x in parsed])
+                    best_source = f"NetEase ({s.get('name') or ''})"
+                    if not best_synced and not is_live_or_alt:
+                        best_synced = parsed
                     break
             except Exception:
                 continue
@@ -687,40 +755,13 @@ def _get_yt_cookie_opts() -> dict:
     return {}
 
 
-def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], str, str, float, str]:
-    import yt_dlp
-
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_get_yt_cookie_opts(), **_get_yt_js_runtimes()}) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:
-        print(f"[Lyrics] YouTube subtitle probe skipped ({video_id}): {str(exc)[:140]}", flush=True)
-        return None, "", video_id, 0.0, ""
-    if not isinstance(info, dict):
-        return None, "", video_id, 0.0, ""
-
-    title = info.get("title") or video_id
-    duration = float(info.get("duration") or 0.0)
-    desc = info.get("description") or ""
-    subs = info.get("subtitles") or {}
-    if not subs:
-        return None, "", title, duration, desc
-
-    preferred_langs = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko", "en"]
-    chosen_lang = next((l for l in preferred_langs if l in subs), next(iter(subs.keys()), None))
-    if not chosen_lang:
-        return None, "", title, duration, desc
-
-    formats = subs.get(chosen_lang) or []
-    json3_url = next((f["url"] for f in formats if f.get("ext") == "json3" and f.get("url")), None)
+def _download_json3_subtitles(json3_url: str, chosen_lang: str) -> Optional[list[dict]]:
     if not json3_url:
-        return None, "", title, duration, desc
-
+        return None
     try:
         r = httpx.get(json3_url, timeout=10)
         if r.status_code != 200:
-            return None, "", title, duration, desc
+            return None
         data = r.json()
         lines = []
         for ev in data.get("events") or []:
@@ -733,7 +774,7 @@ def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], 
             start_s = round((ev.get("tStartMs") or 0) / 1000.0, 2)
             dur_s = (ev.get("dDurationMs") or 4000) / 1000.0
             end_s = round(start_s + max(0.5, dur_s), 2)
-            is_cjk = chosen_lang.startswith(("zh", "yue"))
+            is_cjk = (chosen_lang or "").startswith(("zh", "yue"))
             lines.append({
                 "start": start_s,
                 "end": end_s,
@@ -741,11 +782,47 @@ def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], 
                 "words": [],
             })
         if len(lines) >= 4:
-            return lines, chosen_lang, title, duration, desc
+            return lines
     except Exception:
         pass
+    return None
 
-    return None, "", title, duration, desc
+
+def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], str, str, float, str, str, str, str]:
+    import yt_dlp
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_get_yt_cookie_opts(), **_get_yt_js_runtimes()}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        print(f"[Lyrics] YouTube subtitle probe skipped ({video_id}): {str(exc)[:140]}", flush=True)
+        return None, "", video_id, 0.0, "", "", "", ""
+    if not isinstance(info, dict):
+        return None, "", video_id, 0.0, "", "", "", ""
+
+    title = info.get("title") or video_id
+    duration = float(info.get("duration") or 0.0)
+    desc = info.get("description") or ""
+    yt_track = (info.get("track") or "").strip()
+    yt_artist = (info.get("artist") or info.get("creator") or "").strip()
+    yt_channel = (info.get("channel") or info.get("uploader") or "").strip()
+    subs = info.get("subtitles") or {}
+    if not subs:
+        return None, "", title, duration, desc, yt_track, yt_artist, yt_channel
+
+    preferred_langs = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko", "en"]
+    chosen_lang = next((l for l in preferred_langs if l in subs), next(iter(subs.keys()), None))
+    if not chosen_lang:
+        return None, "", title, duration, desc, yt_track, yt_artist, yt_channel
+
+    formats = subs.get(chosen_lang) or []
+    json3_url = next((f["url"] for f in formats if f.get("ext") == "json3" and f.get("url")), None)
+    if not json3_url:
+        return None, "", title, duration, desc, yt_track, yt_artist, yt_channel
+
+    lines = _download_json3_subtitles(json3_url, chosen_lang)
+    return lines, chosen_lang, title, duration, desc, yt_track, yt_artist, yt_channel
 
 
 def detect_lyrics_language(lines: list[str]) -> str:
@@ -1589,6 +1666,63 @@ def align_official_lyrics_with_stable_ts(
     return lines, used_dev, False
 
 
+def fast_probe_transcribe_for_rescue(
+    audio_16k: np.ndarray,
+    first_onset: float,
+    device_mode: str,
+    title_hint: str = "",
+    probe_sec: float = 48.0,
+) -> list[dict]:
+    """Transcribe ONLY the first ~48s of singing (~8s on CPU / ~0.5s on GPU) to rescue official lyrics
+    via NetEase full-text search without wasting 80s transcribing an entire unknown song on CPU!
+    """
+    if len(audio_16k) < 16000 * 6:
+        return []
+    add_nvidia_dll_dirs()
+    from faster_whisper import WhisperModel
+
+    s0 = int(max(0.0, first_onset) * 16000)
+    s1 = min(len(audio_16k), s0 + int(probe_sec * 16000))
+    clip = audio_16k[s0:s1]
+    if len(clip) < 16000 * 5:
+        return []
+
+    free_mb = query_free_vram_mb()
+    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
+    is_cjk_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or ""))
+    prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_cjk_title else None
+
+    def _run(dev: str):
+        ctype = "float16" if dev == "cuda" else "int8"
+        kw = {"device": dev, "compute_type": ctype, "download_root": str(MODEL_DIR)}
+        if dev == "cpu":
+            kw["cpu_threads"] = max(4, min(8, os.cpu_count() or 4))
+        m = WhisperModel("large-v3-turbo", **kw)
+        segs, inf = m.transcribe(
+            clip,
+            beam_size=2,
+            word_timestamps=False,
+            vad_filter=True,
+            initial_prompt=prompt,
+            condition_on_previous_text=False,
+        )
+        return list(segs), inf
+
+    try:
+        segments, info = _run("cuda" if use_cuda else "cpu")
+    except Exception:
+        segments, info = _run("cpu")
+
+    is_cjk = (info.language or "") in ("zh", "yue", "")
+    out = []
+    for seg in segments:
+        txt = (seg.text or "").strip()
+        if not txt or HALLUCINATION_RE.search(txt) or GARBAGE_CHARS_RE.search(txt):
+            continue
+        out.append({"text": to_hk_traditional(txt) if is_cjk else txt})
+    return out
+
+
 def fallback_free_transcribe(
     vocals_path: Path,
     device_mode: str,
@@ -1683,14 +1817,23 @@ def main() -> int:
     parser.add_argument("--title", default="")
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--inst-path", default="")
+    parser.add_argument("--meta-file", default="")
     args = parser.parse_args()
 
     status_file = Path(args.status_file)
     out_file = Path(args.out_file)
     vocals_path = Path(args.vocals_path)
     inst_path = Path(args.inst_path) if args.inst_path else None
+    meta_file = Path(args.meta_file) if args.meta_file else None
     force_ai = args.force_ai == "1"
     started = time.time()
+
+    meta_data: dict = {}
+    if meta_file and meta_file.exists():
+        try:
+            meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta_data = {}
 
     def update(status: str, progress: int, stage_text: str, error: Optional[str] = None):
         write_status(status_file, {
@@ -1704,15 +1847,28 @@ def main() -> int:
 
     try:
         update("running", 10, "載入歌詞中...")
-        # Skip slow yt-dlp probe if force_ai=True and title was already provided by meta.json!
-        if force_ai and args.title.strip():
-            yt_lines, yt_lang, title, duration, yt_desc = None, "", args.title.strip(), float(args.duration or 0.0), ""
+        yt_track = (meta_data.get("track") or "").strip()
+        yt_artist = (meta_data.get("artist") or "").strip()
+        yt_channel = (meta_data.get("channel") or "").strip()
+        yt_desc = meta_data.get("description") or ""
+        title = (meta_data.get("title") or args.title or "").strip()
+        duration = float(meta_data.get("duration") or args.duration or 0.0)
+        yt_lines = None
+        yt_lang = ""
+
+        # Zero-duplicate yt-dlp: reuse metadata captured during worker.py's single YouTube fetch!
+        if meta_data.get("yt_meta_present"):
+            if not force_ai and meta_data.get("subtitles_url"):
+                yt_lang = meta_data.get("subtitles_lang") or ""
+                yt_lines = _download_json3_subtitles(meta_data["subtitles_url"], yt_lang)
+        elif force_ai and title:
+            pass
         else:
-            yt_lines, yt_lang, title, duration, yt_desc = fetch_youtube_human_subtitles(args.video_id)
-            if not title or title == args.video_id:
-                title = args.title.strip() or title
-            if duration <= 0 and args.duration > 0:
-                duration = float(args.duration)
+            yt_lines, yt_lang, fetched_title, fetched_dur, yt_desc, yt_track, yt_artist, yt_channel = fetch_youtube_human_subtitles(args.video_id)
+            if fetched_title and fetched_title != args.video_id:
+                title = fetched_title
+            if fetched_dur > 0:
+                duration = fetched_dur
 
         # Layer 1: Human YouTube subtitles (unless user explicitly requested AI re-alignment)
         if yt_lines and not force_ai:
@@ -1729,11 +1885,16 @@ def main() -> int:
             update("ready", 100, "歌詞已就緒")
             return 0
 
-        # Layer 2: Multi-source official lyrics lookup (LRCLIB + NetEase + YT Desc)
+        # Layer 2: Generic parallel official lyrics lookup (LRCLIB + NetEase + YT Desc)
         update("running", 25, "搜尋歌詞中...")
         is_mashup_title = bool(MASHUP_KEYWORDS_RE.search(title))
         lrc_synced, official_lines, lrc_src = (
-            (None, [], "") if is_mashup_title else fetch_official_lyrics(title, duration, yt_desc)
+            (None, [], "")
+            if is_mashup_title
+            else fetch_official_lyrics(
+                title, duration, yt_desc,
+                yt_track=yt_track, yt_artist=yt_artist, yt_channel=yt_channel,
+            )
         )
 
         if lrc_synced and not force_ai:
@@ -1792,12 +1953,16 @@ def main() -> int:
                 src = "qwen3_forced_align" if qwen_ok else "forced_align"
             label = "同步歌詞"
         else:
-            # Layer 3B: Free transcription + automatic Lyric-Phrase Rescue (identifies acoustic/live covers with no title!)
-            update("running", 50, "辨識歌詞中...")
-            ai_lines, used_dev = fallback_free_transcribe(
-                vocals_path, args.device_mode, db_profile, step_sec, first_onset, title_hint=title
-            )
-            rescued_lines = search_official_lyrics_by_sung_phrases(ai_lines) if len(ai_lines) >= 4 else []
+            # Layer 3B: Fast 48s vocal probe -> Phrase Rescue BEFORE ever paying for full-song CPU free transcription!
+            update("running", 45, "辨識歌曲中...")
+            probe_segs = fast_probe_transcribe_for_rescue(audio_16k, first_onset, args.device_mode, title_hint=title)
+            rescued_lines = search_official_lyrics_by_sung_phrases(probe_segs) if len(probe_segs) >= 2 else []
+            if not rescued_lines:
+                update("running", 55, "辨識歌詞中...")
+                ai_lines, used_dev = fallback_free_transcribe(
+                    vocals_path, args.device_mode, db_profile, step_sec, first_onset, title_hint=title
+                )
+                rescued_lines = search_official_lyrics_by_sung_phrases(ai_lines) if len(ai_lines) >= 4 else []
             if rescued_lines:
                 update("running", 75, "對齊歌詞中...")
                 ai_lines, used_dev, _ = align_official_lyrics_with_stable_ts(
