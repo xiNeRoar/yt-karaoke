@@ -223,6 +223,21 @@ def main() -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         model_filename = MODELS[args.mode]["filename"]
 
+        def query_nvidia_free_vram_mb() -> float:
+            """Query free VRAM via nvidia-smi without creating a ~300MB PyTorch CUDA context."""
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                    text=True,
+                    timeout=2,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                ).strip().splitlines()
+                if out:
+                    return float(out[0].strip())
+            except Exception:
+                pass
+            return 0.0
+
         separator = Separator(
             model_file_dir=str(MODEL_DIR),
             output_dir=str(out_dir),
@@ -239,7 +254,9 @@ def main() -> int:
                 "pitch_shift": 0,
             },
         )
-        if not cuda_ok:
+        # In "auto" (dynamic) mode, ALWAYS load model onto CPU RAM first (0 MB VRAM!) so even when
+        # GPU only has 0.x GB free (e.g. local LLM or game running), load_model() NEVER OOMs!
+        if (not cuda_ok) or (device_mode == "auto"):
             separator.torch_device = torch.device("cpu")
             separator.onnx_execution_provider = ["CPUExecutionProvider"]
 
@@ -249,22 +266,29 @@ def main() -> int:
         # Install Real-Time Dynamic GPU <-> CPU Scheduler onto the loaded RoFormer instance!
         mi = separator.model_instance
         if cuda_ok and hasattr(mi, "model_run") and hasattr(mi, "_run_roformer_model"):
-            # Move model initially to CPU so demix() keeps input/accumulation tensors on CPU RAM;
-            # our dynamic wrapper moves model onto CUDA on chunk 1 whenever VRAM permits,
-            # and smoothly yields VRAM back to CPU mid-song if MiniMax/games need it!
-            mi.model_run.to("cpu")
-            torch.cuda.empty_cache()
+            if device_mode == "gpu":
+                mi.model_run.to("cpu")
+                torch.cuda.empty_cache()
 
             dyn_state = {
                 "dev": "cpu",
                 "gpu_chunks": 0,
                 "cpu_chunks": 0,
                 "switches": 0,
+                "last_smi_check": 0.0,
+                "last_smi_free_mb": 0.0,
             }
             cuda_dev = torch.device("cuda")
             cpu_dev = torch.device("cpu")
 
             def free_vram_mb() -> float:
+                # While on CPU, query nvidia-smi (throttled to 1/s) so we touch 0.0 MB VRAM until >=2200 MB is free!
+                if dyn_state["dev"] == "cpu":
+                    now_t = time.time()
+                    if now_t - dyn_state["last_smi_check"] >= 1.0:
+                        dyn_state["last_smi_free_mb"] = query_nvidia_free_vram_mb()
+                        dyn_state["last_smi_check"] = now_t
+                    return dyn_state["last_smi_free_mb"]
                 try:
                     free_b, _ = torch.cuda.mem_get_info(0)
                     return free_b / (1024 * 1024)
