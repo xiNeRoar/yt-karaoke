@@ -311,29 +311,21 @@ ytd-app[dark] #yt-ai-ktv-panel {
   font-weight: 600;
 }
 
-/* Native Studio Floating KTV Lyrics Overlay inside YouTube #movie_player */
+/* Authentic HK KTV Staggered Dual-Line Sweeping Overlay (Modern High-DPI Typography) */
 #yt-ai-ktv-lyrics-overlay {
   position: absolute;
-  left: 50%;
-  bottom: 70px;
-  transform: translateX(-50%);
-  max-width: 86%;
+  left: 0;
+  right: 0;
+  bottom: 66px;
   z-index: 59;
   pointer-events: none;
   display: none;
   flex-direction: column;
-  align-items: center;
-  gap: 5px;
-  padding: 10px 22px;
-  border-radius: 12px;
-  background: rgba(10, 10, 12, 0.62);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  text-align: center;
-  font-family: "YouTube Sans", "Noto Sans TC", "Microsoft JhengHei", sans-serif;
+  gap: 8px;
+  padding: 0 6%;
+  box-sizing: border-box;
+  font-family: "Noto Sans TC", "PingFang HK", "PingFang TC", "Microsoft JhengHei", "Heiti TC", sans-serif;
   user-select: none;
-  transition: opacity 0.18s ease;
 }
 
 #yt-ai-ktv-lyrics-overlay.visible {
@@ -341,47 +333,124 @@ ytd-app[dark] #yt-ai-ktv-panel {
 }
 
 .ytp-fullscreen #yt-ai-ktv-lyrics-overlay {
-  bottom: 96px;
-  padding: 14px 30px;
+  bottom: 92px;
+  gap: 14px;
+  padding: 0 7%;
 }
 
-.ktv-lyric-current {
-  font-size: 23px;
-  font-weight: 700;
-  line-height: 1.35;
-  color: #ffffff;
-  text-shadow: 0 2px 10px rgba(0, 0, 0, 0.85);
-  letter-spacing: 0.4px;
+.ktv-stage-row {
+  display: flex;
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
 }
 
-.ytp-fullscreen .ktv-lyric-current {
+.ytp-fullscreen .ktv-stage-row {
+  min-height: 64px;
+}
+
+.ktv-stage-row.row-top {
+  justify-content: flex-start;
+}
+
+.ktv-stage-row.row-bottom {
+  justify-content: flex-end;
+}
+
+.ktv-countdown {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-right: 12px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.ktv-countdown.active {
+  opacity: 1;
+}
+
+.ktv-cd-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #2563eb;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.85);
+  opacity: 0.25;
+  transform: scale(0.85);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.ktv-cd-dot.lit {
+  opacity: 1;
+  transform: scale(1.1);
+}
+
+.ktv-sweep-wrap {
+  position: relative;
+  display: inline-block;
   font-size: 32px;
+  font-weight: 900;
+  line-height: 1.25;
+  letter-spacing: 1.5px;
+  white-space: nowrap;
+  max-width: 100%;
 }
 
-.ktv-lyric-word {
-  color: rgba(255, 255, 255, 0.52);
-  transition: color 0.08s linear;
+.ytp-fullscreen .ktv-sweep-wrap {
+  font-size: 48px;
+  letter-spacing: 2.2px;
 }
 
-.ktv-lyric-word.sung {
+/* Base layer: crisp white fill with clean dark outline (unsung state) */
+.ktv-layer-base {
+  display: inline-block;
   color: #ffffff;
-  text-shadow: 0 0 12px rgba(255, 255, 255, 0.45), 0 2px 8px rgba(0, 0, 0, 0.9);
+  -webkit-text-stroke: 2.2px rgba(0, 0, 0, 0.92);
+  paint-order: stroke fill;
+  text-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.9),
+    0 0 14px rgba(0, 0, 0, 0.55);
 }
 
-.ktv-lyric-next {
-  font-size: 14.5px;
-  font-weight: 500;
-  line-height: 1.3;
-  color: rgba(255, 255, 255, 0.6);
-  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.85);
+.ytp-fullscreen .ktv-layer-base {
+  -webkit-text-stroke: 3.2px rgba(0, 0, 0, 0.92);
 }
 
-.ytp-fullscreen .ktv-lyric-next {
-  font-size: 19px;
+/* Sweep layer: iconic HK KTV Royal Blue fill with crisp white outline (sung state) */
+.ktv-layer-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: inline-block;
+  color: #1d5cff;
+  -webkit-text-stroke: 2.6px #ffffff;
+  paint-order: stroke fill;
+  text-shadow:
+    0 2px 7px rgba(0, 0, 0, 0.95),
+    0 0 14px rgba(29, 92, 255, 0.45);
+  clip-path: inset(0 100% 0 0);
+  will-change: clip-path;
+}
+
+.ytp-fullscreen .ktv-layer-fill {
+  -webkit-text-stroke: 3.8px #ffffff;
 }
 
 .ktv-lyric-status {
-  font-size: 13px;
-  color: rgba(255, 255, 255, 0.78);
-  font-weight: 500;
+  align-self: center;
+  font-size: 14px;
+  font-weight: 600;
+  color: #ffffff;
+  padding: 5px 14px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.65);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+}
+
+.ktv-lyric-status:empty {
+  display: none;
 }

@@ -659,18 +659,36 @@
     updateUI();
   }
 
-  // -------------------- On-Demand KTV Lyrics Overlay --------------------
+  // -------------------- Authentic HK KTV Staggered Dual-Line Sweeping Overlay --------------------
+  function makeSweepSlot() {
+    const baseEl = el("span", { className: "ktv-layer-base" });
+    const fillEl = el("span", { className: "ktv-layer-fill" });
+    const wrap = el("div", { className: "ktv-sweep-wrap" }, [baseEl, fillEl]);
+    return { wrap, baseEl, fillEl, lastText: "" };
+  }
+
   function ensureLyricsOverlay() {
     if (lyricsOverlay && lyricsOverlay.root.isConnected) return lyricsOverlay;
     const player = document.querySelector("#movie_player");
     if (!player) return null;
 
-    const currentEl = el("div", { className: "ktv-lyric-current" });
-    const nextEl = el("div", { className: "ktv-lyric-next" });
     const statusEl = el("div", { className: "ktv-lyric-status" });
-    const root = el("div", { id: "yt-ai-ktv-lyrics-overlay" }, [statusEl, currentEl, nextEl]);
+    const cdDots = [
+      el("span", { className: "ktv-cd-dot" }),
+      el("span", { className: "ktv-cd-dot" }),
+      el("span", { className: "ktv-cd-dot" }),
+    ];
+    const countdownEl = el("div", { className: "ktv-countdown" }, cdDots);
+
+    const topSlot = makeSweepSlot();
+    const bottomSlot = makeSweepSlot();
+
+    const topRow = el("div", { className: "ktv-stage-row row-top" }, [countdownEl, topSlot.wrap]);
+    const bottomRow = el("div", { className: "ktv-stage-row row-bottom" }, [bottomSlot.wrap]);
+    const root = el("div", { id: "yt-ai-ktv-lyrics-overlay" }, [statusEl, topRow, bottomRow]);
     player.appendChild(root);
-    lyricsOverlay = { root, currentEl, nextEl, statusEl };
+
+    lyricsOverlay = { root, statusEl, countdownEl, cdDots, topSlot, bottomSlot };
     return lyricsOverlay;
   }
 
@@ -683,9 +701,22 @@
 
   function stopLyricsRenderLoop() {
     if (state.lyricsRenderTimer) {
-      clearInterval(state.lyricsRenderTimer);
+      cancelAnimationFrame(state.lyricsRenderTimer);
       state.lyricsRenderTimer = null;
     }
+  }
+
+  function startLyricsRenderLoop() {
+    stopLyricsRenderLoop();
+    const step = () => {
+      if (!state.lyricsEnabled) {
+        state.lyricsRenderTimer = null;
+        return;
+      }
+      renderLyricsFrame();
+      state.lyricsRenderTimer = requestAnimationFrame(step);
+    };
+    state.lyricsRenderTimer = requestAnimationFrame(step);
   }
 
   function disableLyricsOverlay() {
@@ -697,6 +728,61 @@
     if (lyricsOverlay) {
       lyricsOverlay.root.classList.remove("visible");
     }
+  }
+
+  function computeLineSweepProgress(line, now) {
+    if (!line) return 0;
+    if (now <= line.start) return 0;
+    if (now >= line.end) return 1;
+
+    // Smooth word-weighted sweep when word-level timestamps exist
+    if (line.words && line.words.length > 0) {
+      let totalWeight = 0;
+      const weights = [];
+      for (const w of line.words) {
+        const len = Math.max(1, (w.word || "").length);
+        weights.push(len);
+        totalWeight += len;
+      }
+      let acc = 0;
+      for (let i = 0; i < line.words.length; i++) {
+        const w = line.words[i];
+        const wt = weights[i];
+        if (now < w.start) {
+          return acc / totalWeight;
+        }
+        if (now <= w.end) {
+          const wDur = Math.max(0.05, w.end - w.start);
+          const frac = Math.max(0, Math.min(1, (now - w.start) / wDur));
+          return (acc + wt * frac) / totalWeight;
+        }
+        acc += wt;
+      }
+      return 1;
+    }
+
+    // Smooth linear sweep for line-timed lyrics (YouTube CC / LRCLIB)
+    const dur = Math.max(0.2, line.end - line.start);
+    return Math.max(0, Math.min(1, (now - line.start) / dur));
+  }
+
+  function setSlotContent(slot, text, progress) {
+    if (!text) {
+      if (slot.lastText !== "") {
+        slot.baseEl.textContent = "";
+        slot.fillEl.textContent = "";
+        slot.lastText = "";
+      }
+      slot.fillEl.style.clipPath = "inset(0 100% 0 0)";
+      return;
+    }
+    if (slot.lastText !== text) {
+      slot.baseEl.textContent = text;
+      slot.fillEl.textContent = text;
+      slot.lastText = text;
+    }
+    const rightPct = Math.max(0, Math.min(100, (1 - progress) * 100));
+    slot.fillEl.style.clipPath = `inset(0 ${rightPct.toFixed(2)}% 0 0)`;
   }
 
   function renderLyricsFrame() {
@@ -711,8 +797,9 @@
 
     if (state.lyricsLoading) {
       ov.root.classList.add("visible");
-      ov.currentEl.textContent = "";
-      ov.nextEl.textContent = "";
+      setSlotContent(ov.topSlot, "", 0);
+      setSlotContent(ov.bottomSlot, "", 0);
+      ov.countdownEl.classList.remove("active");
       return;
     }
 
@@ -726,63 +813,81 @@
     if (!video) return;
     const now = video.currentTime + state.lyricsOffsetSec;
 
-    let idx = -1;
+    // Find current active line OR the upcoming line right before singing begins
+    let activeIdx = -1;
+    let nextUpcomingIdx = -1;
+
     for (let i = 0; i < lines.length; i++) {
-      if (now >= lines[i].start - 0.15 && now <= lines[i].end + 0.35) {
-        idx = i;
+      if (now >= lines[i].start && now <= lines[i].end + 0.15) {
+        activeIdx = i;
+        break;
+      }
+      if (lines[i].start > now) {
+        nextUpcomingIdx = i;
         break;
       }
     }
 
-    // Show upcoming first line right before singing starts
-    let nextIdx = -1;
-    if (idx === -1) {
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].start > now) {
-          if (lines[i].start - now <= 4.0) {
-            nextIdx = i;
-          }
-          break;
-        }
+    let topIdx = -1;
+    let bottomIdx = -1;
+    let countdownSec = -1;
+
+    if (activeIdx !== -1) {
+      // Classic HK KTV alternating slots: even lines on Top-Left, odd lines on Bottom-Right!
+      if (activeIdx % 2 === 0) {
+        topIdx = activeIdx;
+        if (activeIdx + 1 < lines.length) bottomIdx = activeIdx + 1;
+      } else {
+        bottomIdx = activeIdx;
+        if (activeIdx + 1 < lines.length) topIdx = activeIdx + 1;
       }
-      if (nextIdx === -1) {
+    } else if (nextUpcomingIdx !== -1) {
+      const timeUntil = lines[nextUpcomingIdx].start - now;
+      if (timeUntil <= 4.5) {
+        // Preview the upcoming pair cleanly right before the verse enters
+        if (nextUpcomingIdx % 2 === 0) {
+          topIdx = nextUpcomingIdx;
+          if (nextUpcomingIdx + 1 < lines.length) bottomIdx = nextUpcomingIdx + 1;
+        } else {
+          bottomIdx = nextUpcomingIdx;
+          if (nextUpcomingIdx + 1 < lines.length) topIdx = nextUpcomingIdx + 1;
+        }
+        // Classic 3-2-1 KTV countdown dots before intro or after a long >6s instrumental break
+        const prevEnd = nextUpcomingIdx > 0 ? lines[nextUpcomingIdx - 1].end : -99;
+        if (timeUntil <= 3.0 && lines[nextUpcomingIdx].start - prevEnd >= 5.0) {
+          countdownSec = timeUntil;
+        }
+      } else {
+        // Long instrumental interlude — hide overlay cleanly so MV shines
         ov.root.classList.remove("visible");
-        state.lastLyricLineIdx = -1;
+        ov.countdownEl.classList.remove("active");
         return;
       }
-      ov.root.classList.add("visible");
-      ov.statusEl.textContent = "";
-      ov.currentEl.textContent = "♪";
-      ov.nextEl.textContent = lines[nextIdx].text;
-      state.lastLyricLineIdx = -2;
+    } else {
+      // Past final line
+      ov.root.classList.remove("visible");
+      ov.countdownEl.classList.remove("active");
       return;
     }
 
     ov.root.classList.add("visible");
     ov.statusEl.textContent = "";
 
-    const cur = lines[idx];
-    const nextLine = idx + 1 < lines.length ? lines[idx + 1] : null;
-
-    if (cur.words && cur.words.length > 0) {
-      // Word-by-word KTV sweeping highlight
-      if (state.lastLyricLineIdx !== idx) {
-        ov.currentEl.textContent = "";
-        for (const w of cur.words) {
-          ov.currentEl.appendChild(el("span", { className: "ktv-lyric-word", textContent: w.word }));
-        }
-        ov.nextEl.textContent = nextLine ? nextLine.text : "";
-        state.lastLyricLineIdx = idx;
-      }
-      const spans = ov.currentEl.children;
-      for (let i = 0; i < cur.words.length && i < spans.length; i++) {
-        spans[i].classList.toggle("sung", now >= cur.words[i].start - 0.05);
-      }
-    } else if (state.lastLyricLineIdx !== idx) {
-      ov.currentEl.textContent = cur.text;
-      ov.nextEl.textContent = nextLine ? nextLine.text : "";
-      state.lastLyricLineIdx = idx;
+    // Update 3-2-1 KTV intro countdown dots
+    if (countdownSec > 0) {
+      ov.countdownEl.classList.add("active");
+      ov.cdDots[0].classList.toggle("lit", countdownSec <= 3.0);
+      ov.cdDots[1].classList.toggle("lit", countdownSec <= 2.0);
+      ov.cdDots[2].classList.toggle("lit", countdownSec <= 1.0);
+    } else {
+      ov.countdownEl.classList.remove("active");
     }
+
+    const topLine = topIdx >= 0 ? lines[topIdx] : null;
+    const bottomLine = bottomIdx >= 0 ? lines[bottomIdx] : null;
+
+    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0);
+    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0);
   }
 
   async function requestLyrics(forceAi = false) {
@@ -800,8 +905,9 @@
     if (ov) {
       ov.root.classList.add("visible");
       ov.statusEl.textContent = forceAi ? "AI 正在對準純人聲逐字對齊歌詞..." : "正在載入同步歌詞...";
-      ov.currentEl.textContent = "";
-      ov.nextEl.textContent = "";
+      setSlotContent(ov.topSlot, "", 0);
+      setSlotContent(ov.bottomSlot, "", 0);
+      ov.countdownEl.classList.remove("active");
     }
 
     const res = await apiRequest("/api/lyrics", "POST", {
@@ -821,9 +927,7 @@
       state.lyricsLoading = false;
       state.lyricsLines = res.data.lines;
       state.lyricsSourceLabel = res.data.source_label || "";
-      stopLyricsRenderLoop();
-      state.lyricsRenderTimer = setInterval(renderLyricsFrame, 60);
-      renderLyricsFrame();
+      startLyricsRenderLoop();
       updateUI();
       return;
     }
@@ -842,9 +946,7 @@
           state.lyricsLoading = false;
           state.lyricsLines = d.lines;
           state.lyricsSourceLabel = d.source_label || "";
-          stopLyricsRenderLoop();
-          state.lyricsRenderTimer = setInterval(renderLyricsFrame, 60);
-          renderLyricsFrame();
+          startLyricsRenderLoop();
           updateUI();
         } else if (d.status === "error") {
           stopLyricsPolling();
@@ -869,9 +971,7 @@
     if (state.lyricsLines && state.lyricsLines.length > 0) {
       state.lyricsEnabled = true;
       state.lastLyricLineIdx = -999;
-      stopLyricsRenderLoop();
-      state.lyricsRenderTimer = setInterval(renderLyricsFrame, 60);
-      renderLyricsFrame();
+      startLyricsRenderLoop();
       updateUI();
     } else {
       requestLyrics(false);
