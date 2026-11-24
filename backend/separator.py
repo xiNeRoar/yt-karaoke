@@ -1213,14 +1213,16 @@ class KaraokeSeparatorManager:
                 with self._lock:
                     self._active_procs[key] = proc
 
+                dur_sec = float(meta.get("duration") or 0.0)
+                lyrics_timeout = max(240, min(900, int(dur_sec * 1.15)))
                 try:
-                    _, stderr_text = proc.communicate(timeout=240)
+                    _, stderr_text = proc.communicate(timeout=lyrics_timeout)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     _, stderr_text = proc.communicate()
                     self.log.error(
                         "Lyrics",
-                        f"Worker timeout ({video_id}) after 240s | stderr: {(stderr_text or '')[-1500:]}",
+                        f"Worker timeout ({video_id}) after {lyrics_timeout}s | stderr: {(stderr_text or '')[-1500:]}",
                     )
                     raise RuntimeError("歌詞生成逾時")
                 finally:

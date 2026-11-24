@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -1978,15 +1979,40 @@ def main() -> int:
         except Exception:
             meta_data = {}
 
+    last_state = {"status": "running", "progress": 10, "stage_text": "載入歌詞中...", "error": None}
+    state_lock = threading.Lock()
+    hb_stop = threading.Event()
+
     def update(status: str, progress: int, stage_text: str, error: Optional[str] = None):
-        write_status(status_file, {
-            "video_id": args.video_id,
-            "status": status,
-            "progress": progress,
-            "stage_text": stage_text,
-            "error": error,
-            "elapsed_sec": round(time.time() - started, 1),
-        })
+        with state_lock:
+            last_state.update({"status": status, "progress": progress, "stage_text": stage_text, "error": error})
+            if status in ("ready", "error"):
+                hb_stop.set()
+            write_status(status_file, {
+                "video_id": args.video_id,
+                "status": status,
+                "progress": progress,
+                "stage_text": stage_text,
+                "error": error,
+                "elapsed_sec": round(time.time() - started, 1),
+            })
+
+    def _heartbeat_loop() -> None:
+        """Keep updated_at fresh during long CPU alignments (e.g. 8-10 min medleys) so monitors never false-alarm."""
+        while not hb_stop.wait(25.0):
+            with state_lock:
+                if hb_stop.is_set() or last_state["status"] != "running":
+                    return
+                write_status(status_file, {
+                    "video_id": args.video_id,
+                    "status": last_state["status"],
+                    "progress": last_state["progress"],
+                    "stage_text": last_state["stage_text"],
+                    "error": last_state["error"],
+                    "elapsed_sec": round(time.time() - started, 1),
+                })
+
+    threading.Thread(target=_heartbeat_loop, daemon=True, name="lyrics-heartbeat").start()
 
     try:
         update("running", 10, "載入歌詞中...")
@@ -2214,6 +2240,8 @@ def main() -> int:
         update("error", 0, "暫未能載入歌詞", error=str(exc))
         print(f"[LyricsWorker Error] {exc}", file=sys.stderr, flush=True)
         return 1
+    finally:
+        hb_stop.set()
 
 
 if __name__ == "__main__":
