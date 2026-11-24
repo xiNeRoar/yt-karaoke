@@ -382,6 +382,9 @@ def clear_video_cache(
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=18765, reload=False)
+    bind_host = os.environ.get("KARAOKE_HOST", "127.0.0.1")
+    bind_port = int(os.environ.get("KARAOKE_PORT", "18765"))
+    uvicorn.run("main:app", host=bind_host, port=bind_port, reload=False)
