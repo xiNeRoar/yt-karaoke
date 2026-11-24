@@ -35,7 +35,7 @@ LIVE_KEYWORDS_RE = re.compile(
     re.IGNORECASE,
 )
 HALLUCINATION_RE = re.compile(
-    r"(訂閱|订阅|按讚|点赞|感謝觀看|感谢观看|字幕組|字幕组|Amara\.org|謝謝收看|谢谢收看|Subscribe|Thanks for watching)",
+    r"(訂閱|订阅|按讚|点赞|感謝觀看|感谢观看|字幕組|字幕组|字幕視聽|字幕提供|Amara\.org|謝謝收看|谢谢收看|Subscribe|Thanks for watching|李宗盛)",
     re.IGNORECASE,
 )
 
@@ -120,8 +120,15 @@ def parse_lrc(lrc_text: str) -> list[dict]:
 
 def fetch_lrclib(title: str, duration: float) -> tuple[Optional[list[dict]], str]:
     """Returns (synced_lines_if_exact_studio_match, plain_lyrics_prompt_text)."""
-    queries = [clean_search_title(title)]
-    if queries[0] != title:
+    cleaned = clean_search_title(title)
+    queries = [cleaned]
+    # Also try extracting primary CJK song title (e.g. "戀愛腦之死 Feanna Wong" -> "戀愛腦之死")
+    cjk_parts = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
+    if cjk_parts:
+        for p in sorted(cjk_parts, key=len, reverse=True)[:2]:
+            if p not in queries:
+                queries.append(p)
+    if title not in queries:
         queries.append(title)
 
     best_synced = None
@@ -269,12 +276,16 @@ def run_whisper_on_vocals(vocals_path: Path, prompt_text: str, device_mode: str)
         vocab_hint = "以下是繁體中文粵語或國語歌曲歌詞，請使用標準香港繁體字。"
 
     def _run_with_model(m):
+        # NOTE: vad_filter MUST be False for isolated singing stems — Silero VAD is trained on spoken
+        # speech and falsely drops soft/melodic singing voices! BS-RoFormer vocals.mp3 already has zero music.
         segs_iter, inf = m.transcribe(
             str(vocals_path),
-            beam_size=3,
+            beam_size=5,
             word_timestamps=True,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 450, "speech_pad_ms": 200},
+            vad_filter=False,
+            no_speech_threshold=0.75,
+            log_prob_threshold=-1.2,
+            compression_ratio_threshold=2.2,
             initial_prompt=vocab_hint,
             condition_on_previous_text=False,
         )
