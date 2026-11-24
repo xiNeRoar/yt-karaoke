@@ -89,11 +89,13 @@ class KaraokeSeparatorManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._worker_lock = threading.Lock()
+        self._lyrics_lock = threading.Lock()
         self._active_procs: Dict[str, subprocess.Popen] = {}
         self._queued_keys: set[str] = set()
         self._rate_history: Dict[str, list[float]] = {}
         self._lyrics_mem_cache: Dict[str, dict] = {}
         self._lyrics_gdrive_missing: set[str] = set()
+        self._lyrics_in_progress: set[str] = set()
 
         self.cuda_available, self.gpu_name, _, _ = query_nvidia_gpu()
         env_mode = os.environ.get("KARAOKE_DEVICE", "auto").strip().lower()
@@ -129,7 +131,9 @@ class KaraokeSeparatorManager:
         if self.gdrive.is_configured():
             self.storage_mode = "gdrive"
             self.save_config()
-            threading.Thread(target=self.gdrive.sync_index_from_remote, daemon=True, name="gdrive-boot-sync").start()
+            # Only scan remote on boot if local index is empty; otherwise use instant gdrive_index.json!
+            if not self.gdrive.list_items():
+                threading.Thread(target=self.gdrive.sync_index_from_remote, daemon=True, name="gdrive-boot-sync").start()
         elif self.storage_mode == "gdrive":
             self.storage_mode = "local"
         self.log.info(
@@ -662,12 +666,11 @@ class KaraokeSeparatorManager:
     def get_lyrics(self, video_id: str, mode: str = "pure") -> dict:
         # 1) Ultra-fast in-memory cache (~4KB/song, 0 MB local disk, <1ms response!)
         with self._lock:
-            mem = self._lyrics_mem_cache.get(video_id)
-            if mem and mem.get("lines"):
-                return {"status": "ready", "progress": 100, "stage_text": mem.get("source_label", "歌詞已就緒"), **mem}
-            key = f"lyrics__{video_id}"
-            proc = self._active_procs.get(key)
-            is_running = proc is not None and proc.poll() is None
+            is_running = video_id in self._lyrics_in_progress
+            if not is_running:
+                mem = self._lyrics_mem_cache.get(video_id)
+                if mem and mem.get("lines"):
+                    return {"status": "ready", "progress": 100, "stage_text": mem.get("source_label", "歌詞已就緒"), **mem}
 
         # 2) If worker is currently running, return status immediately without hitting Google Drive!
         sf = self._lyrics_status_file(video_id)
@@ -722,11 +725,10 @@ class KaraokeSeparatorManager:
                 self._lyrics_mem_cache.pop(video_id, None)
                 self._lyrics_gdrive_missing.discard(video_id)
 
-        key = f"lyrics__{video_id}"
         with self._lock:
-            existing_proc = self._active_procs.get(key)
-            if existing_proc is not None and existing_proc.poll() is None:
+            if video_id in self._lyrics_in_progress:
                 return self.get_lyrics(video_id, mode)
+            self._lyrics_in_progress.add(video_id)
 
             sf = self._lyrics_status_file(video_id)
             init = {
@@ -752,7 +754,7 @@ class KaraokeSeparatorManager:
         key = f"lyrics__{video_id}"
         temp_vocals: Optional[Path] = None
         try:
-            with self._worker_lock:
+            with self._lyrics_lock:
                 vocals_path = self.get_cache_dir(video_id, mode) / "vocals.mp3"
                 # If audio lives only on Google Drive, pull vocals.mp3 temporarily for Whisper alignment
                 if not vocals_path.exists() and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
@@ -851,6 +853,8 @@ class KaraokeSeparatorManager:
             except Exception:
                 pass
         finally:
+            with self._lock:
+                self._lyrics_in_progress.discard(video_id)
             if temp_vocals and temp_vocals.exists():
                 try:
                     temp_vocals.unlink()

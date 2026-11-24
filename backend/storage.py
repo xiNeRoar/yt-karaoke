@@ -47,6 +47,8 @@ class GoogleDriveStorage:
         self._lock = threading.Lock()
         self.rclone_exe = find_rclone_exe()
         self._index: dict[str, dict] = {}
+        self._configured_cache: Optional[bool] = None
+        self._configured_checked_at: float = 0.0
         self._load_index()
 
     def refresh_binary(self) -> Optional[str]:
@@ -66,9 +68,14 @@ class GoogleDriveStorage:
         except Exception:
             pass
 
-    def is_configured(self) -> bool:
+    def is_configured(self, force_refresh: bool = False) -> bool:
+        now = time.time()
+        if not force_refresh and self._configured_cache is not None and (now - self._configured_checked_at) < 60.0:
+            return self._configured_cache
         exe = self.refresh_binary()
         if not exe:
+            self._configured_cache = False
+            self._configured_checked_at = now
             return False
         try:
             out = subprocess.check_output(
@@ -77,9 +84,12 @@ class GoogleDriveStorage:
                 timeout=4,
                 creationflags=CREATE_NO_WINDOW,
             )
-            return f"{RCLONE_REMOTE}:" in out.splitlines()
+            res = f"{RCLONE_REMOTE}:" in out.splitlines()
         except Exception:
-            return False
+            res = False
+        self._configured_cache = res
+        self._configured_checked_at = now
+        return res
 
     def _remote_base(self, video_id: str, mode: str) -> str:
         return f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{video_id}/{mode}"
@@ -197,9 +207,9 @@ class GoogleDriveStorage:
                 pass
 
     def sync_index_from_remote(self) -> int:
-        """Scan Google Drive folder to rebuild index (e.g., on fresh install or restart)."""
+        """Scan Google Drive folder to rebuild index WITHOUT holding self._lock during network I/O."""
         exe = self.refresh_binary()
-        if not exe or not self.is_configured():
+        if not exe or not self.is_configured(force_refresh=True):
             return 0
         try:
             out = subprocess.check_output(
@@ -210,52 +220,59 @@ class GoogleDriveStorage:
             )
             files = json.loads(out)
         except Exception:
-            return len(self._index)
+            with self._lock:
+                return len(self._index)
 
         grouped: dict[tuple[str, str], dict] = {}
         for f in files:
             path_parts = f.get("Path", "").replace("\\", "/").split("/")
-            if len(path_parts) != 3:
+            if len(path_parts) != 3 or path_parts[0].startswith("_"):
                 continue
             vid, mode, fname = path_parts
             g = grouped.setdefault((vid, mode), {"files": set(), "bytes": 0})
             g["files"].add(fname)
             g["bytes"] += int(f.get("Size", 0))
 
+        # Snapshot existing index quickly (<0.1ms) then do all network meta.json reads OUTSIDE self._lock!
         with self._lock:
-            new_index: dict[str, dict] = {}
-            for (vid, mode), info in grouped.items():
-                if "instrumental.mp3" in info["files"] and "vocals.mp3" in info["files"]:
-                    key = self._key(vid, mode)
-                    existing = self._index.get(key, {})
-                    title = existing.get("title") or vid
-                    duration = existing.get("duration") or 0
-                    created_at = existing.get("created_at") or time.time()
-                    # Fetch meta.json if title not cached yet
-                    if title == vid and "meta.json" in info["files"]:
-                        try:
-                            meta_raw = subprocess.check_output(
-                                [exe, "cat", f"{self._remote_base(vid, mode)}/meta.json"],
-                                text=True,
-                                timeout=8,
-                                creationflags=CREATE_NO_WINDOW,
-                            )
-                            m = json.loads(meta_raw)
-                            title = m.get("title", vid)
-                            duration = m.get("duration", 0)
-                            created_at = m.get("created_at", created_at)
-                        except Exception:
-                            pass
-                    new_index[key] = {
-                        "video_id": vid,
-                        "mode": mode,
-                        "title": title,
-                        "duration": duration,
-                        "size_mb": round(info["bytes"] / (1024 * 1024), 2),
-                        "created_at": created_at,
-                        "storage": "gdrive",
-                        "url": f"https://www.youtube.com/watch?v={vid}",
-                    }
+            existing_snapshot = dict(self._index)
+
+        new_index: dict[str, dict] = {}
+        for (vid, mode), info in grouped.items():
+            if "instrumental.mp3" in info["files"] and "vocals.mp3" in info["files"]:
+                key = self._key(vid, mode)
+                existing = existing_snapshot.get(key, {})
+                title = existing.get("title") or vid
+                duration = existing.get("duration") or 0
+                created_at = existing.get("created_at") or time.time()
+                if title == vid and "meta.json" in info["files"]:
+                    try:
+                        meta_raw = subprocess.check_output(
+                            [exe, "cat", f"{self._remote_base(vid, mode)}/meta.json"],
+                            text=True,
+                            encoding="utf-8",
+                            timeout=10,
+                            creationflags=CREATE_NO_WINDOW,
+                        )
+                        m = json.loads(meta_raw)
+                        title = m.get("title", vid)
+                        duration = m.get("duration", 0)
+                        created_at = m.get("created_at", created_at)
+                    except Exception:
+                        pass
+                new_index[key] = {
+                    "video_id": vid,
+                    "mode": mode,
+                    "title": title,
+                    "duration": duration,
+                    "size_mb": round(info["bytes"] / (1024 * 1024), 2),
+                    "created_at": created_at,
+                    "storage": "gdrive",
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                }
+
+        # Atomic swap inside lock (<0.1ms)
+        with self._lock:
             self._index = new_index
             self._save_index()
             return len(self._index)
