@@ -332,7 +332,7 @@ class KaraokeSeparatorManager:
                 cur_ly = self.get_lyrics(vid, mode)
                 cur_src = str(cur_ly.get("source") or "")
                 keep_sources = {
-                    "youtube_sub", "lrclib_exact",
+                    "youtube_sub_qwen3", "lrclib_qwen3_align",
                     "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align", "qwen3_phrase_rescue_align",
                 }
                 if cur_src not in keep_sources:

@@ -1391,6 +1391,7 @@ def refine_lines_with_qwen3(
     step_sec: float,
     device_mode: str,
     first_onset: float,
+    max_pad_sec: float = 1.5,
 ) -> tuple[list[dict], bool]:
     """Windowed batched Cantonese/multilingual word-level timestamp refinement using Qwen3-ForcedAligner-0.6B.
 
@@ -1448,8 +1449,8 @@ def refine_lines_with_qwen3(
             prev_end = float(lines[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
             next_start = float(lines[idx_list[-1] + 1]["start"]) if (idx_list[-1] + 1) < len(lines) else audio_dur
             # Pad window boundaries safely without crossing into neighboring sung lines
-            pad_left = min(1.5, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * 0.45))
-            pad_right = min(1.5, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * 0.45))
+            pad_left = min(max_pad_sec, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * 0.45))
+            pad_right = min(max_pad_sec, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * 0.45))
             w_t0 = max(0.0, float(lines[idx_list[0]]["start"]) - pad_left)
             w_t1 = min(audio_dur, float(lines[idx_list[-1]]["end"]) + pad_right)
             if w_t1 - w_t0 < 1.0 or w_t1 - w_t0 > 120.0:
@@ -1870,12 +1871,22 @@ def main() -> int:
             if fetched_dur > 0:
                 duration = fetched_dur
 
-        # Layer 1: Human YouTube subtitles (unless user explicitly requested AI re-alignment)
+        # Layer 1: Human YouTube subtitles (already timed to this exact video; if GPU is free, enrich with Qwen3 word sweep!)
         if yt_lines and not force_ai:
+            yt_src = "youtube_sub"
+            if vocals_path.exists():
+                audio_16k, db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
+                if len(audio_16k) > 0:
+                    yt_ref, q_ok = refine_lines_with_qwen3(
+                        yt_lines, audio_16k, db_profile, step_sec, args.device_mode, first_onset, max_pad_sec=1.5
+                    )
+                    if q_ok and len(yt_ref) >= 4:
+                        yt_lines = yt_ref
+                        yt_src = "youtube_sub_qwen3"
             result = {
                 "video_id": args.video_id,
                 "title": title,
-                "source": "youtube_sub",
+                "source": yt_src,
                 "source_label": "同步字幕",
                 "lines": yt_lines,
                 "created_at": time.time(),
@@ -1897,7 +1908,9 @@ def main() -> int:
             )
         )
 
-        if lrc_synced and not force_ai:
+        # Only return raw line-only LRC if vocals.mp3 is unavailable; otherwise ALWAYS acoustically align
+        # against THIS video's actual vocals (eliminates MV-vs-Spotify intro offsets and fake 8s 0-word sweeps!).
+        if lrc_synced and not force_ai and not vocals_path.exists():
             result = {
                 "video_id": args.video_id,
                 "title": title,
@@ -1915,6 +1928,35 @@ def main() -> int:
             raise RuntimeError("請先開啟唱 K 伴奏")
 
         audio_16k, db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
+
+        # Fast-path acoustic alignment when we have studio LRC scaffold + free GPU VRAM (~2.5s total with Qwen3!):
+        # Auto-compensate MV-vs-Spotify intro offset using detected first_onset before running windowed Qwen3 refinement.
+        if lrc_synced and len(lrc_synced) >= 4 and len(audio_16k) > 0:
+            shift = first_onset - float(lrc_synced[0]["start"])
+            if abs(shift) <= 12.0:
+                audio_dur = len(audio_16k) / 16000.0
+                shifted_lrc = []
+                for ln in lrc_synced:
+                    ns = max(0.0, round(float(ln["start"]) + (shift if abs(shift) > 0.6 else 0.0), 2))
+                    ne = min(audio_dur, max(ns + 0.5, round(float(ln["end"]) + (shift if abs(shift) > 0.6 else 0.0), 2)))
+                    shifted_lrc.append({"start": ns, "end": ne, "text": ln["text"], "words": []})
+                update("running", 65, "精修歌詞時間軸...")
+                q_lines, q_ok = refine_lines_with_qwen3(
+                    shifted_lrc, audio_16k, db_profile, step_sec, args.device_mode, first_onset, max_pad_sec=2.5
+                )
+                if q_ok and len(q_lines) >= 4:
+                    result = {
+                        "video_id": args.video_id,
+                        "title": title,
+                        "source": "lrclib_qwen3_align",
+                        "source_label": "同步歌詞",
+                        "lines": q_lines,
+                        "created_at": time.time(),
+                    }
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                    update("ready", 100, "歌詞已就緒")
+                    return 0
 
         # Layer 2B: Automatic Shazam audio fingerprinting for Mashups/Medleys OR videos whose title has no song name!
         shazam_tried = False
