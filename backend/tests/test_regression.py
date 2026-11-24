@@ -110,7 +110,11 @@ def test_worker_and_separator_invariants() -> None:
     # 4) gateway/main.py must NEVER set max-age=86400 on fallback proxy stream and must evict _lyrics_ram on HQ upgrade
     assert 'headers={"Cache-Control": "no-store"}' in gw_src, "Gateway proxy stream must not cache 24h"
     assert "_lyrics_ram.pop(evid" in gw_src, "Gateway must evict stale lyrics RAM on HQ upgrade"
-    print("[PASS] Structural lifecycle & concurrency invariants (worker + separator + gateway)")
+    # 5) lyrics_worker.py must NEVER return raw 0-word youtube_sub or lrclib_exact when vocals.mp3 exists
+    lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
+    assert "if not vocals_path.exists():" in lw_src, "Layer 1 youtube_sub must require word alignment when vocals exist"
+    assert "if lrc_synced and not force_ai and not vocals_path.exists():" in lw_src, "Layer 2 LRC must require word alignment when vocals exist"
+    print("[PASS] Structural lifecycle & concurrency invariants (worker + separator + gateway + zero-0w lyrics)")
 
 
 def test_generic_title_decomposition() -> None:

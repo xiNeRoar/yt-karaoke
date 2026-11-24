@@ -2001,42 +2001,63 @@ def main() -> int:
             if fetched_dur > 0:
                 duration = fetched_dur
 
-        # Layer 1: Human YouTube subtitles (already timed to this exact video; if GPU is free, enrich with Qwen3 word sweep!)
+        # Layer 1: Human YouTube subtitles — NEVER ship 0-word linear-sweep lines when vocals.mp3 exists!
+        # If GPU is free -> enrich directly with Qwen3 (~2.5s); if GPU is busy -> fall through to stable-ts
+        # forced alignment using these exact human-authored lines so EVERY song gets real word timestamps!
+        yt_human_official_lines: list[str] = []
+        cached_vocal_profile = None
         if yt_lines and not force_ai:
-            yt_src = "youtube_sub"
-            if vocals_path.exists():
-                audio_16k, db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
-                if len(audio_16k) > 0:
-                    yt_ref, q_ok = refine_lines_with_qwen3(
-                        yt_lines, audio_16k, db_profile, step_sec, args.device_mode, first_onset, max_pad_sec=1.5
-                    )
-                    if q_ok and len(yt_ref) >= 4:
-                        yt_lines = yt_ref
-                        yt_src = "youtube_sub_qwen3"
-            result = {
-                "video_id": args.video_id,
-                "title": title,
-                "source": yt_src,
-                "source_label": "同步字幕",
-                "lines": yt_lines,
-                "created_at": time.time(),
-            }
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            write_json_atomic(out_file, result, stamp_updated_at=False)
-            update("ready", 100, "歌詞已就緒")
-            return 0
+            if not vocals_path.exists():
+                result = {
+                    "video_id": args.video_id,
+                    "title": title,
+                    "source": "youtube_sub",
+                    "source_label": "同步字幕",
+                    "lines": yt_lines,
+                    "created_at": time.time(),
+                }
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                write_json_atomic(out_file, result, stamp_updated_at=False)
+                update("ready", 100, "歌詞已就緒")
+                return 0
+
+            cached_vocal_profile = detect_vocal_energy_profile(vocals_path)
+            audio_16k_yt, db_prof_yt, step_yt, onset_yt = cached_vocal_profile
+            if len(audio_16k_yt) > 0:
+                update("running", 65, "精修歌詞時間軸...")
+                yt_ref, q_ok = refine_lines_with_qwen3(
+                    yt_lines, audio_16k_yt, db_prof_yt, step_yt, args.device_mode, onset_yt, max_pad_sec=1.5
+                )
+                if q_ok and len(yt_ref) >= 4:
+                    result = {
+                        "video_id": args.video_id,
+                        "title": title,
+                        "source": "youtube_sub_qwen3",
+                        "source_label": "同步字幕",
+                        "lines": yt_ref,
+                        "created_at": time.time(),
+                    }
+                    out_file.parent.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(out_file, result, stamp_updated_at=False)
+                    update("ready", 100, "歌詞已就緒")
+                    return 0
+            # GPU busy / Qwen3 skipped -> keep these exact human YouTube lines for CPU stable-ts word alignment!
+            yt_human_official_lines = clean_lyric_lines([ln["text"] for ln in yt_lines])
 
         # Layer 2: Generic parallel official lyrics lookup (LRCLIB + NetEase + YT Desc)
         update("running", 25, "搜尋歌詞中...")
         is_mashup_title = bool(MASHUP_KEYWORDS_RE.search(title))
-        lrc_synced, official_lines, lrc_src = (
-            (None, [], "")
-            if is_mashup_title
-            else fetch_official_lyrics(
-                title, duration, yt_desc,
-                yt_track=yt_track, yt_artist=yt_artist, yt_channel=yt_channel,
+        if yt_human_official_lines:
+            lrc_synced, official_lines, lrc_src = None, yt_human_official_lines, "YouTube Human Subtitles"
+        else:
+            lrc_synced, official_lines, lrc_src = (
+                (None, [], "")
+                if is_mashup_title
+                else fetch_official_lyrics(
+                    title, duration, yt_desc,
+                    yt_track=yt_track, yt_artist=yt_artist, yt_channel=yt_channel,
+                )
             )
-        )
 
         # Only return raw line-only LRC if vocals.mp3 is unavailable; otherwise ALWAYS acoustically align
         # against THIS video's actual vocals (eliminates MV-vs-Spotify intro offsets and fake 8s 0-word sweeps!).
@@ -2057,7 +2078,9 @@ def main() -> int:
         if not vocals_path.exists():
             raise RuntimeError("請先開啟唱 K 伴奏")
 
-        audio_16k, db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
+        audio_16k, db_profile, step_sec, first_onset = (
+            cached_vocal_profile if cached_vocal_profile is not None else detect_vocal_energy_profile(vocals_path)
+        )
 
         # Fast-path acoustic alignment when we have studio LRC scaffold + free GPU VRAM (~2.5s total with Qwen3!):
         # Auto-compensate MV-vs-Spotify intro offset using detected first_onset before running windowed Qwen3 refinement.
