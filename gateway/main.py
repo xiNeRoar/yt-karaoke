@@ -76,6 +76,7 @@ class GatewayState:
         self._index: dict[str, dict] = {}
         self._lyrics_ram: dict[str, dict] = {}
         self._lyrics_missing: set[str] = set()
+        self._lyrics_refreshing: set[str] = set()
         self._clients: dict[str, dict] = {}
         self._rate_hist: dict[str, list[float]] = {}
 
@@ -602,9 +603,13 @@ def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental"
 @app.get("/api/lyrics/{video_id}")
 def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
     _validate_vid(video_id)
-    cached = gw.get_cached_lyrics(video_id, mode)
-    if cached:
-        return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
+    with gw._lock:
+        is_refreshing = video_id in gw._lyrics_refreshing
+
+    if not is_refreshing:
+        cached = gw.get_cached_lyrics(video_id, mode)
+        if cached:
+            return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
 
     if gw.gpu_online and GPU_NODE_URL:
         try:
@@ -620,9 +625,14 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
                     with gw._lock:
                         gw._lyrics_ram[video_id] = d
                         gw._lyrics_missing.discard(video_id)
+                        gw._lyrics_refreshing.discard(video_id)
+                elif d.get("status") in ("error", "idle"):
+                    with gw._lock:
+                        gw._lyrics_refreshing.discard(video_id)
                 return d
         except Exception:
-            pass
+            with gw._lock:
+                gw._lyrics_refreshing.discard(video_id)
 
     return {"video_id": video_id, "status": "idle", "progress": 0, "stage_text": OFFLINE_MSG if not gw.gpu_online else "未生成歌詞", "lines": []}
 
@@ -634,6 +644,11 @@ def generate_lyrics(req: LyricsRequest):
         cached = gw.get_cached_lyrics(req.video_id, req.mode)
         if cached:
             return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
+    else:
+        with gw._lock:
+            gw._lyrics_ram.pop(req.video_id, None)
+            gw._lyrics_missing.discard(req.video_id)
+            gw._lyrics_refreshing.add(req.video_id)
 
     if not gw.gpu_online or not GPU_NODE_URL:
         raise HTTPException(status_code=503, detail=OFFLINE_MSG)
