@@ -56,8 +56,8 @@ def get_yt_cookie_opts() -> dict:
 
 MODELS = {
     "pure": {
-        "label": "純伴奏 (BS-RoFormer 1297)",
-        "filename": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "label": "純伴奏 (MelBand RoFormer Inst FVX)",
+        "filename": "mel_band_roformer_instrumental_fvx_gabox.ckpt",
     },
 }
 CPU_FAST_MODEL = "UVR-MDX-NET-Inst_HQ_3.onnx"
@@ -366,7 +366,7 @@ def main() -> int:
                 "segment_size": 256,
                 "override_model_segment_size": False,
                 "batch_size": 1,
-                "overlap": 4,  # Cleaner highs & smoother live concert separation with ~13dB SDR
+                "overlap": 2,  # MelBand Inst FVX: 2x faster on GPU (~12-18s) with fuller untouched instrumental
                 "pitch_shift": 0,
             },
         )

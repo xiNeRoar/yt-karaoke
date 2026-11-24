@@ -13,9 +13,9 @@ from storage import GoogleDriveStorage, find_rclone_exe
 
 MODELS: Dict[str, Dict[str, str]] = {
     "pure": {
-        "label": "純伴奏 (BS-RoFormer 1297)",
-        "filename": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
-        "description": "完全去除人聲，最高準確率純伴奏",
+        "label": "純伴奏 (MelBand RoFormer Inst FVX)",
+        "filename": "mel_band_roformer_instrumental_fvx_gabox.ckpt",
+        "description": "伴奏優先旗艦模型，完整保留原曲厚度並乾淨去人聲",
     },
 }
 
@@ -211,7 +211,7 @@ class KaraokeSeparatorManager:
             staging_root.mkdir(parents=True, exist_ok=True)
             self.log.info(
                 "HQUpgrade",
-                f"Start idle BS-RoFormer upgrade for {vid} ({mode}) | free_vram={free_mb:.0f}MB",
+                f"Start idle MelBand Inst FVX upgrade for {vid} ({mode}) | free_vram={free_mb:.0f}MB",
             )
             target_url = f"https://www.youtube.com/watch?v={vid}"
             cmd = [
@@ -288,7 +288,7 @@ class KaraokeSeparatorManager:
             self._hq_upgrade_backoff.pop(key, None)
             self.log.info(
                 "HQUpgrade",
-                f"Upgraded {vid} ({mode}) cpu_fast -> gpu_hq (BS-RoFormer 1297) in {upgraded_meta.get('elapsed_sec', '?')}s",
+                f"Upgraded {vid} ({mode}) cpu_fast -> gpu_hq (MelBand Inst FVX) in {upgraded_meta.get('elapsed_sec', '?')}s",
             )
             self.log.trigger_sync_async()
         except Exception as exc:

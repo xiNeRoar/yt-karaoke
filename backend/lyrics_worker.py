@@ -1277,6 +1277,136 @@ def _live_section_anchored_align(
     return refine_alignment_with_acoustics(final_lines, db_profile, step_sec, total_sec, first_onset)
 
 
+QWEN3_LANG_MAP = {
+    "zh": "Cantonese",
+    "yue": "Cantonese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "fr": "French",
+    "de": "German",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "ru": "Russian",
+}
+
+
+def align_official_lyrics_with_qwen3(
+    vocals_path: Path,
+    audio_16k: np.ndarray,
+    db_profile: np.ndarray,
+    step_sec: float,
+    official_lines: list[str],
+    device_mode: str,
+    first_onset: float,
+) -> tuple[Optional[list[dict]], str, str]:
+    """Primary GPU Forced Aligner using Qwen/Qwen3-ForcedAligner-0.6B.
+
+    Natively trained on Cantonese/Mandarin/English/Japanese/Korean + singing voice.
+    Aligns a full silence-collapsed song (~500 chars) in ~2-3s on RTX GPU.
+    Returns (lines_or_None, used_dev, fallback_reason).
+    """
+    if device_mode == "cpu":
+        return None, "cpu", "cpu_mode"
+
+    free_mb = query_free_vram_mb()
+    if device_mode != "gpu" and free_mb < 2200:
+        return None, "cpu", f"low_vram({free_mb:.0f}MB)"
+
+    lang = detect_lyrics_language(official_lines)
+    qwen_lang = QWEN3_LANG_MAP.get(lang)
+    if not qwen_lang:
+        return None, "cpu", f"unsupported_lang({lang})"
+
+    audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
+    if len(audio_16k) == 0 or len(db_profile) == 0:
+        return None, "cpu", "no_audio_profile"
+
+    # Pillar 1: Collapse silent instrumental interludes (>1.6s) so even 5-6 min songs fit inside Qwen3's 300s window!
+    comp_audio, time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
+    comp_dur = len(comp_audio) / 16000.0
+    if comp_dur <= 1.0 or comp_dur > 285.0:
+        return None, "cpu", f"comp_dur_out_of_range({comp_dur:.1f}s)"
+
+    try:
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        import torch
+        if not torch.cuda.is_available():
+            return None, "cpu", "no_cuda"
+        from qwen_asr import Qwen3ForcedAligner
+
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        aligner = Qwen3ForcedAligner.from_pretrained(
+            "Qwen/Qwen3-ForcedAligner-0.6B",
+            dtype=dtype,
+            device_map="cuda:0",
+        )
+        # Pre-count tokens per official line using Qwen3's exact tokenizer so we map 1:1 back to lines!
+        line_token_counts: list[int] = []
+        valid_lines: list[str] = []
+        for line in official_lines:
+            wlist, _ = aligner.aligner_processor.encode_timestamp(line, qwen_lang)
+            if wlist:
+                valid_lines.append(line)
+                line_token_counts.append(len(wlist))
+        if len(valid_lines) < 4:
+            return None, "cuda", "too_few_lines"
+
+        full_text = "\n".join(valid_lines)
+        res = aligner.align(audio=(comp_audio, 16000), text=full_text, language=qwen_lang)
+        items = list(res[0].items) if (res and len(res) > 0) else []
+        expected_total = sum(line_token_counts)
+        if not items or len(items) != expected_total:
+            return None, "cuda", f"token_count_mismatch({len(items)}!={expected_total})"
+
+        lines: list[dict] = []
+        cursor = 0
+        squished = 0
+        for line_txt, n_tok in zip(valid_lines, line_token_counts):
+            tok_slice = items[cursor: cursor + n_tok]
+            cursor += n_tok
+            if not tok_slice:
+                continue
+            raw_s = _map_comp_to_real(float(tok_slice[0].start_time), time_map)
+            raw_e = _map_comp_to_real(float(tok_slice[-1].end_time), time_map)
+            if (float(tok_slice[-1].end_time) - float(tok_slice[0].start_time)) <= 0.25 and n_tok >= 4:
+                squished += 1
+            start_s = round(max(first_onset, raw_s), 2)
+            end_s = round(max(start_s + 0.4, raw_e), 2)
+
+            words_out = []
+            for it in tok_slice:
+                wt = (it.text or "").strip()
+                if not wt:
+                    continue
+                ws = round(max(start_s, _map_comp_to_real(float(it.start_time), time_map)), 2)
+                we = round(max(ws + 0.05, _map_comp_to_real(float(it.end_time), time_map)), 2)
+                words_out.append({"start": ws, "end": we, "word": wt})
+
+            lines.append({"start": start_s, "end": end_s, "text": line_txt, "words": words_out})
+
+        # Clean up VRAM immediately after alignment
+        del aligner
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # Structural sanity check: if >35% of lines collapsed into <=0.25s (abridged live / skipped verses),
+        # hand off to section-anchored live alignment!
+        if len(lines) < 4:
+            return None, "cuda", "too_few_aligned_lines"
+        if squished / len(lines) > 0.35:
+            return None, "cuda", f"abridged_structure({squished}/{len(lines)}_squished)"
+
+        lines = refine_alignment_with_acoustics(lines, db_profile, step_sec, audio_dur, first_onset)
+        return lines, "cuda", ""
+    except Exception as exc:
+        print(f"[Lyrics] Qwen3-ForcedAligner fallback to stable-ts: {exc}", file=sys.stderr, flush=True)
+        return None, "cpu", f"exception:{exc}"
+
+
 def align_official_lyrics_with_stable_ts(
     vocals_path: Path,
     audio_16k: np.ndarray,
@@ -1590,18 +1720,36 @@ def main() -> int:
                 official_lines = shz_lines
 
         # Layer 3A (BEST): Silence-Collapsed Forced Alignment of 100% REAL official lyrics!
-        # Only skip directly to section-anchored mode for genuine Mashups/Medleys (multiple songs).
-        # Full covers/concerts ALWAYS try Silence-Collapsed Pass 1 first (2.4s, 0% dropped lines!) and
-        # automatically escalate to section-anchored if the singer skipped/swapped verses!
+        # Priority 1: Qwen3-ForcedAligner-0.6B on GPU (~2-3s, native Cantonese/CJK/EN/JP/KR singing voice!)
+        # Priority 2: stable-ts (faster-whisper large-v3-turbo) on low-VRAM CPU or abridged/mashup live cuts!
         if official_lines:
             update("running", 50, "對齊歌詞中...")
             is_multi_song_mashup = is_mashup_title or len(shazam_tracks) >= 2
-            ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
-                vocals_path, audio_16k, db_profile, step_sec, official_lines,
-                args.device_mode, first_onset, prefer_live=is_multi_song_mashup,
-                inst_path=inst_path, shazam_already_tried=shazam_tried,
-            )
-            src = "mashup_shazam_align" if len(shazam_tracks) >= 2 else ("live_anchored_align" if used_live else "forced_align")
+            ai_lines = []
+            used_dev = "cpu"
+            used_live = False
+            src = "forced_align"
+
+            if not is_multi_song_mashup:
+                q_lines, q_dev, q_reason = align_official_lyrics_with_qwen3(
+                    vocals_path, audio_16k, db_profile, step_sec, official_lines,
+                    args.device_mode, first_onset,
+                )
+                if q_lines and len(q_lines) >= 4:
+                    ai_lines = q_lines
+                    used_dev = q_dev
+                    src = "qwen3_forced_align"
+                elif q_reason:
+                    print(f"[Lyrics] Qwen3 skipped ({q_reason}), falling back to stable-ts", file=sys.stderr, flush=True)
+
+            if not ai_lines:
+                prefer_live = is_multi_song_mashup
+                ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
+                    vocals_path, audio_16k, db_profile, step_sec, official_lines,
+                    args.device_mode, first_onset, prefer_live=prefer_live,
+                    inst_path=inst_path, shazam_already_tried=shazam_tried,
+                )
+                src = "mashup_shazam_align" if len(shazam_tracks) >= 2 else ("live_anchored_align" if used_live else "forced_align")
             label = "同步歌詞"
         else:
             # Layer 3B: Free transcription + automatic Lyric-Phrase Rescue (identifies acoustic/live covers with no title!)
