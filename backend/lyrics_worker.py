@@ -644,12 +644,22 @@ def search_official_lyrics_by_sung_phrases(asr_segs: list[dict]) -> list[str]:
     return rescued_all
 
 
+def _get_yt_cookie_opts() -> dict:
+    cookies_file = BASE_DIR / "cookies.txt"
+    if cookies_file.exists() and cookies_file.stat().st_size > 0:
+        return {"cookiefile": str(cookies_file)}
+    ff_prof = BASE_DIR / ".yt_firefox_profile"
+    if (ff_prof / "cookies.sqlite").exists():
+        return {"cookiesfrombrowser": ("firefox", str(ff_prof), None, None)}
+    return {}
+
+
 def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], str, str, float, str]:
     import yt_dlp
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_get_yt_cookie_opts()}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         print(f"[Lyrics] YouTube subtitle probe skipped ({video_id}): {str(exc)[:140]}", flush=True)

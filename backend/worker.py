@@ -23,6 +23,17 @@ BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "cache"
 MODEL_DIR = BASE_DIR / "models"
 TEMP_DIR = BASE_DIR / "tmp"
+YT_COOKIES_FILE = BASE_DIR / "cookies.txt"
+YT_FIREFOX_PROFILE = BASE_DIR / ".yt_firefox_profile"
+
+
+def get_yt_cookie_opts() -> dict:
+    """Use optional owner-configured local cookies.txt or dedicated Firefox profile (never stored in git)."""
+    if YT_COOKIES_FILE.exists() and YT_COOKIES_FILE.stat().st_size > 0:
+        return {"cookiefile": str(YT_COOKIES_FILE)}
+    if (YT_FIREFOX_PROFILE / "cookies.sqlite").exists():
+        return {"cookiesfrombrowser": ("firefox", str(YT_FIREFOX_PROFILE), None, None)}
+    return {}
 
 MODELS = {
     "pure": {
@@ -163,6 +174,7 @@ def main() -> int:
                     "preferredquality": "0",
                 }
             ],
+            **get_yt_cookie_opts(),
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:

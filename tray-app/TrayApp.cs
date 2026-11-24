@@ -145,6 +145,7 @@ namespace YtKaraokeTray
         private static readonly string PythonExe = Path.Combine(BackendDir, @".venv\Scripts\python.exe");
         private static readonly string MainPy = Path.Combine(BackendDir, "main.py");
         private static readonly string TokenPath = Path.Combine(BackendDir, ".admin_token");
+        private static readonly string FirefoxProfileDir = Path.Combine(BackendDir, ".yt_firefox_profile");
         private const string ApiBase = "http://127.0.0.1:18765";
 
         private static string ResolveProjectRoot()
@@ -192,6 +193,7 @@ namespace YtKaraokeTray
         private Label _lblStatusPill;
         private Button _btnToggleServer;
         private Button _btnAutoUpdateExt;
+        private Button _btnYoutubeAuth;
         private Label _lblUsersNum;
         private Label _lblUsersSub;
         private Label _lblCacheNum;
@@ -342,9 +344,9 @@ namespace YtKaraokeTray
             };
             Controls.Add(_lblStatusPill);
 
-            // Top Action Row: Start/Stop + Auto-Update Chrome Extension
-            _btnToggleServer = MakeButton("啟動唱K 服務", pad, 58, 352, 44, AccentWhite, Color.FromArgb(15, 15, 15));
-            _btnToggleServer.Font = new Font("Microsoft JhengHei UI", 11f, FontStyle.Bold);
+            // Top Action Row: Start/Stop + Auto-Update Chrome Extension + YouTube Auth (Dedicated Firefox Profile)
+            _btnToggleServer = MakeButton("啟動唱K 服務", pad, 58, 232, 44, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnToggleServer.Font = new Font("Microsoft JhengHei UI", 10.5f, FontStyle.Bold);
             _btnToggleServer.Click += (s, e) =>
             {
                 if (_backendOnline || _starting) StopBackend();
@@ -352,10 +354,16 @@ namespace YtKaraokeTray
             };
             Controls.Add(_btnToggleServer);
 
-            _btnAutoUpdateExt = MakeButton("一鍵自動更新 Chrome 插件", pad + 364, 58, 352, 44, BtnNeutral, TextPrimary);
-            _btnAutoUpdateExt.Font = new Font("Microsoft JhengHei UI", 10.5f, FontStyle.Bold);
+            _btnAutoUpdateExt = MakeButton("更新 Chrome 插件", pad + 242, 58, 232, 44, BtnNeutral, TextPrimary);
+            _btnAutoUpdateExt.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
             _btnAutoUpdateExt.Click += async (s, e) => await TriggerAutoReloadExtensionAsync();
             Controls.Add(_btnAutoUpdateExt);
+
+            _btnYoutubeAuth = MakeButton("YouTube 登入驗證", pad + 484, 58, 232, 44, BtnNeutral, TextPrimary);
+            _btnYoutubeAuth.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
+            _btnYoutubeAuth.Click += async (s, e) => await OpenYouTubeFirefoxAuthAsync();
+            Controls.Add(_btnYoutubeAuth);
+            RefreshYouTubeAuthButton();
 
             // KPI Row (3 Cards)
             int kGap = 12;
@@ -602,6 +610,7 @@ namespace YtKaraokeTray
             _trayMenu.Items.Add(_trayPauseItem);
 
             _trayMenu.Items.Add(new ToolStripMenuItem("一鍵自動更新 Chrome 插件", null, async (s, e) => await TriggerAutoReloadExtensionAsync()));
+            _trayMenu.Items.Add(new ToolStripMenuItem("YouTube 登入驗證（專用 Firefox）", null, async (s, e) => await OpenYouTubeFirefoxAuthAsync()));
 
             _trayMenu.Items.Add(new ToolStripSeparator());
 
@@ -1016,8 +1025,68 @@ namespace YtKaraokeTray
             await Task.Delay(1200);
             _btnAutoUpdateExt.Text = resp != null ? "已觸發自動更新 ✓" : "更新失敗";
             await Task.Delay(1500);
-            _btnAutoUpdateExt.Text = "一鍵自動更新 Chrome 插件";
+            _btnAutoUpdateExt.Text = "更新 Chrome 插件";
             _btnAutoUpdateExt.Enabled = true;
+        }
+
+        private string FindFirefoxExe()
+        {
+            string[] candidates =
+            {
+                @"C:\Program Files\Mozilla Firefox\firefox.exe",
+                @"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Mozilla Firefox\firefox.exe")
+            };
+            foreach (var c in candidates)
+            {
+                if (File.Exists(c)) return c;
+            }
+            return null;
+        }
+
+        private void RefreshYouTubeAuthButton()
+        {
+            if (_btnYoutubeAuth == null || IsDisposed) return;
+            bool hasCookies = File.Exists(Path.Combine(FirefoxProfileDir, "cookies.sqlite"))
+                           || File.Exists(Path.Combine(BackendDir, "cookies.txt"));
+            _btnYoutubeAuth.Text = hasCookies ? "YouTube 已驗證 ✓" : "YouTube 登入驗證";
+            _btnYoutubeAuth.BackColor = hasCookies ? Color.FromArgb(26, 78, 46) : BtnNeutral;
+        }
+
+        private async Task OpenYouTubeFirefoxAuthAsync()
+        {
+            string ff = FindFirefoxExe();
+            if (string.IsNullOrEmpty(ff))
+            {
+                MessageBox.Show("搵唔到 Firefox，請先安裝 Mozilla Firefox（不會影響你原本的 Chrome）。", "未安裝 Firefox", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            try
+            {
+                Directory.CreateDirectory(FirefoxProfileDir);
+                _btnYoutubeAuth.Enabled = false;
+                _btnYoutubeAuth.Text = "登入完請關閉 Firefox...";
+
+                await Task.Run(() =>
+                {
+                    var p = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = ff,
+                        Arguments = "-no-remote -profile \"" + FirefoxProfileDir + "\" \"https://www.youtube.com\"",
+                        UseShellExecute = false
+                    });
+                    if (p != null) p.WaitForExit();
+                });
+            }
+            catch (Exception ex)
+            {
+                AppendLog("[YouTube Auth] Firefox error: " + ex.Message);
+            }
+            finally
+            {
+                _btnYoutubeAuth.Enabled = true;
+                RefreshYouTubeAuthButton();
+            }
         }
 
         private string FindRcloneExe()
