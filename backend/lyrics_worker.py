@@ -1591,11 +1591,20 @@ def _live_section_anchored_align(
 
     matched = filled
 
+    # Exclude any unmatched ASR gap whose timestamp was ALREADY covered by recovered official lyrics!
+    def _covered_by_matched(t_mid: float) -> bool:
+        for m in matched:
+            if (m["start"] - 1.0) <= t_mid <= (m["end"] + 1.0):
+                return True
+        return False
+
+    remaining_gaps = [g for g in unmatched_gaps if not _covered_by_matched(0.5 * (g["start"] + g["end"]))]
+
     # If a sustained unrecognized singing cluster STILL remains (e.g. an unreleased/parody section inside a Mashup),
     # keep those sung ASR lines so Mashup viewers never face a blank screen!
-    for cl in _find_sustained_unmatched_clusters(unmatched_gaps):
+    for cl in _find_sustained_unmatched_clusters(remaining_gaps):
         for g in cl:
-            matched.append({"start": g["start"], "end": g["end"], "text": g["text"], "sim": 0.0})
+            matched.append({"start": g["start"], "end": g["end"], "text": g["text"], "sim": 0.5})
     matched.sort(key=lambda x: x["start"])
 
     # Group into contiguous singing blocks (split on gaps > 4.5s) and align each block on its own audio slice!
@@ -1626,11 +1635,16 @@ def _live_section_anchored_align(
 
         if len(al_segs) == len(blk):
             for seg, ref in zip(al_segs, blk):
-                s_abs = round(max(first_onset, b_start + float(seg.start)), 2)
-                e_abs = round(max(s_abs + 0.4, b_start + float(seg.end)), 2)
-                n_chars = max(1, len(_norm_lyrics_cmp(ref["text"])))
-                # Guard against any single crushed/drifted line inside a block
-                if (e_abs - s_abs) < max(0.4, 0.08 * n_chars) or abs(s_abs - ref["start"]) > 5.5:
+                raw_s = b_start + float(seg.start)
+                raw_e = b_start + float(seg.end)
+                s_abs = round(max(first_onset, raw_s), 2)
+                e_abs = round(max(s_abs + 0.35, raw_e), 2)
+                is_real_anchor = float(ref.get("sim") or 0.0) > 0.0
+                # ONLY compare drift against ref["start"] for genuine ASR anchors (sim > 0)!
+                # Interpolated/recovered lines (sim == 0) have rough placeholder spans — NEVER overwrite real acoustic alignment with linear placeholders!
+                anchor_drifted = is_real_anchor and abs(s_abs - ref["start"]) > 6.0
+                totally_collapsed = (raw_e - raw_s) <= 0.05
+                if anchor_drifted or (is_real_anchor and totally_collapsed):
                     s_abs = round(max(first_onset, ref["start"]), 2)
                     e_abs = round(max(s_abs + 0.6, ref["end"]), 2)
                     words_out = _even_words_for_line(ref["text"], s_abs, e_abs)
@@ -1640,8 +1654,8 @@ def _live_section_anchored_align(
                         wt = (w.word or "").strip()
                         if not wt:
                             continue
-                        ws = round(max(s_abs, b_start + float(w.start)), 2)
-                        we = round(max(ws + 0.05, b_start + float(w.end)), 2)
+                        ws = round(max(s_abs, b_start + float(w.start)), 3)
+                        we = round(max(ws, b_start + float(w.end)), 3)
                         words_out.append({"start": ws, "end": we, "word": wt})
                 final_lines.append({"start": s_abs, "end": e_abs, "text": ref["text"], "words": words_out})
         else:
@@ -1655,11 +1669,13 @@ def _live_section_anchored_align(
                     "words": _even_words_for_line(ref["text"], s_abs, e_abs),
                 })
 
-    # Ensure strictly monotonic non-overlapping starts + acoustic onset/tail refinement
+    # Ensure strictly monotonic non-overlapping line boundaries before acoustic refinement
     for idx in range(1, len(final_lines)):
         if final_lines[idx]["start"] < final_lines[idx - 1]["start"] + 0.2:
             final_lines[idx]["start"] = round(final_lines[idx - 1]["end"], 2)
-            final_lines[idx]["end"] = round(max(final_lines[idx]["start"] + 0.5, final_lines[idx]["end"]), 2)
+            final_lines[idx]["end"] = round(max(final_lines[idx]["start"] + 0.4, final_lines[idx]["end"]), 2)
+        elif final_lines[idx]["start"] < final_lines[idx - 1]["end"]:
+            final_lines[idx - 1]["end"] = round(max(final_lines[idx - 1]["start"] + 0.3, final_lines[idx]["start"]), 2)
 
     return refine_alignment_with_acoustics(final_lines, db_profile, step_sec, total_sec, first_onset)
 
