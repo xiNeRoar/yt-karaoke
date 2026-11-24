@@ -2,6 +2,58 @@ const API_BASE = "http://127.0.0.1:18765";
 const IS_LOCAL_DEV = API_BASE.startsWith("http://127.0.0.1") || API_BASE.startsWith("http://localhost");
 let lastReloadNonce = null;
 
+// Persist & cache the user's bound invite device token + stable device ID in chrome.storage.local
+let _cachedAuth = { loaded: false, token: "", deviceId: "" };
+
+function _genDeviceId() {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  return "dev_" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function getAuthState() {
+  if (_cachedAuth.loaded && _cachedAuth.deviceId) {
+    return { token: _cachedAuth.token, deviceId: _cachedAuth.deviceId };
+  }
+  try {
+    const stored = await chrome.storage.local.get(["ktv_access_token", "ktv_device_id"]);
+    let deviceId = stored.ktv_device_id || "";
+    if (!deviceId) {
+      deviceId = _genDeviceId();
+      await chrome.storage.local.set({ ktv_device_id: deviceId });
+    }
+    _cachedAuth = {
+      loaded: true,
+      token: typeof stored.ktv_access_token === "string" ? stored.ktv_access_token : "",
+      deviceId,
+    };
+  } catch (_e) {
+    if (!_cachedAuth.deviceId) _cachedAuth.deviceId = _genDeviceId();
+    _cachedAuth.loaded = true;
+  }
+  return { token: _cachedAuth.token, deviceId: _cachedAuth.deviceId };
+}
+
+async function saveAuthToken(token) {
+  const st = await getAuthState();
+  _cachedAuth.token = token || "";
+  try {
+    if (token) {
+      await chrome.storage.local.set({ ktv_access_token: token, ktv_device_id: st.deviceId });
+    } else {
+      await chrome.storage.local.remove(["ktv_access_token"]);
+    }
+  } catch (_e) {}
+}
+
+if (chrome.storage && chrome.storage.onChanged) {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.ktv_access_token) {
+      _cachedAuth.token = typeof changes.ktv_access_token.newValue === "string" ? changes.ktv_access_token.newValue : "";
+    }
+  });
+}
+
 // Right after local dev auto-reload finishes, gently refresh open YouTube watch tabs so new content.js takes effect
 chrome.runtime.onInstalled.addListener((details) => {
   if (IS_LOCAL_DEV && (details.reason === "update" || details.reason === "install")) {
@@ -45,12 +97,54 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   (async () => {
     try {
+      if (message.type === "AUTH_GET_STATE") {
+        const st = await getAuthState();
+        sendResponse({ ok: true, token: st.token, deviceId: st.deviceId });
+        return;
+      }
+
+      if (message.type === "AUTH_CLEAR") {
+        await saveAuthToken("");
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "AUTH_ACTIVATE") {
+        const code = typeof message.code === "string" ? message.code.trim() : "";
+        if (!code) {
+          sendResponse({ ok: false, error: "請輸入邀請碼" });
+          return;
+        }
+        const st = await getAuthState();
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 15000);
+        try {
+          const res = await fetch(`${API_BASE}/api/auth/activate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ code, device_id: st.deviceId }),
+            signal: ctrl.signal,
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data && data.token) {
+            await saveAuthToken(data.token);
+            sendResponse({ ok: true, status: res.status, data });
+          } else {
+            sendResponse({ ok: false, status: res.status, error: (data && data.detail) || "邀請碼啟用失敗", data });
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+        return;
+      }
+
       if (message.type === "API_REQUEST") {
         const { path, method = "GET", body = null, clientId = null } = message;
         if (typeof path !== "string" || !path.startsWith("/api/")) {
           sendResponse({ ok: false, error: "Invalid API path" });
           return;
         }
+        const st = await getAuthState();
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 20000);
         const init = {
@@ -61,6 +155,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (clientId) {
           init.headers["X-Karaoke-Client"] = clientId;
         }
+        if (st.token) {
+          init.headers["X-Karaoke-Token"] = st.token;
+        }
         if (body !== null) {
           init.headers["Content-Type"] = "application/json";
           init.body = JSON.stringify(body);
@@ -68,6 +165,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         try {
           const res = await fetch(`${API_BASE}${path}`, init);
           const data = await res.json().catch(() => ({}));
+          if (res.status === 401 && data && data.auth_required) {
+            await saveAuthToken("");
+          }
           if (data && typeof data.extension_reload_nonce === "number") {
             checkReloadNonce(data.extension_reload_nonce);
           }
@@ -102,11 +202,14 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener(async (msg) => {
     if (!msg || typeof msg.path !== "string" || !msg.path.startsWith("/api/")) return;
+    const st = await getAuthState();
     const ctrl = new AbortController();
     activeCtrl = ctrl;
     const timer = setTimeout(() => ctrl.abort(), 60000);
     try {
-      const res = await fetch(`${API_BASE}${msg.path}`, { signal: ctrl.signal });
+      const headers = {};
+      if (st.token) headers["X-Karaoke-Token"] = st.token;
+      const res = await fetch(`${API_BASE}${msg.path}`, { headers, signal: ctrl.signal });
       if (disconnected) return;
       if (!res.ok) {
         port.postMessage({ type: "error", error: `HTTP ${res.status}` });

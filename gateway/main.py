@@ -9,9 +9,11 @@ Runs on NAS (Docker, ~140MB RAM, 0% GPU):
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -26,6 +28,7 @@ from pydantic import BaseModel
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
 
 GPU_NODE_URL = os.environ.get("GPU_NODE_URL", "").rstrip("/")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "").strip()
@@ -33,6 +36,7 @@ RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "ytkaraoke_gdrive").strip()
 RCLONE_FOLDER = os.environ.get("RCLONE_FOLDER", "YT-Karaoke-Cache").strip()
 RATE_LIMIT_PER_10MIN = int(os.environ.get("RATE_LIMIT_PER_10MIN", "5"))
 MAX_CLIENTS = int(os.environ.get("MAX_CLIENTS", "200"))
+REQUIRE_AUTH_MODE = os.environ.get("REQUIRE_AUTH", "auto").strip().lower()
 ALLOWED_EXT_IDS = {
     x.strip() for x in os.environ.get("ALLOWED_EXTENSION_IDS", "").split(",") if x.strip()
 }
@@ -40,6 +44,8 @@ ALLOWED_EXT_IDS = {
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_FILE = DATA_DIR / "gdrive_index.json"
+ACCESS_KEYS_FILE = DATA_DIR / "access_keys.json"
+DEVICE_BINDINGS_FILE = DATA_DIR / "device_bindings.json"
 AUDIO_CACHE_DIR = DATA_DIR / "audio_cache"
 AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MAX_NAS_CACHE_MB = int(os.environ.get("MAX_NAS_CACHE_MB", "2048"))
@@ -84,6 +90,13 @@ class GatewayState:
         self._lyrics_refresh_ttl = 300.0
         self._clients: dict[str, dict] = {}
         self._rate_hist: dict[str, list[float]] = {}
+        self._activate_rate_hist: dict[str, list[float]] = {}
+        self._access_codes: dict[str, dict] = {}
+        self._device_bindings: dict[str, dict] = {}
+        self._last_keys_sync: float = 0.0
+        self._bindings_push_lock = threading.Lock()
+        self._bindings_push_pending = False
+        self._bindings_push_running = False
         self._http = httpx.Client(
             limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
             follow_redirects=False,
@@ -96,8 +109,10 @@ class GatewayState:
         self.last_index_sync: float = 0.0
 
         self._load_index()
+        self._load_auth_files()
         threading.Thread(target=self._bg_gpu_probe_loop, daemon=True, name="gpu-probe").start()
         threading.Thread(target=self._bg_index_sync_loop, daemon=True, name="gdrive-sync").start()
+        threading.Thread(target=self._bg_auth_sync_loop, daemon=True, name="auth-sync").start()
 
     def _put_lyrics_ram(self, video_id: str, data: dict) -> None:
         with self._lock:
@@ -139,6 +154,239 @@ class GatewayState:
             os.replace(tmp, INDEX_FILE)
         except Exception:
             pass
+
+    # -------------------- Invite Codes & Device-Binding Auth (24/7) --------------------
+    @staticmethod
+    def _hash_token(raw_token: str) -> str:
+        return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_code(raw: str) -> str:
+        return "".join(ch for ch in (raw or "").upper().strip() if ch.isalnum() or ch == "-")
+
+    def _load_auth_files(self) -> None:
+        if ACCESS_KEYS_FILE.exists():
+            try:
+                doc = json.loads(ACCESS_KEYS_FILE.read_text(encoding="utf-8"))
+                codes = doc.get("codes") if isinstance(doc, dict) else None
+                if isinstance(codes, dict):
+                    self._access_codes = codes
+            except Exception:
+                self._access_codes = {}
+        if DEVICE_BINDINGS_FILE.exists():
+            try:
+                doc = json.loads(DEVICE_BINDINGS_FILE.read_text(encoding="utf-8"))
+                toks = doc.get("tokens") if isinstance(doc, dict) else None
+                if isinstance(toks, dict):
+                    self._device_bindings = toks
+            except Exception:
+                self._device_bindings = {}
+
+    def _save_access_keys_local(self) -> None:
+        try:
+            tmp = ACCESS_KEYS_FILE.with_name(f".{ACCESS_KEYS_FILE.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
+            tmp.write_text(
+                json.dumps({"version": 1, "updated_at": time.time(), "codes": self._access_codes}, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(tmp, ACCESS_KEYS_FILE)
+        except Exception:
+            pass
+
+    def _save_bindings_local(self) -> None:
+        try:
+            tmp = DEVICE_BINDINGS_FILE.with_name(f".{DEVICE_BINDINGS_FILE.name}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
+            tmp.write_text(
+                json.dumps({"version": 1, "updated_at": time.time(), "tokens": self._device_bindings}, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(tmp, DEVICE_BINDINGS_FILE)
+        except Exception:
+            pass
+
+    def is_auth_required(self) -> bool:
+        if REQUIRE_AUTH_MODE in ("1", "true", "yes"):
+            return True
+        if REQUIRE_AUTH_MODE in ("0", "false", "no"):
+            return False
+        # "auto": automatically enforce as soon as at least 1 invite code exists
+        with self._lock:
+            return len(self._access_codes) > 0
+
+    def _bg_auth_sync_loop(self) -> None:
+        self.sync_access_keys_from_gdrive()
+        while True:
+            time.sleep(60)
+            self.sync_access_keys_from_gdrive()
+
+    def sync_access_keys_from_gdrive(self) -> int:
+        try:
+            res = subprocess.run(
+                ["rclone", "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/_access_keys.json", "--drive-pacer-min-sleep", "200ms"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                doc = json.loads(res.stdout)
+                codes = doc.get("codes") if isinstance(doc, dict) else None
+                if isinstance(codes, dict):
+                    with self._lock:
+                        self._access_codes = codes
+                        self._last_keys_sync = time.time()
+                        self._save_access_keys_local()
+                    return len(codes)
+        except Exception:
+            pass
+        with self._lock:
+            self._last_keys_sync = time.time()
+            return len(self._access_codes)
+
+    def push_bindings_to_gdrive(self) -> bool:
+        with self._lock:
+            payload = {"version": 1, "updated_at": time.time(), "tokens": dict(self._device_bindings)}
+        tmp = DATA_DIR / f"._device_bindings.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            res = subprocess.run(
+                [
+                    "rclone", "copyto", str(tmp), f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/_device_bindings.json",
+                    "--retries", "4", "--retries-sleep", "4s", "--drive-pacer-min-sleep", "200ms", "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=35,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def push_bindings_async(self) -> None:
+        with self._bindings_push_lock:
+            self._bindings_push_pending = True
+            if self._bindings_push_running:
+                return
+            self._bindings_push_running = True
+
+        def _worker() -> None:
+            try:
+                while True:
+                    time.sleep(1.5)
+                    with self._bindings_push_lock:
+                        if not self._bindings_push_pending:
+                            self._bindings_push_running = False
+                            return
+                        self._bindings_push_pending = False
+                    self.push_bindings_to_gdrive()
+            except Exception:
+                with self._bindings_push_lock:
+                    self._bindings_push_running = False
+
+        threading.Thread(target=_worker, daemon=True, name="bindings-push").start()
+
+    def _check_activate_rate_limit(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            if len(self._activate_rate_hist) > 2000:
+                self._activate_rate_hist = {
+                    k: [t for t in v if now - t < 600.0]
+                    for k, v in self._activate_rate_hist.items()
+                    if any(now - t < 600.0 for t in v)
+                }
+            hist = [t for t in self._activate_rate_hist.get(ip, []) if now - t < 600.0]
+            if len(hist) >= 8:
+                self._activate_rate_hist[ip] = hist
+                return False
+            hist.append(now)
+            self._activate_rate_hist[ip] = hist
+            return True
+
+    def activate_invite_code(self, raw_code: str, device_id: str, ip: str) -> dict:
+        if not self._check_activate_rate_limit(ip):
+            raise HTTPException(status_code=429, detail="嘗試次數過多，請 10 分鐘後再試。")
+        code = self._normalize_code(raw_code)
+        if len(code) < 6 or len(code) > 32:
+            raise HTTPException(status_code=400, detail="邀請碼格式不正確")
+        clean_dev = device_id.strip() if (device_id and DEVICE_ID_RE.match(device_id.strip())) else f"dev_{secrets.token_hex(8)}"
+
+        # On-demand Drive refresh if code is newly generated in Tray App
+        with self._lock:
+            need_sync = (code not in self._access_codes) and (time.time() - self._last_keys_sync > 5.0)
+        if need_sync:
+            self.sync_access_keys_from_gdrive()
+
+        now = time.time()
+        ip_prefix = ".".join(ip.split(".")[:2]) + ".*.*" if "." in ip else ip[:12]
+        with self._lock:
+            entry = self._access_codes.get(code)
+            if not entry:
+                raise HTTPException(status_code=403, detail="邀請碼無效，請檢查有無輸入錯誤")
+            if not entry.get("enabled", True):
+                raise HTTPException(status_code=403, detail="此邀請碼已被停用，請聯絡分享者")
+
+            max_dev = max(1, int(entry.get("max_devices") or 2))
+            # Check if this device_id already activated this exact code (replace old token cleanly without burning a slot)
+            existing_hash = None
+            bound_hashes = []
+            for thash, binfo in self._device_bindings.items():
+                if binfo.get("code") == code:
+                    bound_hashes.append(thash)
+                    if binfo.get("device_id") == clean_dev:
+                        existing_hash = thash
+
+            if existing_hash is None and len(bound_hashes) >= max_dev:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"此邀請碼已達裝置上限（{len(bound_hashes)}/{max_dev}），請聯絡分享者",
+                )
+
+            if existing_hash is not None:
+                self._device_bindings.pop(existing_hash, None)
+
+            raw_token = f"ktv_{secrets.token_urlsafe(32)}"
+            token_hash = self._hash_token(raw_token)
+            self._device_bindings[token_hash] = {
+                "code": code,
+                "device_id": clean_dev,
+                "activated_at": now,
+                "last_seen": now,
+                "ip_prefix": ip_prefix,
+            }
+            used_now = sum(1 for b in self._device_bindings.values() if b.get("code") == code)
+            self._save_bindings_local()
+
+        self.push_bindings_async()
+        return {
+            "status": "ok",
+            "token": raw_token,
+            "device_id": clean_dev,
+            "label": entry.get("label") or "",
+            "used_devices": used_now,
+            "max_devices": max_dev,
+        }
+
+    def verify_device_token(self, raw_token: Optional[str]) -> tuple[bool, Optional[dict], str]:
+        if not raw_token or not raw_token.startswith("ktv_"):
+            return (False, None, "請先輸入朋友邀請碼以啟用唱K 服務")
+        thash = self._hash_token(raw_token.strip())
+        with self._lock:
+            binfo = self._device_bindings.get(thash)
+            if not binfo:
+                return (False, None, "登入憑證已失效，請重新輸入朋友邀請碼")
+            code = binfo.get("code", "")
+            entry = self._access_codes.get(code)
+            if not entry:
+                return (False, None, "此邀請碼已被移除，請聯絡分享者")
+            if not entry.get("enabled", True):
+                return (False, None, "此邀請碼已被停用，請聯絡分享者")
+            binfo["last_seen"] = time.time()
+            return (True, {"code": code, "label": entry.get("label") or "", "max_devices": int(entry.get("max_devices") or 2)}, "")
 
     def _worker_headers(self) -> dict:
         h = {}
@@ -545,21 +793,34 @@ async def cors_and_security(request: Request, call_next):
     if origin and not _is_allowed_origin(origin):
         return Response(content='{"detail":"Origin not allowed"}', status_code=403, media_type="application/json")
 
+    def _apply_headers(resp: Response) -> Response:
+        if origin and _is_allowed_origin(origin):
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Karaoke-Client, X-Karaoke-Token"
+            resp.headers["Access-Control-Allow-Private-Network"] = "true"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        return resp
+
     if request.method == "OPTIONS":
-        resp = Response(status_code=204)
-    else:
-        resp = await call_next(request)
+        return _apply_headers(Response(status_code=204))
 
-    if origin and _is_allowed_origin(origin):
-        resp.headers["Access-Control-Allow-Origin"] = origin
-        resp.headers["Vary"] = "Origin"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Karaoke-Client"
-        resp.headers["Access-Control-Allow-Private-Network"] = "true"
+    # Enforce invite code + device-binding auth on all protected API paths
+    path = request.url.path
+    request.state.auth_info = None
+    if gw.is_auth_required() and path.startswith("/api/"):
+        token = request.headers.get("x-karaoke-token") or ""
+        ok, auth_info, err_msg = gw.verify_device_token(token)
+        if ok:
+            request.state.auth_info = auth_info
+        elif path not in ("/api/health", "/api/auth/activate", "/api/auth/verify", "/api/internal/sync-auth"):
+            payload = json.dumps({"detail": err_msg, "auth_required": True}, ensure_ascii=False)
+            return _apply_headers(Response(content=payload, status_code=401, media_type="application/json"))
 
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-    resp.headers["X-Frame-Options"] = "DENY"
-    return resp
+    resp = await call_next(request)
+    return _apply_headers(resp)
 
 
 class SeparateRequest(BaseModel):
@@ -578,6 +839,11 @@ class HeartbeatRequest(BaseModel):
     video_id: Optional[str] = None
     singing: bool = False
     leaving: bool = False
+
+
+class ActivateInviteRequest(BaseModel):
+    code: str
+    device_id: str = ""
 
 
 def _validate_vid(video_id: str) -> str:
@@ -600,8 +866,43 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "127.0.0.1"
 
 
+@app.post("/api/auth/activate")
+def activate_invite(req: ActivateInviteRequest, request: Request):
+    return gw.activate_invite_code(req.code, req.device_id, _client_ip(request))
+
+
+@app.get("/api/auth/verify")
+def verify_auth(request: Request):
+    req_auth = gw.is_auth_required()
+    if not req_auth:
+        return {"status": "ok", "auth_required": False, "authenticated": True}
+    info = getattr(request.state, "auth_info", None)
+    if info:
+        return {"status": "ok", "auth_required": True, "authenticated": True, "label": info.get("label", "")}
+    return {"status": "ok", "auth_required": True, "authenticated": False}
+
+
+@app.post("/api/internal/sync-auth")
+def internal_sync_auth(x_worker_secret: Optional[str] = Header(default=None)):
+    if not WORKER_SECRET or not x_worker_secret or not secrets.compare_digest(x_worker_secret, WORKER_SECRET):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    codes_n = gw.sync_access_keys_from_gdrive()
+    gw.push_bindings_async()
+    return {"status": "ok", "codes_count": codes_n, "auth_required": gw.is_auth_required()}
+
+
 @app.get("/api/health")
 def health(request: Request, x_karaoke_client: Optional[str] = Header(default=None)):
+    auth_req = gw.is_auth_required()
+    auth_info = getattr(request.state, "auth_info", None)
+    if auth_req and not auth_info:
+        # Leak zero song catalog or active client info to unauthenticated visitors (keeps Docker healthcheck green!)
+        return {
+            "status": "ok",
+            "gateway_mode": True,
+            "auth_required": True,
+            "authenticated": False,
+        }
     if x_karaoke_client:
         gw.touch_client(x_karaoke_client, _client_ip(request))
     songs = gw.list_songs()
@@ -611,6 +912,9 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
     return {
         "status": "ok",
         "gateway_mode": True,
+        "auth_required": auth_req,
+        "authenticated": True,
+        "invite_label": auth_info.get("label", "") if auth_info else "",
         "gpu_online": ai_available,
         "gpu_offline_message": "" if ai_available else OFFLINE_MSG,
         "cache_count": len(songs),
@@ -747,13 +1051,14 @@ def separate(req: SeparateRequest, request: Request):
 @app.get("/api/audio/{video_id}/{mode}/{stem}")
 def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental", "vocals"]):
     _validate_vid(video_id)
+    cache_hdr = "private, max-age=86400" if gw.is_auth_required() else "public, max-age=86400"
     # 1) Hot NAS LRU Cache -> instant ~40ms playback (350x faster than Google Drive rclone!)
     cached_file = gw.get_nas_cached_audio(video_id, mode, stem)
     if cached_file:
         return FileResponse(
             path=str(cached_file),
             media_type="audio/mpeg",
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers={"Cache-Control": cache_hdr},
         )
     # 2) Cache miss -> stream from Google Drive while populating NAS LRU cache automatically!
     if gw.has_song(video_id, mode):
@@ -766,7 +1071,7 @@ def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental"
         return StreamingResponse(
             stream,
             media_type="audio/mpeg",
-            headers={"Cache-Control": "public, max-age=86400"},
+            headers={"Cache-Control": cache_hdr},
         )
     # Fallback proxy to GPU PC if just finished separating before index synced.
     # Verify upstream HTTP 200 BEFORE starting StreamingResponse so errors NEVER return a 200 OK 0-byte MP3!

@@ -10,6 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from invites import InviteManager
 from separator import BASE_DIR, MODELS, manager
 
 # Strict canonical YouTube 11-char video ID (prevents SSRF, injection, and path traversal)
@@ -85,7 +86,8 @@ class ClientTracker:
 
 
 clients = ClientTracker()
-app = FastAPI(title="YouTube Karaoke AI Backend", version="2.1.0", docs_url=None, redoc_url=None, openapi_url=None)
+invites = InviteManager(BASE_DIR, manager.gdrive, manager.log, worker_secret=WORKER_SECRET)
+app = FastAPI(title="YouTube Karaoke AI Backend", version="2.2.0", docs_url=None, redoc_url=None, openapi_url=None)
 
 
 @app.middleware("http")
@@ -148,6 +150,17 @@ class SettingsRequest(BaseModel):
     max_queue_size: Optional[int] = None
     rate_limit_per_10min: Optional[int] = None
     max_clients: Optional[int] = None
+
+
+class CreateInvitesRequest(BaseModel):
+    count: int = 1
+    label: str = ""
+    max_devices: int = 2
+
+
+class ToggleInviteRequest(BaseModel):
+    code: str
+    enabled: bool
 
 
 def _validate_video_id(video_id: str) -> str:
@@ -303,6 +316,43 @@ def gdrive_sync(x_admin_token: Optional[str] = Header(default=None)):
         manager.storage_mode = "gdrive"
         manager.save_config()
     return {"status": "ok", "gdrive_count": count, "storage_mode": manager.storage_mode}
+
+
+# -------------------- Invite Codes & Device-Binding Admin API (Tray App Only) --------------------
+@app.get("/api/admin/invites")
+def list_invites(refresh: int = 0, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    return {"status": "ok", **invites.list_codes(refresh_bindings=bool(refresh))}
+
+
+@app.post("/api/admin/invites/create")
+def create_invites(req: CreateInvitesRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    created = invites.create_codes(count=req.count, label=req.label, max_devices=req.max_devices)
+    return {"status": "ok", "created": created, **invites.list_codes(refresh_bindings=False)}
+
+
+@app.post("/api/admin/invites/toggle")
+def toggle_invite(req: ToggleInviteRequest, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    updated = invites.set_enabled(req.code, req.enabled)
+    if not updated:
+        raise HTTPException(status_code=404, detail="邀請碼不存在")
+    return {"status": "ok", "item": updated}
+
+
+@app.delete("/api/admin/invites/{code}")
+def delete_invite(code: str, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    if not invites.delete_code(code):
+        raise HTTPException(status_code=404, detail="邀請碼不存在")
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/invites/sync")
+def sync_invites(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    return {"status": "ok", **invites.sync_now()}
 
 
 @app.get("/api/status/{video_id}")

@@ -148,9 +148,85 @@ def test_store_builder_parity() -> None:
         assert "AbortController" in bg, "Production background.js lost fetch timeout guard!"
         assert 'const API_BASE = "https://karaoke.example.com";' in ct
         assert mf["host_permissions"] == ["https://karaoke.example.com/*"]
+        assert mf["permissions"] == ["storage"]
+        assert "X-Karaoke-Token" in bg and "AUTH_ACTIVATE" in bg
         node = subprocess.run(["node", "--check", str(unpacked / "background.js")], capture_output=True, text=True)
         assert node.returncode == 0, f"Prod background.js syntax error: {node.stderr}"
     print("[PASS] Chrome Web Store builder single-source parity & syntax check")
+
+
+def test_invite_code_device_binding_and_revocation() -> None:
+    """End-to-end test of InviteManager + Gateway device binding, device-limit enforcement, and instant revocation."""
+    import importlib.util
+    from invites import InviteManager
+
+    class _DummyGDrive:
+        def refresh_binary(self): return None
+        def is_configured(self): return False
+
+    class _DummyLog:
+        def info(self, *a, **kw): pass
+        def warning(self, *a, **kw): pass
+        def error(self, *a, **kw): pass
+
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        im = InviteManager(tdir, _DummyGDrive(), _DummyLog())
+        created = im.create_codes(count=2, label="測試群", max_devices=2)
+        assert len(created) == 2
+        c1 = created[0]["code"]
+        assert c1.startswith("KTV-") and len(c1) == 13
+
+        # Load gateway/main.py in isolation pointed at temp DATA_DIR (no live rclone needed)
+        os.environ["DATA_DIR"] = str(tdir / "gw_data")
+        os.environ["REQUIRE_AUTH"] = "auto"
+        spec = importlib.util.spec_from_file_location("gw_test_mod", str(GATEWAY / "main.py"))
+        gw_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gw_mod)
+        gw = gw_mod.gw
+        gw._access_codes = dict(im._codes)
+        gw._last_keys_sync = time.time()
+
+        assert gw.is_auth_required() is True
+
+        # Device 1 activates -> succeeds
+        r1 = gw.activate_invite_code(c1, "dev_aaaa1111bbbb2222", "1.2.3.4")
+        t1 = r1["token"]
+        assert r1["used_devices"] == 1 and t1.startswith("ktv_")
+        ok, info, _ = gw.verify_device_token(t1)
+        assert ok and info["code"] == c1
+
+        # Same Device 1 re-activates -> reuses slot cleanly (still 1/2!)
+        r1b = gw.activate_invite_code(c1, "dev_aaaa1111bbbb2222", "1.2.3.4")
+        assert r1b["used_devices"] == 1
+        t1_new = r1b["token"]
+        assert gw.verify_device_token(t1)[0] is False  # old rotated token invalidated
+        assert gw.verify_device_token(t1_new)[0] is True
+
+        # Device 2 activates -> succeeds (2/2)
+        r2 = gw.activate_invite_code(c1, "dev_cccc3333dddd4444", "5.6.7.8")
+        assert r2["used_devices"] == 2
+        t2 = r2["token"]
+
+        # Device 3 (leaked code!) -> BLOCKED with HTTP 403!
+        blocked = False
+        try:
+            gw.activate_invite_code(c1, "dev_eeee5555ffff6666", "9.10.11.12")
+        except gw_mod.HTTPException as exc:
+            blocked = (exc.status_code == 403)
+        assert blocked, "Device 3 should have been blocked by max_devices=2!"
+
+        # Instant revocation -> BOTH Device 1 & Device 2 immediately fail verification!
+        im.set_enabled(c1, False)
+        gw._access_codes = dict(im._codes)
+        assert gw.verify_device_token(t1_new)[0] is False
+        assert gw.verify_device_token(t2)[0] is False
+
+        # Re-enable -> immediately works again!
+        im.set_enabled(c1, True)
+        gw._access_codes = dict(im._codes)
+        assert gw.verify_device_token(t1_new)[0] is True
+    print("[PASS] Invite code device binding, max-device cap & instant revocation")
 
 
 def test_generic_title_decomposition() -> None:
@@ -236,6 +312,7 @@ def main() -> int:
     test_atomic_json_concurrency()
     test_worker_and_separator_invariants()
     test_store_builder_parity()
+    test_invite_code_device_binding_and_revocation()
     test_generic_title_decomposition()
     test_word_bunching_deglitcher()
     test_sidecar_watcher_cp1252_safety()

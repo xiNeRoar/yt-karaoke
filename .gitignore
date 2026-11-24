@@ -10,6 +10,8 @@ backend/cookies.txt
 backend/.yt_firefox_profile/
 backend/config.json
 backend/gdrive_index.json
+backend/access_keys.json
+backend/device_bindings.json
 gateway/.env
 gateway/rclone.conf
 gateway/data/

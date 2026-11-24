@@ -26,12 +26,12 @@ def build_package(api_base: str, out_zip: Path, unpacked_dir: Path | None = None
     shutil.copytree(EXT_SRC, staging)
 
     # 1. Patch manifest.json with strictly minimal Chrome Web Store permissions:
-    #    - Zero special API permissions (no storage, tabs, cookies, webRequest)
+    #    - Only "storage" (stores the user's bound invite device token locally; zero sensitive permissions)
     #    - host_permissions strictly limited to the karaoke gateway origin only
     #      (content_scripts.matches already handles injecting the UI on https://www.youtube.com/*)
     m_path = staging / "manifest.json"
     manifest = json.loads(m_path.read_text(encoding="utf-8"))
-    manifest.pop("permissions", None)
+    manifest["permissions"] = ["storage"]
     manifest["host_permissions"] = [f"{api_base}/*"]
     m_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 

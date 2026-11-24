@@ -60,7 +60,43 @@
             resolve({ ok: false, error: chrome.runtime.lastError.message });
             return;
           }
-          resolve(resp || { ok: false, error: "No response" });
+          const out = resp || { ok: false, error: "No response" };
+          if (out.status === 401 && out.data && out.data.auth_required) {
+            state.authRequired = true;
+            state.authenticated = false;
+            if (ui && ui.authMsg && out.data.detail) {
+              ui.authMsg.textContent = out.data.detail;
+              ui.authMsg.classList.add("error");
+            }
+            updateUI();
+          }
+          resolve(out);
+        });
+      } catch (err) {
+        resolve({ ok: false, error: String(err) });
+      }
+    });
+  }
+
+  function getAuthToken() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "AUTH_GET_STATE" }, (resp) => {
+          if (chrome.runtime.lastError || !resp || !resp.ok) resolve("");
+          else resolve(resp.token || "");
+        });
+      } catch (_e) {
+        resolve("");
+      }
+    });
+  }
+
+  function activateInviteCode(code) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "AUTH_ACTIVATE", code }, (resp) => {
+          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+          else resolve(resp || { ok: false, error: "無回應" });
         });
       } catch (err) {
         resolve({ ok: false, error: String(err) });
@@ -69,12 +105,14 @@
   }
 
   async function fetchAudioArrayBuffer(path) {
+    const token = await getAuthToken();
+    const headers = token ? { "X-Karaoke-Token": token } : {};
     // 1) Direct HTTPS fetch with full-body timeout + 1 auto-retry (zero Base64 overhead!)
     for (let attempt = 0; attempt < 2; attempt++) {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 45000);
       try {
-        const res = await fetch(`${API_BASE}${path}`, { signal: ctrl.signal });
+        const res = await fetch(`${API_BASE}${path}`, { headers, signal: ctrl.signal });
         if (res.ok) {
           const buf = await res.arrayBuffer();
           if (buf && buf.byteLength > 8192) {
@@ -449,6 +487,8 @@
     active: false,
     busy: false,
     backendOnline: false,
+    authRequired: false,
+    authenticated: true,
     gpuOnline: true,
     gpuOfflineMsg: "AI 伺服器休息中，現有歌庫仍可免費唱",
     deviceMode: "gpu",
@@ -512,10 +552,14 @@
     const isCurrentModeCached = state.cachedModes.includes("pure");
     ui.cacheBadge.style.display = isCurrentModeCached ? "inline-block" : "none";
 
-    const gpuRestingForNewSong = state.backendOnline && !state.gpuOnline && !isCurrentModeCached && !state.active;
+    const needInvite = state.backendOnline && state.authRequired && !state.authenticated;
+    const gpuRestingForNewSong = state.backendOnline && !needInvite && !state.gpuOnline && !isCurrentModeCached && !state.active;
 
     if (!state.backendOnline) {
       ui.deviceBadge.textContent = "服務未連線";
+      ui.deviceBadge.style.display = "inline-block";
+    } else if (needInvite) {
+      ui.deviceBadge.textContent = "朋友專屬邀請制";
       ui.deviceBadge.style.display = "inline-block";
     } else if (!state.gpuOnline) {
       ui.deviceBadge.textContent = "歌庫在線 · AI 休息中";
@@ -524,7 +568,12 @@
       ui.deviceBadge.style.display = "none";
     }
 
-    ui.toggleBtn.disabled = state.busy || !state.backendOnline || gpuRestingForNewSong;
+    if (ui.authRow) {
+      ui.authRow.classList.toggle("visible", needInvite);
+    }
+
+    ui.toggleBtn.style.display = needInvite ? "none" : "inline-flex";
+    ui.toggleBtn.disabled = state.busy || !state.backendOnline || gpuRestingForNewSong || needInvite;
     ui.toggleBtn.classList.toggle("active", state.active);
     if (state.busy) {
       ui.toggleBtn.textContent = "準備伴奏中...";
@@ -1384,6 +1433,14 @@
     if (state.videoId !== targetVideoId) return;
     if (health.ok && health.data && health.data.status === "ok") {
       state.backendOnline = true;
+      state.authRequired = !!health.data.auth_required;
+      state.authenticated = health.data.authenticated !== false;
+      if (state.authRequired && !state.authenticated) {
+        state.cachedModes = [];
+        setStatus("", false, null);
+        updateUI();
+        return;
+      }
       state.gpuOnline = health.data.gpu_online !== false;
       state.gpuOfflineMsg = health.data.gpu_offline_message || "AI 伺服器休息中，現有歌庫仍可免費唱";
       state.deviceMode = health.data.device_mode || "gpu";
@@ -1664,7 +1721,51 @@
       ]),
     ]);
 
-    const panel = el("div", { id: "yt-ai-ktv-panel" }, [topRow, progressWrap, mixerRow]);
+    // Friends-only invite code activation row (auto-hidden once activated or on localhost)
+    const authInput = el("input", {
+      className: "ktv-auth-input",
+      type: "text",
+      placeholder: "輸入朋友邀請碼 (例如 KTV-XXXX-XXXX)",
+      autocomplete: "off",
+      spellcheck: "false",
+    });
+    const authMsg = el("span", { className: "ktv-auth-msg", textContent: "只需輸入一次，此電腦將永久記住" });
+    const authSubmitBtn = el("button", {
+      className: "ktv-primary-btn",
+      type: "button",
+      textContent: "啟用",
+    });
+    const submitInvite = async () => {
+      const code = (authInput.value || "").trim();
+      if (!code) {
+        authMsg.textContent = "請先輸入邀請碼";
+        authMsg.classList.add("error");
+        return;
+      }
+      authSubmitBtn.disabled = true;
+      authSubmitBtn.textContent = "驗證中...";
+      authMsg.classList.remove("error");
+      authMsg.textContent = "正在驗證邀請碼...";
+      const res = await activateInviteCode(code);
+      authSubmitBtn.disabled = false;
+      authSubmitBtn.textContent = "啟用";
+      if (res.ok) {
+        authInput.value = "";
+        state.authenticated = true;
+        authMsg.textContent = "啟用成功！";
+        await refreshBackendAndVideoStatus();
+      } else {
+        authMsg.textContent = res.error || "邀請碼無效或已達上限";
+        authMsg.classList.add("error");
+      }
+    };
+    authSubmitBtn.addEventListener("click", submitInvite);
+    authInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitInvite();
+    });
+    const authRow = el("div", { className: "ktv-auth-row" }, [authInput, authSubmitBtn, authMsg]);
+
+    const panel = el("div", { id: "yt-ai-ktv-panel" }, [topRow, authRow, progressWrap, mixerRow]);
 
     ui = {
       panel,
@@ -1672,6 +1773,9 @@
       deviceBadge,
       cacheBadge,
       toggleBtn,
+      authRow,
+      authInput,
+      authMsg,
       progressWrap,
       progressFill,
       statusText,

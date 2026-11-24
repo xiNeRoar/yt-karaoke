@@ -197,6 +197,7 @@ namespace YtKaraokeTray
         // UI
         private Label _lblStatusPill;
         private Button _btnToggleServer;
+        private Button _btnManageInvites;
         private Button _btnAutoUpdateExt;
         private Button _btnYoutubeAuth;
         private Label _lblUsersNum;
@@ -360,9 +361,9 @@ namespace YtKaraokeTray
             };
             Controls.Add(_lblStatusPill);
 
-            // Top Action Row: Start/Stop + Auto-Update Chrome Extension + YouTube Auth (Dedicated Firefox Profile)
-            _btnToggleServer = MakeButton("啟動唱K 服務", pad, 58, 232, 44, AccentWhite, Color.FromArgb(15, 15, 15));
-            _btnToggleServer.Font = new Font("Microsoft JhengHei UI", 10.5f, FontStyle.Bold);
+            // Top Action Row: Start/Stop + Invite Manager + Auto-Update Chrome Extension + YouTube Auth
+            _btnToggleServer = MakeButton("啟動唱K 服務", pad, 58, 174, 44, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnToggleServer.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
             _btnToggleServer.Click += (s, e) =>
             {
                 if (_backendOnline || _starting) StopBackend();
@@ -370,13 +371,18 @@ namespace YtKaraokeTray
             };
             Controls.Add(_btnToggleServer);
 
-            _btnAutoUpdateExt = MakeButton("更新 Chrome 插件", pad + 242, 58, 232, 44, BtnNeutral, TextPrimary);
-            _btnAutoUpdateExt.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
+            _btnManageInvites = MakeButton("邀請碼管理", pad + 182, 58, 172, 44, Color.FromArgb(30, 58, 110), Color.White);
+            _btnManageInvites.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
+            _btnManageInvites.Click += (s, e) => OpenInviteManagerDialog();
+            Controls.Add(_btnManageInvites);
+
+            _btnAutoUpdateExt = MakeButton("更新 Chrome 插件", pad + 362, 58, 172, 44, BtnNeutral, TextPrimary);
+            _btnAutoUpdateExt.Font = new Font("Microsoft JhengHei UI", 9.8f, FontStyle.Bold);
             _btnAutoUpdateExt.Click += async (s, e) => await TriggerAutoReloadExtensionAsync();
             Controls.Add(_btnAutoUpdateExt);
 
-            _btnYoutubeAuth = MakeButton("YouTube 登入驗證", pad + 484, 58, 232, 44, BtnNeutral, TextPrimary);
-            _btnYoutubeAuth.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
+            _btnYoutubeAuth = MakeButton("YouTube 登入驗證", pad + 542, 58, 174, 44, BtnNeutral, TextPrimary);
+            _btnYoutubeAuth.Font = new Font("Microsoft JhengHei UI", 9.8f, FontStyle.Bold);
             _btnYoutubeAuth.Click += async (s, e) => await OpenYouTubeFirefoxAuthAsync();
             Controls.Add(_btnYoutubeAuth);
             RefreshYouTubeAuthButton();
@@ -638,6 +644,7 @@ namespace YtKaraokeTray
             _trayMenu.Items.Add(modeMenu);
 
             _trayMenu.Items.Add(new ToolStripSeparator());
+            _trayMenu.Items.Add(new ToolStripMenuItem("邀請碼管理...", null, (s, e) => { RestoreFromTray(); OpenInviteManagerDialog(); }));
             _trayMenu.Items.Add(new ToolStripMenuItem("完全結束", null, (s, e) => QuitApplication()));
 
             _trayIcon = new NotifyIcon
@@ -1339,6 +1346,19 @@ namespace YtKaraokeTray
             base.OnFormClosing(e);
         }
 
+        private void OpenInviteManagerDialog()
+        {
+            if (!_backendOnline)
+            {
+                MessageBox.Show("請先啟動唱K 服務先可以管理邀請碼。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            using (var dlg = new InviteManagerForm(this, _dpiScale, HttpRequestAsync))
+            {
+                dlg.ShowDialog(this);
+            }
+        }
+
         private void QuitApplication()
         {
             _isExiting = true;
@@ -1353,6 +1373,429 @@ namespace YtKaraokeTray
             if (_fontModeNormal != null) { _fontModeNormal.Dispose(); _fontModeNormal = null; }
             _jobTracker.Dispose();
             Application.Exit();
+        }
+    }
+
+    public sealed class InviteManagerForm : Form
+    {
+        private readonly float _dpiScale;
+        private readonly Func<string, string, string, int, bool, Task<string>> _httpReq;
+        private readonly JavaScriptSerializer _json = new JavaScriptSerializer { MaxJsonLength = 16 * 1024 * 1024 };
+
+        private static readonly Color BgDark = Color.FromArgb(15, 15, 15);
+        private static readonly Color CardDark = Color.FromArgb(24, 24, 24);
+        private static readonly Color BorderSubtle = Color.FromArgb(46, 46, 46);
+        private static readonly Color BtnNeutral = Color.FromArgb(40, 40, 40);
+        private static readonly Color TextPrimary = Color.FromArgb(241, 241, 241);
+        private static readonly Color TextMuted = Color.FromArgb(156, 156, 156);
+        private static readonly Color AccentWhite = Color.FromArgb(241, 241, 241);
+        private static readonly Color AccentGreen = Color.FromArgb(34, 150, 72);
+        private static readonly Color AccentRed = Color.FromArgb(196, 42, 42);
+        private static readonly Color AccentBlue = Color.FromArgb(37, 99, 235);
+
+        private Label _lblStats;
+        private TextBox _txtLabel;
+        private NumericUpDown _numCount;
+        private NumericUpDown _numMaxDevices;
+        private Button _btnGenerate;
+        private ListView _lvCodes;
+        private Button _btnCopySel;
+        private Button _btnCopyUnused;
+        private Button _btnExport;
+        private Button _btnToggle;
+        private Button _btnDelete;
+        private Button _btnSync;
+        private List<Dictionary<string, object>> _latestItems = new List<Dictionary<string, object>>();
+
+        private int S(int px) { return (int)Math.Round(px * _dpiScale); }
+
+        public InviteManagerForm(Form owner, float dpiScale, Func<string, string, string, int, bool, Task<string>> httpReq)
+        {
+            _dpiScale = dpiScale;
+            _httpReq = httpReq;
+
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "朋友邀請碼管理";
+            Icon = owner.Icon;
+            ClientSize = new Size(S(800), S(590));
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            BackColor = BgDark;
+            ForeColor = TextPrimary;
+            Font = new Font("Microsoft JhengHei UI", 10f);
+
+            BuildUI();
+            this.Shown += async (s, e) => await LoadCodesAsync(true);
+        }
+
+        private Button MakeBtn(string text, int x, int y, int w, int h, Color bg, Color fg)
+        {
+            var b = new Button
+            {
+                Text = text,
+                Location = new Point(S(x), S(y)),
+                Size = new Size(S(w), S(h)),
+                BackColor = bg,
+                ForeColor = fg,
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Font = new Font("Microsoft JhengHei UI", 9.6f)
+            };
+            b.FlatAppearance.BorderColor = BorderSubtle;
+            b.FlatAppearance.BorderSize = 1;
+            return b;
+        }
+
+        private NumericUpDown MakeNum(int x, int y, int w, int min, int max, int val)
+        {
+            return new NumericUpDown
+            {
+                Location = new Point(S(x), S(y)),
+                Size = new Size(S(w), S(28)),
+                Minimum = min,
+                Maximum = max,
+                Value = val,
+                BackColor = Color.FromArgb(18, 18, 18),
+                ForeColor = TextPrimary,
+                Font = new Font("Microsoft JhengHei UI", 10f)
+            };
+        }
+
+        private void BuildUI()
+        {
+            int pad = 20;
+            int w = 760;
+
+            Controls.Add(new Label
+            {
+                Text = "朋友邀請碼管理（自動同步 Google Drive ＋ 24/7 NAS）",
+                Font = new Font("Microsoft JhengHei UI", 13.5f, FontStyle.Bold),
+                ForeColor = TextPrimary,
+                Location = new Point(S(pad), S(14)),
+                AutoSize = true
+            });
+
+            _lblStats = new Label
+            {
+                Text = "載入中...",
+                Font = new Font("Microsoft JhengHei UI", 9.5f),
+                ForeColor = TextMuted,
+                Location = new Point(S(pad), S(44)),
+                Size = new Size(S(w), S(22))
+            };
+            Controls.Add(_lblStats);
+
+            // Generator Card
+            var cardGen = new Panel
+            {
+                Location = new Point(S(pad), S(72)),
+                Size = new Size(S(w), S(82)),
+                BackColor = CardDark
+            };
+            cardGen.Paint += (s, e) =>
+            {
+                using (var pen = new Pen(BorderSubtle, 1))
+                    e.Graphics.DrawRectangle(pen, 0, 0, cardGen.Width - 1, cardGen.Height - 1);
+            };
+            cardGen.Controls.Add(new Label
+            {
+                Text = "一鍵批量生成邀請碼（每條個人碼建議上限 2 部機；朋友群組碼可設 30–100 部機）",
+                Font = new Font("Microsoft JhengHei UI", 9.2f),
+                ForeColor = TextMuted,
+                Location = new Point(S(14), S(10)),
+                AutoSize = true
+            });
+
+            cardGen.Controls.Add(new Label { Text = "備註:", ForeColor = TextMuted, Location = new Point(S(14), S(42)), AutoSize = true });
+            _txtLabel = new TextBox
+            {
+                Text = "朋友",
+                Location = new Point(S(60), S(39)),
+                Size = new Size(S(155), S(28)),
+                BackColor = Color.FromArgb(18, 18, 18),
+                ForeColor = TextPrimary,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Microsoft JhengHei UI", 10f)
+            };
+
+            cardGen.Controls.Add(new Label { Text = "數量:", ForeColor = TextMuted, Location = new Point(S(228), S(42)), AutoSize = true });
+            _numCount = MakeNum(274, 39, 64, 1, 500, 10);
+
+            cardGen.Controls.Add(new Label { Text = "每碼裝置上限:", ForeColor = TextMuted, Location = new Point(S(350), S(42)), AutoSize = true });
+            _numMaxDevices = MakeNum(462, 39, 64, 1, 500, 2);
+
+            _btnGenerate = MakeBtn("一鍵生成並複製", 542, 35, 204, 36, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnGenerate.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
+            _btnGenerate.Click += async (s, e) => await GenerateCodesAsync();
+
+            cardGen.Controls.AddRange(new Control[] { _txtLabel, _numCount, _numMaxDevices, _btnGenerate });
+            Controls.Add(cardGen);
+
+            // ListView of Invite Codes
+            _lvCodes = new ListView
+            {
+                Location = new Point(S(pad), S(166)),
+                Size = new Size(S(w), S(356)),
+                View = View.Details,
+                FullRowSelect = true,
+                MultiSelect = true,
+                GridLines = false,
+                BackColor = CardDark,
+                ForeColor = TextPrimary,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 10f)
+            };
+            _lvCodes.Columns.Add("邀請碼", S(168));
+            _lvCodes.Columns.Add("備註 / 群組", S(178));
+            _lvCodes.Columns.Add("狀態", S(90));
+            _lvCodes.Columns.Add("已綁裝置", S(112));
+            _lvCodes.Columns.Add("建立時間", S(186));
+            _lvCodes.DoubleClick += (s, e) => CopySelectedCodes();
+            Controls.Add(_lvCodes);
+
+            // Action Bar
+            int ay = 536;
+            _btnCopySel = MakeBtn("複製選取碼", pad, ay, 114, 36, AccentBlue, Color.White);
+            _btnCopySel.Font = new Font("Microsoft JhengHei UI", 9.6f, FontStyle.Bold);
+            _btnCopySel.Click += (s, e) => CopySelectedCodes();
+
+            _btnCopyUnused = MakeBtn("複製全部未使用", pad + 122, ay, 134, 36, BtnNeutral, TextPrimary);
+            _btnCopyUnused.Click += (s, e) => CopyUnusedCodes();
+
+            _btnExport = MakeBtn("匯出 .txt", pad + 264, ay, 94, 36, BtnNeutral, TextPrimary);
+            _btnExport.Click += (s, e) => ExportCodesTxt();
+
+            _btnToggle = MakeBtn("停用 / 啟用", pad + 366, ay, 110, 36, BtnNeutral, TextPrimary);
+            _btnToggle.Click += async (s, e) => await ToggleSelectedAsync();
+
+            _btnDelete = MakeBtn("刪除", pad + 484, ay, 82, 36, AccentRed, Color.White);
+            _btnDelete.Click += async (s, e) => await DeleteSelectedAsync();
+
+            _btnSync = MakeBtn("立即同步 NAS", pad + 574, ay, 186, 36, AccentGreen, Color.White);
+            _btnSync.Font = new Font("Microsoft JhengHei UI", 9.6f, FontStyle.Bold);
+            _btnSync.Click += async (s, e) => await SyncNowAsync();
+
+            Controls.AddRange(new Control[] { _btnCopySel, _btnCopyUnused, _btnExport, _btnToggle, _btnDelete, _btnSync });
+        }
+
+        private async Task LoadCodesAsync(bool refreshBindings)
+        {
+            string raw = await _httpReq("GET", "/api/admin/invites?refresh=" + (refreshBindings ? "1" : "0"), null, 20000, true);
+            if (raw == null)
+            {
+                _lblStats.Text = "讀取失敗，請確認本機後端已更新並重新啟動。";
+                return;
+            }
+            PopulateFromJson(raw);
+        }
+
+        private void PopulateFromJson(string raw)
+        {
+            try
+            {
+                var doc = _json.Deserialize<Dictionary<string, object>>(raw);
+                if (doc == null || !doc.ContainsKey("items")) return;
+                int total = doc.ContainsKey("total_codes") ? Convert.ToInt32(doc["total_codes"]) : 0;
+                int active = doc.ContainsKey("active_codes") ? Convert.ToInt32(doc["active_codes"]) : 0;
+                int bound = doc.ContainsKey("total_bound_devices") ? Convert.ToInt32(doc["total_bound_devices"]) : 0;
+                _lblStats.Text = string.Format("總計 {0} 條邀請碼 · 啟用中 {1} 條 · 已綁定 {2} 部朋友裝置（雙擊可複製）", total, active, bound);
+
+                var arr = doc["items"] as System.Collections.ArrayList;
+                _latestItems = new List<Dictionary<string, object>>();
+                _lvCodes.BeginUpdate();
+                _lvCodes.Items.Clear();
+                if (arr != null)
+                {
+                    foreach (var o in arr)
+                    {
+                        var d = o as Dictionary<string, object>;
+                        if (d == null) continue;
+                        _latestItems.Add(d);
+
+                        string code = d.ContainsKey("code") ? Convert.ToString(d["code"]) : "";
+                        string label = d.ContainsKey("label") && d["label"] != null ? Convert.ToString(d["label"]) : "";
+                        bool enabled = !d.ContainsKey("enabled") || Convert.ToBoolean(d["enabled"]);
+                        int used = d.ContainsKey("used_devices") ? Convert.ToInt32(d["used_devices"]) : 0;
+                        int maxD = d.ContainsKey("max_devices") ? Convert.ToInt32(d["max_devices"]) : 2;
+                        double createdTs = d.ContainsKey("created_at") ? Convert.ToDouble(d["created_at"]) : 0;
+                        string timeStr = createdTs > 0
+                            ? DateTimeOffset.FromUnixTimeSeconds((long)createdTs).ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+                            : "-";
+
+                        var lvi = new ListViewItem(code);
+                        lvi.SubItems.Add(string.IsNullOrEmpty(label) ? "-" : label);
+                        lvi.SubItems.Add(enabled ? "啟用中" : "已停用");
+                        lvi.SubItems.Add(string.Format("{0} / {1}", used, maxD));
+                        lvi.SubItems.Add(timeStr);
+                        lvi.ForeColor = enabled ? (used >= maxD ? Color.FromArgb(250, 204, 21) : TextPrimary) : Color.FromArgb(248, 113, 113);
+                        lvi.Tag = code + "|" + (enabled ? "1" : "0");
+                        _lvCodes.Items.Add(lvi);
+                    }
+                }
+                _lvCodes.EndUpdate();
+            }
+            catch { }
+        }
+
+        private async Task GenerateCodesAsync()
+        {
+            _btnGenerate.Enabled = false;
+            _btnGenerate.Text = "生成中...";
+            try
+            {
+                string payload = _json.Serialize(new Dictionary<string, object>
+                {
+                    { "count", (int)_numCount.Value },
+                    { "label", (_txtLabel.Text ?? "").Trim() },
+                    { "max_devices", (int)_numMaxDevices.Value }
+                });
+                string resp = await _httpReq("POST", "/api/admin/invites/create", payload, 15000, true);
+                if (resp == null)
+                {
+                    MessageBox.Show("生成失敗，請確認本機唱K 服務已重啟至最新版本。", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                PopulateFromJson(resp);
+
+                var doc = _json.Deserialize<Dictionary<string, object>>(resp);
+                var created = doc != null && doc.ContainsKey("created") ? doc["created"] as System.Collections.ArrayList : null;
+                var newCodes = new List<string>();
+                if (created != null)
+                {
+                    foreach (var o in created)
+                    {
+                        var d = o as Dictionary<string, object>;
+                        if (d != null && d.ContainsKey("code")) newCodes.Add(Convert.ToString(d["code"]));
+                    }
+                }
+                if (newCodes.Count > 0)
+                {
+                    try { Clipboard.SetText(string.Join(Environment.NewLine, newCodes)); } catch { }
+                    MessageBox.Show(
+                        string.Format("已生成 {0} 條邀請碼，並自動複製到剪貼簿！\n\n正自動同步上 Google Drive 同 NAS，幾秒後朋友即可輸入使用。", newCodes.Count),
+                        "生成成功",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
+                }
+            }
+            finally
+            {
+                _btnGenerate.Enabled = true;
+                _btnGenerate.Text = "一鍵生成並複製";
+            }
+        }
+
+        private void CopySelectedCodes()
+        {
+            if (_lvCodes.SelectedItems.Count == 0) return;
+            var list = new List<string>();
+            foreach (ListViewItem item in _lvCodes.SelectedItems) list.Add(item.Text);
+            try
+            {
+                Clipboard.SetText(string.Join(Environment.NewLine, list));
+                _lblStats.Text = string.Format("已複製 {0} 條邀請碼到剪貼簿 ✓", list.Count);
+            }
+            catch { }
+        }
+
+        private void CopyUnusedCodes()
+        {
+            var unused = new List<string>();
+            foreach (var d in _latestItems)
+            {
+                bool enabled = !d.ContainsKey("enabled") || Convert.ToBoolean(d["enabled"]);
+                int used = d.ContainsKey("used_devices") ? Convert.ToInt32(d["used_devices"]) : 0;
+                if (enabled && used == 0 && d.ContainsKey("code")) unused.Add(Convert.ToString(d["code"]));
+            }
+            if (unused.Count == 0)
+            {
+                MessageBox.Show("目前無未使用的啟用中邀請碼。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            try
+            {
+                Clipboard.SetText(string.Join(Environment.NewLine, unused));
+                MessageBox.Show(string.Format("已複製全部 {0} 條未使用邀請碼到剪貼簿！", unused.Count), "已複製", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch { }
+        }
+
+        private void ExportCodesTxt()
+        {
+            if (_latestItems.Count == 0) return;
+            using (var sfd = new SaveFileDialog
+            {
+                Title = "匯出邀請碼清單",
+                Filter = "Text Files (*.txt)|*.txt",
+                FileName = "yt-karaoke-invites-" + DateTime.Now.ToString("yyyyMMdd-HHmm") + ".txt"
+            })
+            {
+                if (sfd.ShowDialog(this) != DialogResult.OK) return;
+                var sb = new StringBuilder();
+                sb.AppendLine("# YouTube AI 唱K 朋友邀請碼清單 (" + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + ")");
+                foreach (var d in _latestItems)
+                {
+                    string code = d.ContainsKey("code") ? Convert.ToString(d["code"]) : "";
+                    string label = d.ContainsKey("label") && d["label"] != null ? Convert.ToString(d["label"]) : "";
+                    bool enabled = !d.ContainsKey("enabled") || Convert.ToBoolean(d["enabled"]);
+                    int used = d.ContainsKey("used_devices") ? Convert.ToInt32(d["used_devices"]) : 0;
+                    int maxD = d.ContainsKey("max_devices") ? Convert.ToInt32(d["max_devices"]) : 2;
+                    sb.AppendLine(string.Format("{0}\t{1}\t{2}\t{3}/{4}", code, enabled ? "啟用" : "停用", label, used, maxD));
+                }
+                File.WriteAllText(sfd.FileName, sb.ToString(), new UTF8Encoding(true));
+                MessageBox.Show("已匯出至：\n" + sfd.FileName, "匯出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+        }
+
+        private async Task ToggleSelectedAsync()
+        {
+            if (_lvCodes.SelectedItems.Count == 0) return;
+            foreach (ListViewItem item in _lvCodes.SelectedItems)
+            {
+                string tag = Convert.ToString(item.Tag) ?? "";
+                var parts = tag.Split('|');
+                if (parts.Length < 2) continue;
+                bool nextEnabled = parts[1] != "1";
+                string payload = _json.Serialize(new Dictionary<string, object> { { "code", parts[0] }, { "enabled", nextEnabled } });
+                await _httpReq("POST", "/api/admin/invites/toggle", payload, 10000, true);
+            }
+            await LoadCodesAsync(false);
+        }
+
+        private async Task DeleteSelectedAsync()
+        {
+            if (_lvCodes.SelectedItems.Count == 0) return;
+            var ans = MessageBox.Show(
+                string.Format("確定永久刪除所選 {0} 條邀請碼？已綁定呢啲碼嘅裝置將會即時失效。", _lvCodes.SelectedItems.Count),
+                "刪除邀請碼",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning
+            );
+            if (ans != DialogResult.Yes) return;
+            foreach (ListViewItem item in _lvCodes.SelectedItems)
+            {
+                await _httpReq("DELETE", "/api/admin/invites/" + Uri.EscapeDataString(item.Text), null, 10000, true);
+            }
+            await LoadCodesAsync(false);
+        }
+
+        private async Task SyncNowAsync()
+        {
+            _btnSync.Enabled = false;
+            _btnSync.Text = "同步中...";
+            try
+            {
+                string resp = await _httpReq("POST", "/api/admin/invites/sync", "{}", 30000, true);
+                if (resp != null) PopulateFromJson(resp);
+            }
+            finally
+            {
+                _btnSync.Enabled = true;
+                _btnSync.Text = "立即同步 NAS";
+            }
         }
     }
 }
