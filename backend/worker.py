@@ -60,6 +60,7 @@ MODELS = {
         "filename": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
     },
 }
+CPU_FAST_MODEL = "UVR-MDX-NET-Inst_HQ_3.onnx"
 
 
 def find_ffmpeg_dir() -> str | None:
@@ -233,6 +234,11 @@ def main() -> int:
         import torch
         if device_mode == "cpu":
             torch.cuda.is_available = lambda: False
+        # Avoid Intel P+E core OpenMP oversubscription when running any CPU chunks
+        try:
+            torch.set_num_threads(min(8, max(4, (os.cpu_count() or 8) // 2)))
+        except Exception:
+            pass
 
         cuda_ok = (device_mode != "cpu") and torch.cuda.is_available()
         gpu_name = "GPU" if cuda_ok else "CPU"
@@ -252,6 +258,7 @@ def main() -> int:
         from audio_separator.separator import Separator
         import tqdm as tqdm_mod
         import audio_separator.separator.architectures.mdxc_separator as mdxc_mod
+        import audio_separator.separator.architectures.mdx_separator as mdx_mod
 
         # Keep overlap-add accumulation buffers on CPU RAM so dynamic GPU<->CPU switching is seamless and zero-VRAM
         mdxc_mod.should_accumulate_on_device = lambda *a, **kw: False
@@ -282,8 +289,9 @@ def main() -> int:
                 if self.total > 0 and (now - self._last_report >= 0.35 or self.n >= self.total):
                     self._last_report = now
                     frac = min(1.0, self.n / self.total)
+                    pct_disp = max(1, int(frac * 100)) if self.n > 0 else 0
                     pct = int(42 + frac * 48)  # 42% -> 90%
-                    update(progress=pct, stage_text=f"去人聲中... {int(frac * 100)}%")
+                    update(progress=pct, stage_text=f"去人聲中... {pct_disp}%")
 
             def set_description(self, *a, **kw):
                 pass
@@ -299,10 +307,10 @@ def main() -> int:
 
         tqdm_mod.tqdm = StatusTqdm
         mdxc_mod.tqdm = StatusTqdm
+        mdx_mod.tqdm = StatusTqdm
 
         out_dir = work_dir / "stems"
         out_dir.mkdir(parents=True, exist_ok=True)
-        model_filename = MODELS[args.mode]["filename"]
 
         def query_nvidia_free_vram_mb() -> float:
             """Query free VRAM via nvidia-smi without creating a ~300MB PyTorch CUDA context."""
@@ -319,14 +327,30 @@ def main() -> int:
                 pass
             return 0.0
 
+        initial_free_vram = query_nvidia_free_vram_mb() if cuda_ok else 0.0
+        use_cpu_fast_model = (not cuda_ok) or (device_mode == "cpu") or (device_mode == "auto" and initial_free_vram < 1800)
+        model_filename = CPU_FAST_MODEL if use_cpu_fast_model else MODELS[args.mode]["filename"]
+        print(
+            f"[Worker] Selected model={model_filename} mode={device_mode} initial_free_vram={initial_free_vram:.0f}MB",
+            file=sys.stderr,
+            flush=True,
+        )
+
         separator = Separator(
             model_file_dir=str(MODEL_DIR),
             output_dir=str(out_dir),
             output_format="MP3",
             output_bitrate="320k",
             normalization_threshold=0.9,
-            use_autocast=cuda_ok,
+            use_autocast=(cuda_ok and not use_cpu_fast_model),
             use_soundfile=False,
+            mdx_params={
+                "hop_length": 1024,
+                "segment_size": 256,
+                "overlap": 0.25,
+                "batch_size": 1,
+                "enable_denoise": False,
+            },
             mdxc_params={
                 "segment_size": 256,
                 "override_model_segment_size": False,
@@ -335,18 +359,19 @@ def main() -> int:
                 "pitch_shift": 0,
             },
         )
-        # In "auto" (dynamic) mode, ALWAYS load model onto CPU RAM first (0 MB VRAM!) so even when
-        # GPU only has 0.x GB free (e.g. local LLM or game running), load_model() NEVER OOMs!
-        if (not cuda_ok) or (device_mode == "auto"):
+        # In "auto" (dynamic) or CPU-fast mode, load onto CPU RAM first (0.0 MB VRAM!) so low VRAM NEVER OOMs!
+        if use_cpu_fast_model or (device_mode == "auto"):
             separator.torch_device = torch.device("cpu")
             separator.onnx_execution_provider = ["CPUExecutionProvider"]
 
         update(progress=34, stage_text="準備去人聲中...")
         separator.load_model(model_filename=model_filename)
+        if use_cpu_fast_model:
+            state["device_used"] = "CPU Fast AI (MDX-Net HQ3 · 0 MB VRAM)"
 
         # Install Real-Time Dynamic GPU <-> CPU Scheduler onto the loaded RoFormer instance!
         mi = separator.model_instance
-        if cuda_ok and hasattr(mi, "model_run") and hasattr(mi, "_run_roformer_model"):
+        if (not use_cpu_fast_model) and cuda_ok and hasattr(mi, "model_run") and hasattr(mi, "_run_roformer_model"):
             if device_mode == "gpu":
                 mi.model_run.to("cpu")
                 torch.cuda.empty_cache()
