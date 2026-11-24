@@ -31,6 +31,7 @@ MODEL_DIR = BASE_DIR / "models"
 TEMP_DIR = BASE_DIR / "tmp"
 JOBS_DIR = TEMP_DIR / "jobs"
 WORKER_SCRIPT = BASE_DIR / "worker.py"
+LYRICS_WORKER_SCRIPT = BASE_DIR / "lyrics_worker.py"
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
@@ -550,6 +551,162 @@ class KaraokeSeparatorManager:
             if self.gdrive.is_configured():
                 removed += self.gdrive.purge_all()
         return removed
+
+    # -------------------- 3-Layer Hybrid Lyrics (On-Demand) --------------------
+    def _lyrics_file(self, video_id: str) -> Path:
+        return self.cache_dir / video_id / "lyrics.json"
+
+    def _lyrics_status_file(self, video_id: str) -> Path:
+        return JOBS_DIR / f"lyrics__{video_id}.json"
+
+    def get_lyrics(self, video_id: str, mode: str = "pure") -> dict:
+        lf = self._lyrics_file(video_id)
+        if lf.exists():
+            try:
+                data = json.loads(lf.read_text(encoding="utf-8"))
+                return {"status": "ready", "progress": 100, "stage_text": data.get("source_label", "歌詞已就緒"), **data}
+            except Exception:
+                pass
+
+        # Also check Google Drive if stored there
+        if self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
+            remote_data = self.gdrive.read_json(video_id, mode, "lyrics.json")
+            if remote_data and remote_data.get("lines"):
+                lf.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    lf.write_text(json.dumps(remote_data, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                return {"status": "ready", "progress": 100, "stage_text": remote_data.get("source_label", "歌詞已就緒"), **remote_data}
+
+        sf = self._lyrics_status_file(video_id)
+        if sf.exists():
+            try:
+                return json.loads(sf.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        return {"video_id": video_id, "status": "idle", "progress": 0, "stage_text": "未生成歌詞", "lines": []}
+
+    def start_lyrics_generation(self, video_id: str, mode: str = "pure", force_ai: bool = False) -> dict:
+        if not force_ai:
+            existing = self.get_lyrics(video_id, mode)
+            if existing.get("status") == "ready":
+                return existing
+
+        key = f"lyrics__{video_id}"
+        with self._lock:
+            existing_proc = self._active_procs.get(key)
+            if existing_proc is not None and existing_proc.poll() is None:
+                return self.get_lyrics(video_id, mode)
+
+            sf = self._lyrics_status_file(video_id)
+            init = {
+                "video_id": video_id,
+                "status": "running",
+                "progress": 8,
+                "stage_text": "正在啟動智能歌詞對齊..." if force_ai else "正在搜尋字幕同對齊歌詞...",
+                "error": None,
+                "updated_at": time.time(),
+            }
+            sf.write_text(json.dumps(init, ensure_ascii=False), encoding="utf-8")
+
+        t = threading.Thread(
+            target=self._run_lyrics_worker,
+            args=(video_id, mode, force_ai, sf),
+            daemon=True,
+            name=f"lyrics-{video_id}",
+        )
+        t.start()
+        return init
+
+    def _run_lyrics_worker(self, video_id: str, mode: str, force_ai: bool, status_file: Path) -> None:
+        key = f"lyrics__{video_id}"
+        temp_vocals: Optional[Path] = None
+        try:
+            with self._worker_lock:
+                vocals_path = self.get_cache_dir(video_id, mode) / "vocals.mp3"
+                # If audio lives only on Google Drive, pull vocals.mp3 temporarily for Whisper alignment
+                if not vocals_path.exists() and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
+                    temp_vocals = TEMP_DIR / f"voc_{video_id}_{int(time.time())}.mp3"
+                    if self.gdrive.download_file(video_id, mode, "vocals.mp3", temp_vocals):
+                        vocals_path = temp_vocals
+
+                out_file = self._lyrics_file(video_id)
+                has_gpu, _, _, _ = query_nvidia_gpu()
+                eff_mode = self.device_mode if has_gpu else "cpu"
+
+                cmd = [
+                    sys.executable,
+                    "-u",
+                    str(LYRICS_WORKER_SCRIPT),
+                    "--video-id",
+                    video_id,
+                    "--vocals-path",
+                    str(vocals_path),
+                    "--out-file",
+                    str(out_file),
+                    "--status-file",
+                    str(status_file),
+                    "--device-mode",
+                    eff_mode,
+                    "--force-ai",
+                    "1" if force_ai else "0",
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(BASE_DIR),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                )
+                with self._lock:
+                    self._active_procs[key] = proc
+
+                try:
+                    _, stderr_text = proc.communicate(timeout=240)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    _, stderr_text = proc.communicate()
+                    raise RuntimeError("歌詞生成逾時")
+                finally:
+                    with self._lock:
+                        self._active_procs.pop(key, None)
+
+                if proc.returncode == 0 and out_file.exists():
+                    # Sync tiny lyrics.json (~4KB) to Google Drive if Drive is enabled
+                    if self.storage_mode == "gdrive" and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
+                        self.gdrive.upload_single_file(video_id, mode, out_file)
+                    print(f"[Karaoke] Lyrics ready for {video_id} (force_ai={force_ai})", flush=True)
+                elif proc.returncode != 0:
+                    print(f"[Karaoke] Lyrics worker failed ({video_id}): {(stderr_text or '')[-400:]}", flush=True)
+        except Exception as exc:
+            try:
+                status_file.write_text(
+                    json.dumps(
+                        {
+                            "video_id": video_id,
+                            "status": "error",
+                            "progress": 0,
+                            "stage_text": f"歌詞生成失敗：{exc}",
+                            "error": str(exc),
+                            "updated_at": time.time(),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+        finally:
+            if temp_vocals and temp_vocals.exists():
+                try:
+                    temp_vocals.unlink()
+                except Exception:
+                    pass
 
 
 manager = KaraokeSeparatorManager()

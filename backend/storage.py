@@ -127,6 +127,50 @@ class GoogleDriveStorage:
             self._index[self._key(video_id, mode)] = entry
             self._save_index()
 
+    def download_file(self, video_id: str, mode: str, filename: str, dest: Path) -> bool:
+        exe = self.refresh_binary()
+        if not exe:
+            return False
+        remote_file = f"{self._remote_base(video_id, mode)}/{filename}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        res = subprocess.run(
+            [exe, "copyto", remote_file, str(dest), "--quiet"],
+            capture_output=True,
+            timeout=60,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return res.returncode == 0 and dest.exists()
+
+    def upload_single_file(self, video_id: str, mode: str, local_file: Path) -> bool:
+        exe = self.refresh_binary()
+        if not exe or not local_file.exists():
+            return False
+        remote_file = f"{self._remote_base(video_id, mode)}/{local_file.name}"
+        res = subprocess.run(
+            [exe, "copyto", str(local_file), remote_file, "--quiet"],
+            capture_output=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        return res.returncode == 0
+
+    def read_json(self, video_id: str, mode: str, filename: str) -> Optional[dict]:
+        exe = self.refresh_binary()
+        if not exe:
+            return None
+        remote_file = f"{self._remote_base(video_id, mode)}/{filename}"
+        try:
+            out = subprocess.check_output(
+                [exe, "cat", remote_file],
+                text=True,
+                encoding="utf-8",
+                timeout=12,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return json.loads(out)
+        except Exception:
+            return None
+
     def stream_audio(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
         exe = self.refresh_binary()
         if not exe:

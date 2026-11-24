@@ -109,6 +109,12 @@ class SeparateRequest(BaseModel):
     mode: Literal["pure", "karaoke"] = "pure"
 
 
+class LyricsRequest(BaseModel):
+    video_id: str
+    mode: Literal["pure", "karaoke"] = "pure"
+    force_ai: bool = False
+
+
 class HeartbeatRequest(BaseModel):
     client_id: str
     video_id: Optional[str] = None
@@ -308,6 +314,18 @@ def get_audio(
         )
 
     raise HTTPException(status_code=404, detail="Audio stem not found in cache")
+
+
+@app.get("/api/lyrics/{video_id}")
+def get_lyrics(video_id: str, mode: Literal["pure", "karaoke"] = "pure"):
+    _validate_video_id(video_id)
+    return manager.get_lyrics(video_id, mode)
+
+
+@app.post("/api/lyrics")
+def generate_lyrics(req: LyricsRequest):
+    _validate_video_id(req.video_id)
+    return manager.start_lyrics_generation(req.video_id, req.mode, force_ai=req.force_ai)
 
 
 @app.get("/api/cache")

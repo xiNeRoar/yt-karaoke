@@ -30,6 +30,7 @@
     sliders: () => svgIcon(["M4 21v-7", "M4 10V3", "M12 21v-9", "M12 8V3", "M20 21v-5", "M20 12V3", "M1 14h6", "M9 8h6", "M17 16h6"], 13),
     music: () => svgIcon(["M9 18V5l12-2v13", "M6 18a3 3 0 1 0 0 .01", "M18 16a3 3 0 1 0 0 .01"], 13),
     clock: () => svgIcon(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z", "M12 6v6l4 2"], 13),
+    captions: () => svgIcon(["M3 5h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z", "M7 15h4", "M15 15h2", "M7 11h2", "M13 11h4"], 13),
   };
 
   // Helper to create DOM elements safely (100% Trusted Types compliant on YouTube)
@@ -443,9 +444,19 @@
     attachedVideo: null,
     videoListeners: [],
     prevVideoMuted: false,
+    // On-demand KTV Lyrics Overlay (default OFF per song)
+    lyricsEnabled: false,
+    lyricsLoading: false,
+    lyricsLines: [],
+    lyricsSourceLabel: "",
+    lyricsOffsetSec: 0,
+    lyricsPollTimer: null,
+    lyricsRenderTimer: null,
+    lastLyricLineIdx: -999,
   };
 
   let ui = null;
+  let lyricsOverlay = null;
 
   function getYouTubeVideoId() {
     if (!location.pathname.startsWith("/watch")) return null;
@@ -524,6 +535,18 @@
     // Sync offset display
     ui.syncVal.textContent =
       state.syncOffsetMs === 0 ? "0ms" : state.syncOffsetMs > 0 ? `+${state.syncOffsetMs}ms` : `${state.syncOffsetMs}ms`;
+
+    // Lyrics toggle & fine-tune controls
+    ui.lyricsToggleBtn.classList.toggle("active-preset", state.lyricsEnabled);
+    if (state.lyricsLoading) {
+      ui.lyricsToggleBtn.textContent = "對齊中...";
+    } else {
+      ui.lyricsToggleBtn.textContent = state.lyricsEnabled ? "開" : "關";
+    }
+    ui.lyricsExtraWrap.style.display = state.lyricsEnabled ? "inline-flex" : "none";
+    const lo = state.lyricsOffsetSec;
+    ui.lyricsOffsetVal.textContent = lo === 0 ? "0.0s" : lo > 0 ? `+${lo.toFixed(1)}s` : `${lo.toFixed(1)}s`;
+    ui.lyricsAiBtn.disabled = state.lyricsLoading;
   }
 
   function detachVideoListeners() {
@@ -632,7 +655,227 @@
 
     state.active = false;
     state.busy = false;
+    disableLyricsOverlay();
     updateUI();
+  }
+
+  // -------------------- On-Demand KTV Lyrics Overlay --------------------
+  function ensureLyricsOverlay() {
+    if (lyricsOverlay && lyricsOverlay.root.isConnected) return lyricsOverlay;
+    const player = document.querySelector("#movie_player");
+    if (!player) return null;
+
+    const currentEl = el("div", { className: "ktv-lyric-current" });
+    const nextEl = el("div", { className: "ktv-lyric-next" });
+    const statusEl = el("div", { className: "ktv-lyric-status" });
+    const root = el("div", { id: "yt-ai-ktv-lyrics-overlay" }, [statusEl, currentEl, nextEl]);
+    player.appendChild(root);
+    lyricsOverlay = { root, currentEl, nextEl, statusEl };
+    return lyricsOverlay;
+  }
+
+  function stopLyricsPolling() {
+    if (state.lyricsPollTimer) {
+      clearInterval(state.lyricsPollTimer);
+      state.lyricsPollTimer = null;
+    }
+  }
+
+  function stopLyricsRenderLoop() {
+    if (state.lyricsRenderTimer) {
+      clearInterval(state.lyricsRenderTimer);
+      state.lyricsRenderTimer = null;
+    }
+  }
+
+  function disableLyricsOverlay() {
+    stopLyricsPolling();
+    stopLyricsRenderLoop();
+    state.lyricsEnabled = false;
+    state.lyricsLoading = false;
+    state.lastLyricLineIdx = -999;
+    if (lyricsOverlay) {
+      lyricsOverlay.root.classList.remove("visible");
+    }
+  }
+
+  function renderLyricsFrame() {
+    if (!state.lyricsEnabled) return;
+    const ov = ensureLyricsOverlay();
+    if (!ov) return;
+
+    if (isAdPlaying()) {
+      ov.root.classList.remove("visible");
+      return;
+    }
+
+    if (state.lyricsLoading) {
+      ov.root.classList.add("visible");
+      ov.currentEl.textContent = "";
+      ov.nextEl.textContent = "";
+      return;
+    }
+
+    const lines = state.lyricsLines;
+    if (!lines || lines.length === 0) {
+      ov.root.classList.remove("visible");
+      return;
+    }
+
+    const video = getVideoElement();
+    if (!video) return;
+    const now = video.currentTime + state.lyricsOffsetSec;
+
+    let idx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (now >= lines[i].start - 0.15 && now <= lines[i].end + 0.35) {
+        idx = i;
+        break;
+      }
+    }
+
+    // Show upcoming first line right before singing starts
+    let nextIdx = -1;
+    if (idx === -1) {
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].start > now) {
+          if (lines[i].start - now <= 4.0) {
+            nextIdx = i;
+          }
+          break;
+        }
+      }
+      if (nextIdx === -1) {
+        ov.root.classList.remove("visible");
+        state.lastLyricLineIdx = -1;
+        return;
+      }
+      ov.root.classList.add("visible");
+      ov.statusEl.textContent = "";
+      ov.currentEl.textContent = "♪";
+      ov.nextEl.textContent = lines[nextIdx].text;
+      state.lastLyricLineIdx = -2;
+      return;
+    }
+
+    ov.root.classList.add("visible");
+    ov.statusEl.textContent = "";
+
+    const cur = lines[idx];
+    const nextLine = idx + 1 < lines.length ? lines[idx + 1] : null;
+
+    if (cur.words && cur.words.length > 0) {
+      // Word-by-word KTV sweeping highlight
+      if (state.lastLyricLineIdx !== idx) {
+        ov.currentEl.textContent = "";
+        for (const w of cur.words) {
+          ov.currentEl.appendChild(el("span", { className: "ktv-lyric-word", textContent: w.word }));
+        }
+        ov.nextEl.textContent = nextLine ? nextLine.text : "";
+        state.lastLyricLineIdx = idx;
+      }
+      const spans = ov.currentEl.children;
+      for (let i = 0; i < cur.words.length && i < spans.length; i++) {
+        spans[i].classList.toggle("sung", now >= cur.words[i].start - 0.05);
+      }
+    } else if (state.lastLyricLineIdx !== idx) {
+      ov.currentEl.textContent = cur.text;
+      ov.nextEl.textContent = nextLine ? nextLine.text : "";
+      state.lastLyricLineIdx = idx;
+    }
+  }
+
+  async function requestLyrics(forceAi = false) {
+    if (!state.videoId) return;
+    const targetVideoId = state.videoId;
+    const targetMode = state.mode;
+
+    state.lyricsEnabled = true;
+    state.lyricsLoading = true;
+    state.lastLyricLineIdx = -999;
+    if (forceAi) state.lyricsLines = [];
+    updateUI();
+
+    const ov = ensureLyricsOverlay();
+    if (ov) {
+      ov.root.classList.add("visible");
+      ov.statusEl.textContent = forceAi ? "AI 正在對準純人聲逐字對齊歌詞..." : "正在載入同步歌詞...";
+      ov.currentEl.textContent = "";
+      ov.nextEl.textContent = "";
+    }
+
+    const res = await apiRequest("/api/lyrics", "POST", {
+      video_id: targetVideoId,
+      mode: targetMode,
+      force_ai: forceAi,
+    });
+
+    if (!res.ok) {
+      state.lyricsLoading = false;
+      if (ov) ov.statusEl.textContent = `歌詞載入失敗：${res.error || "未知錯誤"}`;
+      updateUI();
+      return;
+    }
+
+    if (res.data && res.data.status === "ready" && res.data.lines) {
+      state.lyricsLoading = false;
+      state.lyricsLines = res.data.lines;
+      state.lyricsSourceLabel = res.data.source_label || "";
+      stopLyricsRenderLoop();
+      state.lyricsRenderTimer = setInterval(renderLyricsFrame, 60);
+      renderLyricsFrame();
+      updateUI();
+      return;
+    }
+
+    stopLyricsPolling();
+    let inFlight = false;
+    state.lyricsPollTimer = setInterval(async () => {
+      if (inFlight || !state.lyricsEnabled || state.videoId !== targetVideoId) return;
+      inFlight = true;
+      try {
+        const stRes = await apiRequest(`/api/lyrics/${targetVideoId}?mode=${targetMode}`);
+        if (!stRes.ok || !stRes.data) return;
+        const d = stRes.data;
+        if (d.status === "ready" && d.lines) {
+          stopLyricsPolling();
+          state.lyricsLoading = false;
+          state.lyricsLines = d.lines;
+          state.lyricsSourceLabel = d.source_label || "";
+          stopLyricsRenderLoop();
+          state.lyricsRenderTimer = setInterval(renderLyricsFrame, 60);
+          renderLyricsFrame();
+          updateUI();
+        } else if (d.status === "error") {
+          stopLyricsPolling();
+          state.lyricsLoading = false;
+          if (ov) ov.statusEl.textContent = d.stage_text || d.error || "無法生成歌詞";
+          updateUI();
+        } else if (ov) {
+          ov.statusEl.textContent = d.stage_text || "正在生成歌詞...";
+        }
+      } finally {
+        inFlight = false;
+      }
+    }, 1000);
+  }
+
+  function toggleLyrics() {
+    if (state.lyricsEnabled) {
+      disableLyricsOverlay();
+      updateUI();
+      return;
+    }
+    if (state.lyricsLines && state.lyricsLines.length > 0) {
+      state.lyricsEnabled = true;
+      state.lastLyricLineIdx = -999;
+      stopLyricsRenderLoop();
+      state.lyricsRenderTimer = setInterval(renderLyricsFrame, 60);
+      renderLyricsFrame();
+      updateUI();
+    } else {
+      requestLyrics(false);
+    }
   }
 
   async function activateLoadedTracks(videoId, mode) {
@@ -917,6 +1160,48 @@
       updateUI();
     };
 
+    // On-demand KTV Lyrics toggle + timing + force AI align
+    const lyricsToggleBtn = el("button", {
+      className: "ktv-mini-btn",
+      type: "button",
+      title: "段片本身無字幕先需要開（自動優先讀字幕，無字幕則用 AI 對準純人聲逐字生成）",
+      textContent: "關",
+      onClick: () => toggleLyrics(),
+    });
+    const lyricsOffsetVal = el("span", { className: "ktv-val", textContent: "0.0s" });
+    const adjustLyricsOffset = (delta) => {
+      state.lyricsOffsetSec = Math.round((state.lyricsOffsetSec + delta) * 10) / 10;
+      renderLyricsFrame();
+      updateUI();
+    };
+    const lyricsAiBtn = el("button", {
+      className: "ktv-mini-btn",
+      type: "button",
+      title: "強制用本地 AI 針對呢條片嘅純人聲重新逐字對齊（適合 Live 演唱會版）",
+      textContent: "AI 重對齊",
+      onClick: () => requestLyrics(true),
+    });
+    const lyricsExtraWrap = el(
+      "span",
+      { style: "display:none;align-items:center;gap:6px;" },
+      [
+        el("button", {
+          className: "ktv-mini-btn",
+          type: "button",
+          textContent: "-0.2s",
+          onClick: () => adjustLyricsOffset(-0.2),
+        }),
+        lyricsOffsetVal,
+        el("button", {
+          className: "ktv-mini-btn",
+          type: "button",
+          textContent: "+0.2s",
+          onClick: () => adjustLyricsOffset(0.2),
+        }),
+        lyricsAiBtn,
+      ]
+    );
+
     const mixerRow = el("div", { className: "ktv-row ktv-mixer-row" }, [
       el("div", { className: "ktv-control-card" }, [
         el("span", { className: "ktv-label" }, [ICONS.sliders(), "導唱音量"]),
@@ -932,6 +1217,11 @@
         pitchVal,
         pitchUp,
         pitchReset,
+      ]),
+      el("div", { className: "ktv-control-card" }, [
+        el("span", { className: "ktv-label" }, [ICONS.captions(), "KTV 歌詞"]),
+        lyricsToggleBtn,
+        lyricsExtraWrap,
       ]),
       el("div", { className: "ktv-control-card", title: "若伴奏與畫面有微細時間差可在此微調" }, [
         el("span", { className: "ktv-label" }, [ICONS.clock(), "同步微調"]),
@@ -986,6 +1276,10 @@
       preset100,
       pitchVal,
       syncVal,
+      lyricsToggleBtn,
+      lyricsExtraWrap,
+      lyricsOffsetVal,
+      lyricsAiBtn,
     };
 
     return panel;
@@ -1021,6 +1315,10 @@
       engine.setSemitones(0);
       engine.setVocalVolume(0);
       state.syncOffsetMs = 0;
+      state.lyricsOffsetSec = 0;
+      state.lyricsLines = [];
+      state.lyricsSourceLabel = "";
+      disableLyricsOverlay();
       state.cachedModes = [];
       state.videoId = newVideoId;
 
