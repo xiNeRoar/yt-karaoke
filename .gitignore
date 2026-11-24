@@ -1,0 +1,21 @@
+# Python & virtual environments
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Local secrets & machine-specific config (NEVER commit!)
+backend/.admin_token
+backend/config.json
+backend/gdrive_index.json
+*.env
+.env*
+
+# Large AI checkpoints, cached copyrighted audio, and temp files
+backend/models/
+backend/cache/
+backend/tmp/
+
+# Built binaries & release zips
+tray-app/*.exe
+tray-app/*.ico
+*.zip

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8" />
+  <title>唱K 去人聲</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      background: #0f0f0f;
+      color: #f1f1f1;
+      font-family: "Roboto", "Segoe UI", "Noto Sans TC", sans-serif;
+      font-size: 13px;
+      padding: 14px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    .title {
+      font-size: 14.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      letter-spacing: 0.1px;
+    }
+    .pill {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #aaaaaa;
+    }
+    .pill.online {
+      background: rgba(43, 166, 64, 0.18);
+      color: #4ade80;
+    }
+    .card {
+      background: #1a1a1a;
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+    }
+    .card-title {
+      font-size: 11.5px;
+      color: #aaaaaa;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    .btn-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      padding: 3px;
+      border-radius: 999px;
+    }
+    button {
+      border: none;
+      background: transparent;
+      color: #aaaaaa;
+      border-radius: 999px;
+      padding: 7px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.15s ease, color 0.15s ease;
+    }
+    button:hover { color: #f1f1f1; }
+    button.active {
+      background: #f1f1f1;
+      color: #0f0f0f;
+      font-weight: 600;
+    }
+    .song-list {
+      max-height: 185px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .song-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      background: rgba(255, 255, 255, 0.04);
+      padding: 7px 9px;
+      border-radius: 8px;
+      font-size: 12px;
+      text-decoration: none;
+      color: #f1f1f1;
+      transition: background 0.15s ease;
+    }
+    .song-item:hover {
+      background: rgba(255, 255, 255, 0.11);
+    }
+    .song-title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+    .song-tag {
+      font-size: 10.5px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #cccccc;
+      flex-shrink: 0;
+    }
+    .hint {
+      font-size: 11.5px;
+      color: #888888;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/><path d="M8 22h8"/></svg>
+      <span>唱K 去人聲</span>
+    </div>
+    <div id="status-pill" class="pill">連線中</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">預設伴奏模式</div>
+    <div class="btn-row">
+      <button id="btn-pure" type="button">純伴奏</button>
+      <button id="btn-karaoke" type="button">保留和音</button>
+    </div>
+    <p class="hint" style="margin-top:8px;">打開任何 YouTube MV，喺影片下方撳「開始唱K」即可。</p>
+  </div>
+
+  <div class="card">
+    <div class="card-title">最近唱過（<span id="song-count">0 首</span>・點擊即開秒唱）</div>
+    <div id="song-list" class="song-list"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,312 @@
+/* YouTube Native & Studio Premium Karaoke Bar (Auto Dark/Light Theme) */
+#yt-ai-ktv-panel {
+  --ktv-bg: rgba(0, 0, 0, 0.045);
+  --ktv-bg-hover: rgba(0, 0, 0, 0.09);
+  --ktv-card-bg: rgba(0, 0, 0, 0.04);
+  --ktv-border: rgba(0, 0, 0, 0.1);
+  --ktv-border-active: rgba(0, 0, 0, 0.24);
+  --ktv-text: #0f0f0f;
+  --ktv-text-muted: #606060;
+  --ktv-pill-bg: #0f0f0f;
+  --ktv-pill-text: #ffffff;
+  --ktv-pill-hover: #272727;
+  --ktv-accent-red: #ff0033;
+  --ktv-accent-green: #16a34a;
+
+  position: relative;
+  margin: 12px 0 8px 0;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--ktv-bg);
+  border: 1px solid var(--ktv-border);
+  color: var(--ktv-text);
+  font-family: "Roboto", "YouTube Sans", "Noto Sans TC", Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  box-sizing: border-box;
+  width: 100%;
+  overflow: hidden;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+html[dark] #yt-ai-ktv-panel,
+ytd-app[dark] #yt-ai-ktv-panel {
+  --ktv-bg: rgba(255, 255, 255, 0.06);
+  --ktv-bg-hover: rgba(255, 255, 255, 0.14);
+  --ktv-card-bg: rgba(255, 255, 255, 0.05);
+  --ktv-border: rgba(255, 255, 255, 0.1);
+  --ktv-border-active: rgba(255, 255, 255, 0.26);
+  --ktv-text: #f1f1f1;
+  --ktv-text-muted: #aaaaaa;
+  --ktv-pill-bg: #f1f1f1;
+  --ktv-pill-text: #0f0f0f;
+  --ktv-pill-hover: #d9d9d9;
+  --ktv-accent-red: #ff4e45;
+  --ktv-accent-green: #2ba640;
+}
+
+#yt-ai-ktv-panel.ktv-active {
+  border-color: var(--ktv-border-active);
+}
+
+.ktv-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ktv-row + .ktv-row {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ktv-border);
+}
+
+.ktv-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 13.5px;
+  letter-spacing: 0.1px;
+  color: var(--ktv-text);
+}
+
+.ktv-icon-svg {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  color: var(--ktv-text);
+}
+
+.ktv-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ktv-text-muted);
+  flex-shrink: 0;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.ktv-dot.online {
+  background: var(--ktv-accent-green);
+}
+
+#yt-ai-ktv-panel.ktv-active .ktv-dot.online {
+  background: var(--ktv-accent-red);
+  box-shadow: 0 0 0 3px rgba(255, 78, 69, 0.2);
+}
+
+.ktv-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--ktv-card-bg);
+  border: 1px solid var(--ktv-border);
+  color: var(--ktv-text-muted);
+}
+
+.ktv-badge.cached {
+  color: var(--ktv-text);
+}
+
+.ktv-controls-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Native YouTube-style Segmented Chip Switch */
+.ktv-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  background: var(--ktv-card-bg);
+  border: 1px solid var(--ktv-border);
+  border-radius: 999px;
+  padding: 2px;
+}
+
+.ktv-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--ktv-text-muted);
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.ktv-mode-btn:hover {
+  color: var(--ktv-text);
+}
+
+.ktv-mode-btn.selected {
+  background: var(--ktv-pill-bg);
+  color: var(--ktv-pill-text);
+  font-weight: 600;
+}
+
+/* Native YouTube Subscribe-style Primary Pill Button */
+.ktv-primary-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  border-radius: 999px;
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--ktv-pill-text);
+  background: var(--ktv-pill-bg);
+  transition: background-color 0.15s ease, opacity 0.15s ease;
+}
+
+.ktv-primary-btn:hover:not(:disabled) {
+  background: var(--ktv-pill-hover);
+}
+
+.ktv-primary-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ktv-primary-btn.active {
+  background: var(--ktv-card-bg);
+  color: var(--ktv-text);
+  border: 1px solid var(--ktv-border-active);
+}
+
+.ktv-primary-btn.active:hover:not(:disabled) {
+  background: var(--ktv-bg-hover);
+}
+
+.ktv-progress-wrap {
+  width: 100%;
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ktv-progress-wrap.visible {
+  display: flex;
+}
+
+.ktv-progress-bar-bg {
+  width: 100%;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--ktv-border);
+  overflow: hidden;
+}
+
+.ktv-progress-bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: var(--ktv-accent-red);
+  transition: width 0.3s ease;
+}
+
+.ktv-status-text {
+  font-size: 12px;
+  color: var(--ktv-text-muted);
+}
+
+.ktv-status-text.error {
+  color: var(--ktv-accent-red);
+}
+
+/* Studio Mixer Strip */
+.ktv-mixer-row {
+  display: none;
+}
+
+.ktv-mixer-row.visible {
+  display: flex;
+}
+
+.ktv-control-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--ktv-card-bg);
+  border: 1px solid var(--ktv-border);
+  border-radius: 10px;
+  padding: 6px 10px;
+}
+
+.ktv-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ktv-text-muted);
+  white-space: nowrap;
+}
+
+.ktv-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 108px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--ktv-border-active);
+  outline: none;
+  cursor: pointer;
+}
+
+.ktv-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--ktv-text);
+  cursor: pointer;
+  transition: transform 0.12s ease;
+}
+
+.ktv-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+.ktv-val {
+  min-width: 36px;
+  text-align: center;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--ktv-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.ktv-mini-btn {
+  border: 1px solid var(--ktv-border);
+  background: transparent;
+  color: var(--ktv-text-muted);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.ktv-mini-btn:hover {
+  background: var(--ktv-bg-hover);
+  color: var(--ktv-text);
+}
+
+.ktv-mini-btn.active-preset {
+  background: var(--ktv-pill-bg);
+  color: var(--ktv-pill-text);
+  border-color: transparent;
+  font-weight: 600;
+}
