@@ -36,13 +36,43 @@ sys.path.insert(0, str(BACKEND))
 
 
 def test_python_compile_and_ast() -> None:
+    import builtins
+
     py_files = list(BACKEND.glob("*.py")) + [GATEWAY / "main.py"]
     if WATCHER.exists():
         py_files.append(WATCHER)
+    builtin_names = set(dir(builtins))
     for pf in py_files:
         py_compile.compile(str(pf), doraise=True)
-        ast.parse(pf.read_text(encoding="utf-8"), filename=str(pf))
-    print(f"[PASS] Python compile + AST parse ({len(py_files)} files)")
+        tree = ast.parse(pf.read_text(encoding="utf-8"), filename=str(pf))
+        # Structural undefined-call guard: collect every defined/imported/assigned/parameter name in module
+        defined = set(builtin_names)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+                if hasattr(node, "args"):
+                    for a in (
+                        list(node.args.posonlyargs)
+                        + list(node.args.args)
+                        + list(node.args.kwonlyargs)
+                        + ([node.args.vararg] if node.args.vararg else [])
+                        + ([node.args.kwarg] if node.args.kwarg else [])
+                    ):
+                        defined.add(a.arg)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    defined.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    defined.add(alias.asname or alias.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                assert node.func.id in defined, f"Undefined function call '{node.func.id}' at {pf.name}:{node.lineno}"
+    print(f"[PASS] Python compile + AST parse + undefined-call check ({len(py_files)} files)")
 
 
 def test_extension_js_syntax() -> None:
@@ -118,7 +148,7 @@ def test_worker_and_separator_invariants() -> None:
     assert "if lrc_synced and not force_ai and len(lrc_synced)" in lw_src, "force_ai=True must bypass LRC scaffold shortcut"
     assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
-    assert "align_chunk, blk_time_map = _compress_long_silences(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
+    assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
     # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
     assert "OrderedDict" in gw_src and "_lyrics_ram_max" in gw_src, "Gateway lyrics cache must be bounded LRU"

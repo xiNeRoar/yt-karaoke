@@ -1627,14 +1627,14 @@ def _live_section_anchored_align(
             blk_text = "\n".join(x["text"] for x in blk)
             # Compress long instrumental/guitar-solo breaks inside the block BEFORE model.align()
             # so lyrics NEVER stretch across solos or stick to the wrong side of an instrumental interlude!
-            blk_time_map: list[tuple[float, float, float]] = []
+            blk_time_map: list[tuple[float, float, float, float]] = []
             align_chunk = chunk
             if (b_end - b_start) >= 20.0 and len(db_profile) > 0:
                 di0 = max(0, int(b_start / step_sec))
                 di1 = min(len(db_profile), int(b_end / step_sec))
                 if di1 > di0 + 20:
-                    align_chunk, blk_time_map = _compress_long_silences(
-                        chunk, db_profile[di0:di1], step_sec, min_silence_sec=5.0, keep_pad_sec=1.2
+                    align_chunk, blk_time_map = build_silence_collapsed_audio(
+                        chunk, db_profile[di0:di1], step_sec
                     )
             try:
                 al = model.align(align_chunk, blk_text, language=lang, original_split=True, verbose=False)
