@@ -111,12 +111,19 @@ class GoogleDriveStorage:
             raise RuntimeError("搵唔到 rclone，無法上傳到 Google Drive")
 
         remote_dir = self._remote_base(video_id, mode)
-        # Ensure remote directory exists and upload instrumental.mp3, vocals.mp3, meta.json
+        # Ensure remote directory exists and upload instrumental.mp3, vocals.mp3, meta.json (resilient retries)
         res = subprocess.run(
-            [exe, "copy", str(local_dir), remote_dir, "--transfers", "3", "--drive-chunk-size", "32M", "--quiet"],
+            [
+                exe, "copy", str(local_dir), remote_dir,
+                "--transfers", "2",
+                "--retries", "3",
+                "--low-level-retries", "5",
+                "--drive-chunk-size", "16M",
+                "--quiet",
+            ],
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=300,
             creationflags=CREATE_NO_WINDOW,
         )
         if res.returncode != 0:
