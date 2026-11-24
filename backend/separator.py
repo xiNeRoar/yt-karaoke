@@ -156,8 +156,14 @@ class KaraokeSeparatorManager:
         # silently re-separates any 'cpu_fast' (MDX-Net HQ3) songs with BS-RoFormer 1297 and replaces them in cache!
         threading.Thread(target=self._bg_gpu_hq_upgrader_loop, daemon=True, name="hq-idle-upgrader").start()
 
+    def _needs_hq_upgrade(self, item: dict) -> bool:
+        if item.get("quality_tier") == "cpu_fast":
+            return True
+        target_model = MODELS.get(item.get("mode", "pure"), {}).get("filename", "")
+        return bool(target_model and item.get("model") != target_model)
+
     def count_pending_hq_upgrades(self) -> int:
-        return sum(1 for item in self.list_cache() if item.get("quality_tier") == "cpu_fast")
+        return sum(1 for item in self.list_cache() if self._needs_hq_upgrade(item))
 
     def _bg_gpu_hq_upgrader_loop(self) -> None:
         time.sleep(30)
@@ -183,7 +189,7 @@ class KaraokeSeparatorManager:
         now = time.time()
         candidate = None
         for item in self.list_cache():
-            if item.get("quality_tier") != "cpu_fast":
+            if not self._needs_hq_upgrade(item):
                 continue
             key = self._job_key(item["video_id"], item["mode"])
             if self._hq_upgrade_backoff.get(key, 0.0) > now:

@@ -170,6 +170,7 @@ class GatewayState:
                                 "size_mb": entry.get("size_mb") or 0,
                                 "created_at": entry.get("created_at") or time.time(),
                                 "quality_tier": entry.get("quality_tier") or "gpu_hq",
+                                "model": entry.get("model") or "",
                                 "storage": "gdrive",
                                 "url": f"https://www.youtube.com/watch?v={vid}",
                             }
@@ -178,7 +179,11 @@ class GatewayState:
                             with self._lock:
                                 for k, new_ent in cleaned.items():
                                     old_ent = self._index.get(k)
-                                    if old_ent and old_ent.get("quality_tier") == "cpu_fast" and new_ent.get("quality_tier") == "gpu_hq":
+                                    if not old_ent:
+                                        continue
+                                    tier_upgraded = old_ent.get("quality_tier") == "cpu_fast" and new_ent.get("quality_tier") == "gpu_hq"
+                                    model_changed = bool(new_ent.get("model")) and old_ent.get("model") != new_ent.get("model")
+                                    if tier_upgraded or model_changed:
                                         evict_vids.append(new_ent["video_id"])
                                 self._index = cleaned
                                 self._lyrics_missing.clear()
