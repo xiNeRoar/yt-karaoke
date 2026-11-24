@@ -90,7 +90,7 @@ document.getElementById("invite-btn").addEventListener("click", async () => {
   const errEl = document.getElementById("invite-err");
   const code = (input.value || "").trim();
   if (!code) {
-    errEl.textContent = "請先輸入朋友邀請碼";
+    errEl.textContent = "請先輸入邀請碼";
     return;
   }
   btn.disabled = true;

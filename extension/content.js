@@ -559,7 +559,7 @@
       ui.deviceBadge.textContent = "服務未連線";
       ui.deviceBadge.style.display = "inline-block";
     } else if (needInvite) {
-      ui.deviceBadge.textContent = "朋友專屬邀請制";
+      ui.deviceBadge.textContent = "邀請制";
       ui.deviceBadge.style.display = "inline-block";
     } else if (!state.gpuOnline) {
       ui.deviceBadge.textContent = "歌庫在線 · AI 休息中";
@@ -1725,7 +1725,7 @@
     const authInput = el("input", {
       className: "ktv-auth-input",
       type: "text",
-      placeholder: "輸入朋友邀請碼 (例如 KTV-XXXX-XXXX)",
+      placeholder: "輸入邀請碼 (例如 KTV-XXXX-XXXX)",
       autocomplete: "off",
       spellcheck: "false",
     });

@@ -1415,7 +1415,7 @@ namespace YtKaraokeTray
             _httpReq = httpReq;
 
             AutoScaleMode = AutoScaleMode.None;
-            Text = "朋友邀請碼管理";
+            Text = "邀請碼管理";
             Icon = owner.Icon;
             ClientSize = new Size(S(800), S(590));
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -1470,7 +1470,7 @@ namespace YtKaraokeTray
 
             Controls.Add(new Label
             {
-                Text = "朋友邀請碼管理（自動同步 Google Drive ＋ 24/7 NAS）",
+                Text = "邀請碼管理（自動同步 Google Drive ＋ 24/7 NAS）",
                 Font = new Font("Microsoft JhengHei UI", 13.5f, FontStyle.Bold),
                 ForeColor = TextPrimary,
                 Location = new Point(S(pad), S(14)),
@@ -1501,7 +1501,7 @@ namespace YtKaraokeTray
             };
             cardGen.Controls.Add(new Label
             {
-                Text = "一鍵批量生成邀請碼（每條個人碼建議上限 2 部機；朋友群組碼可設 30–100 部機）",
+                Text = "一鍵批量生成邀請碼（每條個人碼建議上限 2 部機；群組碼可設 30–100 部機）",
                 Font = new Font("Microsoft JhengHei UI", 9.2f),
                 ForeColor = TextMuted,
                 Location = new Point(S(14), S(10)),
@@ -1511,7 +1511,7 @@ namespace YtKaraokeTray
             cardGen.Controls.Add(new Label { Text = "備註:", ForeColor = TextMuted, Location = new Point(S(14), S(42)), AutoSize = true });
             _txtLabel = new TextBox
             {
-                Text = "朋友",
+                Text = "",
                 Location = new Point(S(60), S(39)),
                 Size = new Size(S(155), S(28)),
                 BackColor = Color.FromArgb(18, 18, 18),
@@ -1600,7 +1600,7 @@ namespace YtKaraokeTray
                 int total = doc.ContainsKey("total_codes") ? Convert.ToInt32(doc["total_codes"]) : 0;
                 int active = doc.ContainsKey("active_codes") ? Convert.ToInt32(doc["active_codes"]) : 0;
                 int bound = doc.ContainsKey("total_bound_devices") ? Convert.ToInt32(doc["total_bound_devices"]) : 0;
-                _lblStats.Text = string.Format("總計 {0} 條邀請碼 · 啟用中 {1} 條 · 已綁定 {2} 部朋友裝置（雙擊可複製）", total, active, bound);
+                _lblStats.Text = string.Format("總計 {0} 條邀請碼 · 啟用中 {1} 條 · 已綁定 {2} 部裝置（雙擊可複製）", total, active, bound);
 
                 var arr = doc["items"] as System.Collections.ArrayList;
                 _latestItems = new List<Dictionary<string, object>>();
@@ -1674,7 +1674,7 @@ namespace YtKaraokeTray
                 {
                     try { Clipboard.SetText(string.Join(Environment.NewLine, newCodes)); } catch { }
                     MessageBox.Show(
-                        string.Format("已生成 {0} 條邀請碼，並自動複製到剪貼簿！\n\n正自動同步上 Google Drive 同 NAS，幾秒後朋友即可輸入使用。", newCodes.Count),
+                        string.Format("已生成 {0} 條邀請碼，並自動複製到剪貼簿！\n\n正自動同步上 Google Drive 同 NAS，幾秒後即可輸入使用。", newCodes.Count),
                         "生成成功",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Information
@@ -1735,7 +1735,7 @@ namespace YtKaraokeTray
             {
                 if (sfd.ShowDialog(this) != DialogResult.OK) return;
                 var sb = new StringBuilder();
-                sb.AppendLine("# YouTube AI 唱K 朋友邀請碼清單 (" + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + ")");
+                sb.AppendLine("# YouTube AI 唱K 邀請碼清單 (" + DateTime.Now.ToString("yyyy-MM-dd HH:mm") + ")");
                 foreach (var d in _latestItems)
                 {
                     string code = d.ContainsKey("code") ? Convert.ToString(d["code"]) : "";

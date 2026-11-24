@@ -373,12 +373,12 @@ class GatewayState:
 
     def verify_device_token(self, raw_token: Optional[str]) -> tuple[bool, Optional[dict], str]:
         if not raw_token or not raw_token.startswith("ktv_"):
-            return (False, None, "請先輸入朋友邀請碼以啟用唱K 服務")
+            return (False, None, "請先輸入邀請碼以啟用唱K 服務")
         thash = self._hash_token(raw_token.strip())
         with self._lock:
             binfo = self._device_bindings.get(thash)
             if not binfo:
-                return (False, None, "登入憑證已失效，請重新輸入朋友邀請碼")
+                return (False, None, "登入憑證已失效，請重新輸入邀請碼")
             code = binfo.get("code", "")
             entry = self._access_codes.get(code)
             if not entry:
