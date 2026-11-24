@@ -220,6 +220,14 @@ namespace YtKaraokeTray
         private Button _btnToggleLogs;
         private TextBox _txtLogs;
         private System.Windows.Forms.Timer _pollTimer;
+        private float _dpiScale = 1.0f;
+        private Font _fontModeActive;
+        private Font _fontModeNormal;
+
+        private int S(int px)
+        {
+            return (int)Math.Round(px * _dpiScale);
+        }
 
         // Studio Monochrome Dark Palette
         private static readonly Color BgDark = Color.FromArgb(15, 15, 15);
@@ -235,6 +243,13 @@ namespace YtKaraokeTray
 
         public MainForm(string showEventName)
         {
+            using (var g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                _dpiScale = Math.Max(1.0f, g.DpiX / 96.0f);
+            }
+            _fontModeActive = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
+            _fontModeNormal = new Font("Microsoft JhengHei UI", 10f, FontStyle.Regular);
+
             _showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, showEventName);
             _iconRunning = CreateTrayIcon(true);
             _iconStopped = CreateTrayIcon(false);
@@ -290,44 +305,45 @@ namespace YtKaraokeTray
 
         private void BuildUI()
         {
+            AutoScaleMode = AutoScaleMode.None;
             Text = "YouTube 唱K 控制台";
             Icon = _iconRunning;
-            ClientSize = new Size(556, 678);
+            ClientSize = new Size(S(760), S(816));
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = BgDark;
             ForeColor = TextPrimary;
-            Font = new Font("Microsoft JhengHei UI", 9f);
+            Font = new Font("Microsoft JhengHei UI", 10f);
 
-            int pad = 16;
-            int w = 524;
+            int pad = 22;
+            int w = 716;
 
             // Header Row
             Controls.Add(new Label
             {
                 Text = "YouTube 唱K 控制台",
-                Font = new Font("Microsoft JhengHei UI", 12.5f, FontStyle.Bold),
+                Font = new Font("Microsoft JhengHei UI", 16f, FontStyle.Bold),
                 ForeColor = TextPrimary,
-                Location = new Point(pad, 13),
+                Location = new Point(S(pad), S(14)),
                 AutoSize = true
             });
 
             _lblStatusPill = new Label
             {
                 Text = "檢查中",
-                Font = new Font("Microsoft JhengHei UI", 8.5f, FontStyle.Bold),
+                Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold),
                 ForeColor = Color.White,
                 BackColor = BtnNeutral,
                 TextAlign = ContentAlignment.MiddleCenter,
-                Size = new Size(78, 24),
-                Location = new Point(pad + w - 78, 14)
+                Size = new Size(S(96), S(30)),
+                Location = new Point(S(pad + w - 96), S(16))
             };
             Controls.Add(_lblStatusPill);
 
             // Top Action Row: Start/Stop + Auto-Update Chrome Extension
-            _btnToggleServer = MakeButton("啟動唱K 服務", pad, 48, 256, 36, AccentWhite, Color.FromArgb(15, 15, 15));
-            _btnToggleServer.Font = new Font("Microsoft JhengHei UI", 9.5f, FontStyle.Bold);
+            _btnToggleServer = MakeButton("啟動唱K 服務", pad, 58, 352, 44, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnToggleServer.Font = new Font("Microsoft JhengHei UI", 11f, FontStyle.Bold);
             _btnToggleServer.Click += (s, e) =>
             {
                 if (_backendOnline || _starting) StopBackend();
@@ -335,104 +351,107 @@ namespace YtKaraokeTray
             };
             Controls.Add(_btnToggleServer);
 
-            _btnAutoUpdateExt = MakeButton("一鍵自動更新 Chrome 插件", pad + 266, 48, 258, 36, BtnNeutral, TextPrimary);
-            _btnAutoUpdateExt.Font = new Font("Microsoft JhengHei UI", 9f, FontStyle.Bold);
+            _btnAutoUpdateExt = MakeButton("一鍵自動更新 Chrome 插件", pad + 364, 58, 352, 44, BtnNeutral, TextPrimary);
+            _btnAutoUpdateExt.Font = new Font("Microsoft JhengHei UI", 10.5f, FontStyle.Bold);
             _btnAutoUpdateExt.Click += async (s, e) => await TriggerAutoReloadExtensionAsync();
             Controls.Add(_btnAutoUpdateExt);
 
             // KPI Row (3 Cards)
-            int kw = (w - 16) / 3;
-            var cardUsers = MakeCard(pad, 94, kw, 70);
-            cardUsers.Controls.Add(MakeSectionLabel("在線連線 / 排隊", 10, 8));
-            _lblUsersNum = new Label { Text = "0 人", Font = new Font("Microsoft JhengHei UI", 13.5f, FontStyle.Bold), ForeColor = TextPrimary, Location = new Point(10, 26), AutoSize = true };
-            _lblUsersSub = new Label { Text = "0 唱K · 排隊 0", Font = new Font("Microsoft JhengHei UI", 8f), ForeColor = TextMuted, Location = new Point(10, 50), Size = new Size(kw - 16, 16) };
+            int kGap = 12;
+            int kw = 230;
+            int kwLast = w - (kw + kGap) * 2;
+
+            var cardUsers = MakeCard(pad, 114, kw, 92);
+            cardUsers.Controls.Add(MakeSectionLabel("在線連線 / 排隊", 14, 10));
+            _lblUsersNum = new Label { Text = "0 人", Font = new Font("Microsoft JhengHei UI", 18f, FontStyle.Bold), ForeColor = TextPrimary, Location = new Point(S(14), S(32)), AutoSize = true };
+            _lblUsersSub = new Label { Text = "0 唱K · 排隊 0", Font = new Font("Microsoft JhengHei UI", 9.5f), ForeColor = TextMuted, Location = new Point(S(14), S(66)), Size = new Size(S(kw - 24), S(20)) };
             cardUsers.Controls.AddRange(new Control[] { _lblUsersNum, _lblUsersSub });
             Controls.Add(cardUsers);
 
-            var cardCacheKpi = MakeCard(pad + kw + 8, 94, kw, 70);
-            cardCacheKpi.Controls.Add(MakeSectionLabel("已快取伴奏", 10, 8));
-            _lblCacheNum = new Label { Text = "0 首", Font = new Font("Microsoft JhengHei UI", 13.5f, FontStyle.Bold), ForeColor = TextPrimary, Location = new Point(10, 26), AutoSize = true };
-            _lblCacheSub = new Label { Text = "本地 0 MB", Font = new Font("Microsoft JhengHei UI", 8f), ForeColor = TextMuted, Location = new Point(10, 50), Size = new Size(kw - 16, 16) };
+            var cardCacheKpi = MakeCard(pad + kw + kGap, 114, kw, 92);
+            cardCacheKpi.Controls.Add(MakeSectionLabel("已快取伴奏", 14, 10));
+            _lblCacheNum = new Label { Text = "0 首", Font = new Font("Microsoft JhengHei UI", 18f, FontStyle.Bold), ForeColor = TextPrimary, Location = new Point(S(14), S(32)), AutoSize = true };
+            _lblCacheSub = new Label { Text = "本地 0 MB", Font = new Font("Microsoft JhengHei UI", 9.5f), ForeColor = TextMuted, Location = new Point(S(14), S(66)), Size = new Size(S(kw - 24), S(20)) };
             cardCacheKpi.Controls.AddRange(new Control[] { _lblCacheNum, _lblCacheSub });
             Controls.Add(cardCacheKpi);
 
-            var cardVramKpi = MakeCard(pad + (kw + 8) * 2, 94, kw, 70);
-            cardVramKpi.Controls.Add(MakeSectionLabel("剩餘 VRAM", 10, 8));
-            _lblVramNum = new Label { Text = "—", Font = new Font("Microsoft JhengHei UI", 13.5f, FontStyle.Bold), ForeColor = TextPrimary, Location = new Point(10, 26), AutoSize = true };
-            _lblVramSub = new Label { Text = "主服務佔 0 MB", Font = new Font("Microsoft JhengHei UI", 8f), ForeColor = TextMuted, Location = new Point(10, 50), Size = new Size(kw - 16, 16) };
+            var cardVramKpi = MakeCard(pad + (kw + kGap) * 2, 114, kwLast, 92);
+            cardVramKpi.Controls.Add(MakeSectionLabel("剩餘 VRAM", 14, 10));
+            _lblVramNum = new Label { Text = "—", Font = new Font("Microsoft JhengHei UI", 18f, FontStyle.Bold), ForeColor = TextPrimary, Location = new Point(S(14), S(32)), AutoSize = true };
+            _lblVramSub = new Label { Text = "主服務佔 0 MB", Font = new Font("Microsoft JhengHei UI", 9.5f), ForeColor = TextMuted, Location = new Point(S(14), S(66)), Size = new Size(S(kwLast - 24), S(20)) };
             cardVramKpi.Controls.AddRange(new Control[] { _lblVramNum, _lblVramSub });
             Controls.Add(cardVramKpi);
 
             // Multi-User Anti-Overload & GPU Control Card
-            var cardOverload = MakeCard(pad, 174, w, 108);
-            cardOverload.Controls.Add(MakeSectionLabel("多用戶防爆負載控制（確保幾十至百人連線唔會隊爆電腦）", 12, 9));
+            var cardOverload = MakeCard(pad, 218, w, 134);
+            cardOverload.Controls.Add(MakeSectionLabel("多用戶防爆負載控制（確保幾十至百人連線唔會隊爆電腦）", 14, 10));
 
-            _btnAuto = MakeButton("動態防爆", 12, 31, 86, 28, AccentWhite, Color.FromArgb(15, 15, 15));
-            _btnGpu = MakeButton("強制 GPU", 104, 31, 86, 28, BtnNeutral, TextPrimary);
-            _btnCpu = MakeButton("純 CPU", 196, 31, 76, 28, BtnNeutral, TextPrimary);
+            _btnAuto = MakeButton("動態防爆", 14, 38, 116, 36, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnGpu = MakeButton("強制 GPU", 138, 38, 116, 36, BtnNeutral, TextPrimary);
+            _btnCpu = MakeButton("純 CPU", 262, 38, 104, 36, BtnNeutral, TextPrimary);
             _btnAuto.Click += async (s, e) => await SetDeviceModeAsync("auto");
             _btnGpu.Click += async (s, e) => await SetDeviceModeAsync("gpu");
             _btnCpu.Click += async (s, e) => await SetDeviceModeAsync("cpu");
 
-            _btnPauseNew = MakeButton("接受新歌拆軌中", 282, 31, 230, 28, AccentGreen, Color.White);
-            _btnPauseNew.Font = new Font("Microsoft JhengHei UI", 8.5f, FontStyle.Bold);
+            _btnPauseNew = MakeButton("接受新歌拆軌中", 378, 38, 324, 36, AccentGreen, Color.White);
+            _btnPauseNew.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
             _btnPauseNew.Click += async (s, e) => await TogglePauseNewJobsAsync();
 
             cardOverload.Controls.AddRange(new Control[] { _btnAuto, _btnGpu, _btnCpu, _btnPauseNew });
 
             // Numeric limits row
-            cardOverload.Controls.Add(new Label { Text = "排隊上限:", ForeColor = TextMuted, Location = new Point(12, 72), AutoSize = true });
-            _numMaxQueue = MakeNum(74, 69, 46, 1, 20, 3);
-            cardOverload.Controls.Add(new Label { Text = "每人/10分:", ForeColor = TextMuted, Location = new Point(128, 72), AutoSize = true });
-            _numRateLimit = MakeNum(198, 69, 46, 1, 50, 5);
-            cardOverload.Controls.Add(new Label { Text = "人數上限:", ForeColor = TextMuted, Location = new Point(254, 72), AutoSize = true });
-            _numMaxClients = MakeNum(316, 69, 54, 5, 500, 100);
+            cardOverload.Controls.Add(new Label { Text = "排隊上限:", Font = new Font("Microsoft JhengHei UI", 10f), ForeColor = TextMuted, Location = new Point(S(14), S(90)), AutoSize = true });
+            _numMaxQueue = MakeNum(94, 87, 58, 1, 20, 3);
+            cardOverload.Controls.Add(new Label { Text = "每人/10分:", Font = new Font("Microsoft JhengHei UI", 10f), ForeColor = TextMuted, Location = new Point(S(164), S(90)), AutoSize = true });
+            _numRateLimit = MakeNum(256, 87, 58, 1, 50, 5);
+            cardOverload.Controls.Add(new Label { Text = "人數上限:", Font = new Font("Microsoft JhengHei UI", 10f), ForeColor = TextMuted, Location = new Point(S(326), S(90)), AutoSize = true });
+            _numMaxClients = MakeNum(406, 87, 70, 5, 500, 100);
 
-            _btnApplyLimits = MakeButton("套用限流設定", 380, 67, 132, 27, BtnNeutral, TextPrimary);
-            _btnApplyLimits.Font = new Font("Microsoft JhengHei UI", 8.5f);
+            _btnApplyLimits = MakeButton("套用限流設定", 488, 84, 214, 36, BtnNeutral, TextPrimary);
+            _btnApplyLimits.Font = new Font("Microsoft JhengHei UI", 10f);
             _btnApplyLimits.Click += async (s, e) => await ApplyOverloadLimitsAsync();
 
             cardOverload.Controls.AddRange(new Control[] { _numMaxQueue, _numRateLimit, _numMaxClients, _btnApplyLimits });
             Controls.Add(cardOverload);
 
             // Google Drive Cloud Storage Card
-            var cardGdrive = MakeCard(pad, 292, w, 72);
-            cardGdrive.Controls.Add(MakeSectionLabel("Google Drive 雲端快取（自動上傳並刪除本地檔・0 本地容量）", 12, 9));
+            var cardGdrive = MakeCard(pad, 364, w, 92);
+            cardGdrive.Controls.Add(MakeSectionLabel("Google Drive 雲端快取（自動上傳並刪除本地檔・0 本地容量）", 14, 10));
 
             _lblGdriveStatus = new Label
             {
                 Text = "Google Drive：檢查中...",
                 ForeColor = TextMuted,
-                Font = new Font("Microsoft JhengHei UI", 8.5f),
-                Location = new Point(12, 32),
-                Size = new Size(192, 26),
+                Font = new Font("Microsoft JhengHei UI", 10f),
+                Location = new Point(S(14), S(40)),
+                Size = new Size(S(274), S(36)),
                 TextAlign = ContentAlignment.MiddleLeft
             };
             cardGdrive.Controls.Add(_lblGdriveStatus);
 
-            _btnConnectGdrive = MakeButton("連接 Google Drive", 206, 31, 120, 28, AccentWhite, Color.FromArgb(15, 15, 15));
-            _btnConnectGdrive.Font = new Font("Microsoft JhengHei UI", 8.2f, FontStyle.Bold);
+            _btnConnectGdrive = MakeButton("連接 Google Drive", 294, 40, 152, 36, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnConnectGdrive.Font = new Font("Microsoft JhengHei UI", 9.8f, FontStyle.Bold);
             _btnConnectGdrive.Click += async (s, e) => await ConnectGoogleDriveAsync();
 
-            _btnMigrateGdrive = MakeButton("遷移本地上雲端", 332, 31, 100, 28, BtnNeutral, TextPrimary);
-            _btnMigrateGdrive.Font = new Font("Microsoft JhengHei UI", 8.2f);
+            _btnMigrateGdrive = MakeButton("遷移本地上雲端", 454, 40, 138, 36, BtnNeutral, TextPrimary);
+            _btnMigrateGdrive.Font = new Font("Microsoft JhengHei UI", 9.8f);
             _btnMigrateGdrive.Click += async (s, e) => await MigrateToGdriveAsync();
 
-            _btnToggleStorage = MakeButton("本地模式", 438, 31, 74, 28, BtnNeutral, TextPrimary);
-            _btnToggleStorage.Font = new Font("Microsoft JhengHei UI", 8.2f);
+            _btnToggleStorage = MakeButton("本地模式", 600, 40, 102, 36, BtnNeutral, TextPrimary);
+            _btnToggleStorage.Font = new Font("Microsoft JhengHei UI", 9.8f);
             _btnToggleStorage.Click += async (s, e) => await ToggleStorageModeAsync();
 
             cardGdrive.Controls.AddRange(new Control[] { _btnConnectGdrive, _btnMigrateGdrive, _btnToggleStorage });
             Controls.Add(cardGdrive);
 
             // Cached Songs List Card (with clickable YouTube links!)
-            var cardSongs = MakeCard(pad, 374, w, 250);
-            cardSongs.Controls.Add(MakeSectionLabel("已快取歌曲清單（雙擊即開 YouTube 連結）", 12, 9));
+            var cardSongs = MakeCard(pad, 468, w, 278);
+            cardSongs.Controls.Add(MakeSectionLabel("已快取歌曲清單（雙擊即開 YouTube 連結）", 14, 10));
 
             _lvSongs = new ListView
             {
-                Location = new Point(12, 30),
-                Size = new Size(w - 24, 174),
+                Location = new Point(S(14), S(38)),
+                Size = new Size(S(w - 28), S(182)),
                 View = View.Details,
                 FullRowSelect = true,
                 MultiSelect = false,
@@ -440,47 +459,48 @@ namespace YtKaraokeTray
                 BorderStyle = BorderStyle.FixedSingle,
                 BackColor = Color.FromArgb(18, 18, 18),
                 ForeColor = TextPrimary,
-                Font = new Font("Microsoft JhengHei UI", 8.5f)
+                Font = new Font("Microsoft JhengHei UI", 10f),
+                SmallImageList = new ImageList { ImageSize = new Size(1, S(26)) }
             };
-            _lvSongs.Columns.Add("歌名", 215);
-            _lvSongs.Columns.Add("模式", 62);
-            _lvSongs.Columns.Add("位置", 58);
-            _lvSongs.Columns.Add("容量", 60);
-            _lvSongs.Columns.Add("YouTube 連結", 100);
+            _lvSongs.Columns.Add("歌名", S(290));
+            _lvSongs.Columns.Add("模式", S(84));
+            _lvSongs.Columns.Add("位置", S(76));
+            _lvSongs.Columns.Add("容量", S(84));
+            _lvSongs.Columns.Add("YouTube 連結", S(130));
             _lvSongs.DoubleClick += (s, e) => OpenSelectedSongLink();
             cardSongs.Controls.Add(_lvSongs);
 
-            _btnOpenSong = MakeButton("開啟 YouTube", 12, 212, 102, 27, AccentWhite, Color.FromArgb(15, 15, 15));
-            _btnOpenSong.Font = new Font("Microsoft JhengHei UI", 8.2f, FontStyle.Bold);
+            _btnOpenSong = MakeButton("開啟 YouTube", 14, 230, 134, 36, AccentWhite, Color.FromArgb(15, 15, 15));
+            _btnOpenSong.Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold);
             _btnOpenSong.Click += (s, e) => OpenSelectedSongLink();
 
-            _btnCopyLink = MakeButton("複製連結", 120, 212, 76, 27, BtnNeutral, TextPrimary);
-            _btnCopyLink.Font = new Font("Microsoft JhengHei UI", 8.2f);
+            _btnCopyLink = MakeButton("複製連結", 156, 230, 100, 36, BtnNeutral, TextPrimary);
+            _btnCopyLink.Font = new Font("Microsoft JhengHei UI", 10f);
             _btnCopyLink.Click += (s, e) => CopySelectedSongLink();
 
-            _btnDelSong = MakeButton("刪除此歌", 202, 212, 76, 27, Color.FromArgb(72, 28, 28), TextPrimary);
-            _btnDelSong.Font = new Font("Microsoft JhengHei UI", 8.2f);
+            _btnDelSong = MakeButton("刪除此歌", 264, 230, 100, 36, Color.FromArgb(72, 28, 28), TextPrimary);
+            _btnDelSong.Font = new Font("Microsoft JhengHei UI", 10f);
             _btnDelSong.Click += async (s, e) => await DeleteSelectedSongAsync();
 
-            _btnClearAll = MakeButton("清空全部", 284, 212, 76, 27, Color.FromArgb(72, 28, 28), TextPrimary);
-            _btnClearAll.Font = new Font("Microsoft JhengHei UI", 8.2f);
+            _btnClearAll = MakeButton("清空全部", 372, 230, 100, 36, Color.FromArgb(72, 28, 28), TextPrimary);
+            _btnClearAll.Font = new Font("Microsoft JhengHei UI", 10f);
             _btnClearAll.Click += async (s, e) => await ClearAllCacheAsync();
 
-            _btnToggleLogs = MakeButton("日誌 ▼", 436, 212, 76, 27, BtnNeutral, TextPrimary);
-            _btnToggleLogs.Font = new Font("Microsoft JhengHei UI", 8.2f);
+            _btnToggleLogs = MakeButton("日誌 ▼", 602, 230, 100, 36, BtnNeutral, TextPrimary);
+            _btnToggleLogs.Font = new Font("Microsoft JhengHei UI", 10f);
             _btnToggleLogs.Click += (s, e) => ToggleLogsDrawer();
 
             cardSongs.Controls.AddRange(new Control[] { _btnOpenSong, _btnCopyLink, _btnDelSong, _btnClearAll, _btnToggleLogs });
             Controls.Add(cardSongs);
 
             // Bottom Row
-            var btnHideTray = MakeButton("縮小至系統列 (System Tray)", pad, 634, 378, 32, BtnNeutral, TextPrimary);
-            btnHideTray.Font = new Font("Microsoft JhengHei UI", 8.5f);
+            var btnHideTray = MakeButton("縮小至系統列 (System Tray)", pad, 758, 516, 40, BtnNeutral, TextPrimary);
+            btnHideTray.Font = new Font("Microsoft JhengHei UI", 10f);
             btnHideTray.Click += (s, e) => MinimizeToTray();
             Controls.Add(btnHideTray);
 
-            var btnQuit = MakeButton("完全結束", pad + 386, 634, 138, 32, Color.FromArgb(72, 28, 28), TextPrimary);
-            btnQuit.Font = new Font("Microsoft JhengHei UI", 8.5f);
+            var btnQuit = MakeButton("完全結束", pad + 526, 758, 190, 40, Color.FromArgb(72, 28, 28), TextPrimary);
+            btnQuit.Font = new Font("Microsoft JhengHei UI", 10f);
             btnQuit.Click += (s, e) => QuitApplication();
             Controls.Add(btnQuit);
 
@@ -492,10 +512,10 @@ namespace YtKaraokeTray
                 ScrollBars = ScrollBars.Vertical,
                 BackColor = Color.FromArgb(10, 10, 10),
                 ForeColor = Color.FromArgb(200, 200, 200),
-                Font = new Font("Consolas", 8.2f),
+                Font = new Font("Consolas", 9.5f),
                 BorderStyle = BorderStyle.FixedSingle,
-                Location = new Point(pad, 676),
-                Size = new Size(w, 130),
+                Location = new Point(S(pad), S(812)),
+                Size = new Size(S(w), S(156)),
                 Visible = false
             };
             Controls.Add(_txtLogs);
@@ -505,11 +525,12 @@ namespace YtKaraokeTray
         {
             return new NumericUpDown
             {
-                Location = new Point(x, y),
-                Size = new Size(w, 23),
+                Location = new Point(S(x), S(y)),
+                Size = new Size(S(w), S(28)),
                 Minimum = min,
                 Maximum = max,
                 Value = val,
+                Font = new Font("Microsoft JhengHei UI", 10f),
                 BackColor = Color.FromArgb(35, 35, 35),
                 ForeColor = TextPrimary,
                 BorderStyle = BorderStyle.FixedSingle
@@ -518,7 +539,7 @@ namespace YtKaraokeTray
 
         private Panel MakeCard(int x, int y, int w, int h)
         {
-            var p = new Panel { Location = new Point(x, y), Size = new Size(w, h), BackColor = CardDark };
+            var p = new Panel { Location = new Point(S(x), S(y)), Size = new Size(S(w), S(h)), BackColor = CardDark };
             p.Paint += (s, e) =>
             {
                 using (var pen = new Pen(BorderSubtle, 1)) e.Graphics.DrawRectangle(pen, 0, 0, p.Width - 1, p.Height - 1);
@@ -532,8 +553,8 @@ namespace YtKaraokeTray
             {
                 Text = text,
                 ForeColor = TextMuted,
-                Font = new Font("Microsoft JhengHei UI", 8f, FontStyle.Bold),
-                Location = new Point(x, y),
+                Font = new Font("Microsoft JhengHei UI", 10f, FontStyle.Bold),
+                Location = new Point(S(x), S(y)),
                 AutoSize = true
             };
         }
@@ -543,11 +564,12 @@ namespace YtKaraokeTray
             var btn = new Button
             {
                 Text = text,
-                Location = new Point(x, y),
-                Size = new Size(w, h),
+                Location = new Point(S(x), S(y)),
+                Size = new Size(S(w), S(h)),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = bg,
                 ForeColor = fg,
+                Font = new Font("Microsoft JhengHei UI", 10f),
                 Cursor = Cursors.Hand
             };
             btn.FlatAppearance.BorderSize = 0;
@@ -639,7 +661,7 @@ namespace YtKaraokeTray
             _logsExpanded = !_logsExpanded;
             _txtLogs.Visible = _logsExpanded;
             _btnToggleLogs.Text = _logsExpanded ? "日誌 ▲" : "日誌 ▼";
-            ClientSize = new Size(ClientSize.Width, _logsExpanded ? 816 : 678);
+            ClientSize = new Size(ClientSize.Width, _logsExpanded ? S(984) : S(816));
         }
 
         private void AppendLog(string line)
@@ -931,7 +953,7 @@ namespace YtKaraokeTray
         {
             btn.BackColor = selected ? AccentWhite : BtnNeutral;
             btn.ForeColor = selected ? Color.FromArgb(15, 15, 15) : TextPrimary;
-            btn.Font = new Font("Microsoft JhengHei UI", 8.5f, selected ? FontStyle.Bold : FontStyle.Regular);
+            btn.Font = selected ? _fontModeActive : _fontModeNormal;
         }
 
         private async Task SetDeviceModeAsync(string mode)
