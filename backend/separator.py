@@ -160,23 +160,25 @@ class KaraokeSeparatorManager:
         return sum(1 for item in self.list_cache() if item.get("quality_tier") == "cpu_fast")
 
     def _bg_gpu_hq_upgrader_loop(self) -> None:
-        time.sleep(45)
+        time.sleep(30)
         while True:
+            upgraded = False
             try:
-                self._maybe_upgrade_one_cpu_song()
+                upgraded = bool(self._maybe_upgrade_one_cpu_song())
             except Exception as exc:
                 self.log.warning("HQUpgrade", f"Idle upgrader loop warning: {str(exc)[:240]}")
-            time.sleep(120)
+            # Process batch promptly (15s pause) when GPU is free; sleep 90s when idle/busy
+            time.sleep(15 if upgraded else 90)
 
-    def _maybe_upgrade_one_cpu_song(self) -> None:
+    def _maybe_upgrade_one_cpu_song(self) -> bool:
         if self.pause_new_jobs or self.device_mode == "cpu":
-            return
+            return False
         with self._lock:
             if self._queued_keys or self._lyrics_in_progress or self._migration_state.get("running"):
-                return
+                return False
         has_gpu, _, free_mb, _ = query_nvidia_gpu()
         if (not has_gpu) or (free_mb < self._hq_upgrade_min_vram_mb):
-            return
+            return False
 
         now = time.time()
         candidate = None
@@ -189,24 +191,26 @@ class KaraokeSeparatorManager:
             candidate = item
             break
         if not candidate:
-            return
+            return False
 
         if not self._worker_lock.acquire(blocking=False):
-            return
+            return False
 
         vid = candidate["video_id"]
         mode = candidate["mode"]
         key = self._job_key(vid, mode)
         staging_root = TEMP_DIR / f"hq_upgrade_{vid}_{int(now)}"
         staging_status = TEMP_DIR / f"hq_upgrade_{vid}_{int(now)}.json"
+        pre_voc_hint: Optional[Path] = None
+        pre_inst_hint: Optional[Path] = None
         try:
             # Re-verify idle state & VRAM right after acquiring lock
             with self._lock:
                 if self.pause_new_jobs or self._queued_keys or self._lyrics_in_progress:
-                    return
+                    return False
             has_gpu, _, free_mb, _ = query_nvidia_gpu()
             if (not has_gpu) or (free_mb < self._hq_upgrade_min_vram_mb):
-                return
+                return False
 
             staging_root.mkdir(parents=True, exist_ok=True)
             self.log.info(
@@ -244,23 +248,23 @@ class KaraokeSeparatorManager:
                 _, stderr_text = proc.communicate()
                 self._hq_upgrade_backoff[key] = time.time() + 21600
                 self.log.warning("HQUpgrade", f"Timed out upgrading {vid} ({mode}); will retry in 6h")
-                return
+                return False
 
             if proc.returncode == 2:
                 # VRAM dipped before model load — skip cleanly without backoff
-                return
+                return False
             if proc.returncode != 0:
                 self._hq_upgrade_backoff[key] = time.time() + 21600
                 self.log.warning(
                     "HQUpgrade",
                     f"Upgrade skipped for {vid} ({mode}, rc={proc.returncode}), retry in 6h: {(stderr_text or '')[-400:]}",
                 )
-                return
+                return False
 
             staged_song_dir = staging_root / vid / mode
             if not (staged_song_dir / "instrumental.mp3").exists() or not (staged_song_dir / "vocals.mp3").exists():
                 self._hq_upgrade_backoff[key] = time.time() + 21600
-                return
+                return False
 
             # Preserve original created_at so library ordering stays intact
             meta_file = staged_song_dir / "meta.json"
@@ -270,6 +274,19 @@ class KaraokeSeparatorManager:
             upgraded_meta["quality_tier"] = "gpu_hq"
             upgraded_meta["upgraded_at"] = time.time()
             meta_file.write_text(json.dumps(upgraded_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # Prepare hot stem copies before uploading/deleting staging so Qwen3 lyrics upgrade runs with 0s download!
+            try:
+                pre_voc_hint = TEMP_DIR / f"hq_voc_{vid}_{int(time.time())}.mp3"
+                shutil.copy2(staged_song_dir / "vocals.mp3", pre_voc_hint)
+                pre_inst_hint = TEMP_DIR / f"hq_inst_{vid}_{int(time.time())}.mp3"
+                shutil.copy2(staged_song_dir / "instrumental.mp3", pre_inst_hint)
+            except Exception:
+                for _p in (pre_voc_hint, pre_inst_hint):
+                    if _p and _p.exists():
+                        _p.unlink(missing_ok=True)
+                pre_voc_hint = None
+                pre_inst_hint = None
 
             if self.storage_mode == "gdrive" and self.gdrive.is_configured():
                 self.gdrive.upload_song(vid, mode, staged_song_dir, upgraded_meta)
@@ -288,15 +305,41 @@ class KaraokeSeparatorManager:
             self._hq_upgrade_backoff.pop(key, None)
             self.log.info(
                 "HQUpgrade",
-                f"Upgraded {vid} ({mode}) cpu_fast -> gpu_hq (MelBand Inst FVX) in {upgraded_meta.get('elapsed_sec', '?')}s",
+                f"Upgraded {vid} ({mode}) -> gpu_hq (MelBand Inst FVX) in {upgraded_meta.get('elapsed_sec', '?')}s",
             )
             self.log.trigger_sync_async()
+
+            # Also unify old AI-aligned lyrics to Qwen3-ForcedAligner-0.6B (skip human YouTube subs / exact studio LRC)
+            try:
+                cur_ly = self.get_lyrics(vid, mode)
+                cur_src = str(cur_ly.get("source") or "")
+                keep_sources = {
+                    "youtube_sub", "lrclib_exact",
+                    "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align", "qwen3_phrase_rescue_align",
+                }
+                if cur_src not in keep_sources:
+                    self.start_lyrics_generation(
+                        vid, mode, force_ai=True,
+                        local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                    )
+                    pre_voc_hint = None
+                    pre_inst_hint = None
+            except Exception:
+                pass
+            return True
         except Exception as exc:
             self._hq_upgrade_backoff[key] = time.time() + 21600
             self.log.warning("HQUpgrade", f"Failed upgrading {vid} ({mode}), retry in 6h: {str(exc)[:240]}")
+            return False
         finally:
             self._worker_lock.release()
             shutil.rmtree(staging_root, ignore_errors=True)
+            for _p in (pre_voc_hint, pre_inst_hint):
+                if _p and _p.exists():
+                    try:
+                        _p.unlink()
+                    except Exception:
+                        pass
             try:
                 staging_status.unlink(missing_ok=True)
             except Exception:
