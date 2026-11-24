@@ -87,7 +87,7 @@ class KaraokeSeparatorManager:
     """Zero-VRAM manager with multi-user anti-overload queue, rate limits, and Google Drive cloud cache."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._worker_lock = threading.Lock()
         self._lyrics_lock = threading.Lock()
         self._active_procs: Dict[str, subprocess.Popen] = {}
