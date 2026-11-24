@@ -948,6 +948,31 @@
       }
     }
 
+    // Annotate authentic HK KTV section boundaries & slot parity:
+    // - After any instrumental interlude (>= 4.5s gap), reset to TOP row (slot 0)
+    // - Mark the line right before an interlude as isSectionEnd so the other row stays blank during the break
+    const KTV_INTERLUDE_GAP_SEC = 4.5;
+    for (let i = 0; i < out.length; i++) {
+      if (i === 0) {
+        out[i].ktvSlot = 0;
+        out[i].isSectionStart = true;
+      } else {
+        const gap = out[i].start - out[i - 1].end;
+        if (gap >= KTV_INTERLUDE_GAP_SEC) {
+          out[i - 1].isSectionEnd = true;
+          out[i].isSectionStart = true;
+          out[i].ktvSlot = 0;
+        } else {
+          out[i - 1].isSectionEnd = false;
+          out[i].isSectionStart = false;
+          out[i].ktvSlot = 1 - out[i - 1].ktvSlot;
+        }
+      }
+      if (i === out.length - 1) {
+        out[i].isSectionEnd = true;
+      }
+    }
+
     return out;
   }
 
@@ -1057,38 +1082,52 @@
     let countdownSec = -1;
 
     if (activeIdx !== -1) {
-      // Classic HK KTV alternating slots: even lines on Top-Left, odd lines on Bottom-Right!
-      if (activeIdx % 2 === 0) {
+      // Classic HK KTV alternating slots: only pre-load next line when NOT entering an interlude
+      const cur = lines[activeIdx];
+      const hasImmediateNext = activeIdx + 1 < lines.length && !cur.isSectionEnd;
+      if (cur.ktvSlot === 0) {
         topIdx = activeIdx;
-        if (activeIdx + 1 < lines.length) bottomIdx = activeIdx + 1;
+        if (hasImmediateNext) bottomIdx = activeIdx + 1;
       } else {
         bottomIdx = activeIdx;
-        if (activeIdx + 1 < lines.length) topIdx = activeIdx + 1;
+        if (hasImmediateNext) topIdx = activeIdx + 1;
       }
     } else if (nextUpcomingIdx !== -1) {
-      const timeUntil = lines[nextUpcomingIdx].start - now;
-      if (timeUntil <= 4.5) {
-        // Preview the upcoming pair cleanly right before the verse enters
-        if (nextUpcomingIdx % 2 === 0) {
+      const nextLine = lines[nextUpcomingIdx];
+      const timeUntil = nextLine.start - now;
+      const isAfterBreak = nextUpcomingIdx === 0 || !!nextLine.isSectionStart;
+      // After an interlude, stay cleanly hidden until 3.5s before singing resumes (always on TOP row)
+      // Mid-verse pauses (<4.5s) keep the upcoming line ready seamlessly with no flicker
+      const previewLead = isAfterBreak ? 3.5 : 4.5;
+
+      if (timeUntil <= previewLead) {
+        const hasImmediateFollowing = nextUpcomingIdx + 1 < lines.length && !nextLine.isSectionEnd;
+        if (nextLine.ktvSlot === 0) {
           topIdx = nextUpcomingIdx;
-          if (nextUpcomingIdx + 1 < lines.length) bottomIdx = nextUpcomingIdx + 1;
+          if (hasImmediateFollowing) bottomIdx = nextUpcomingIdx + 1;
         } else {
           bottomIdx = nextUpcomingIdx;
-          if (nextUpcomingIdx + 1 < lines.length) topIdx = nextUpcomingIdx + 1;
+          if (hasImmediateFollowing) topIdx = nextUpcomingIdx + 1;
         }
-        // Classic 3-2-1 KTV countdown dots before intro or after a long >6s instrumental break
-        const prevEnd = nextUpcomingIdx > 0 ? lines[nextUpcomingIdx - 1].end : -99;
-        if (timeUntil <= 3.0 && lines[nextUpcomingIdx].start - prevEnd >= 5.0) {
+        // Classic 3-2-1 KTV countdown dots before intro (>=3s) or after an instrumental break
+        const allowCountdown =
+          (nextUpcomingIdx === 0 && nextLine.start >= 3.0) ||
+          (nextUpcomingIdx > 0 && !!nextLine.isSectionStart);
+        if (allowCountdown && timeUntil <= 3.0) {
           countdownSec = timeUntil;
         }
       } else {
         // Long instrumental interlude — hide overlay cleanly so MV shines
+        setSlotContent(ov.topSlot, "", 0);
+        setSlotContent(ov.bottomSlot, "", 0);
         ov.root.classList.remove("visible");
         ov.countdownEl.classList.remove("active");
         return;
       }
     } else {
       // Past final line
+      setSlotContent(ov.topSlot, "", 0);
+      setSlotContent(ov.bottomSlot, "", 0);
       ov.root.classList.remove("visible");
       ov.countdownEl.classList.remove("active");
       return;
