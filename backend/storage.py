@@ -149,7 +149,7 @@ class GoogleDriveStorage:
         res = subprocess.run(
             [exe, "copyto", str(local_file), remote_file, "--quiet"],
             capture_output=True,
-            timeout=30,
+            timeout=90,
             creationflags=CREATE_NO_WINDOW,
         )
         return res.returncode == 0
