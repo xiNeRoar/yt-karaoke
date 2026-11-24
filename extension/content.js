@@ -439,6 +439,7 @@
     gpuName: "",
     cachedModes: [],
     syncOffsetMs: 0,
+    syncExpanded: false,
     pollTimer: null,
     syncTimer: null,
     attachedVideo: null,
@@ -532,14 +533,18 @@
     ui.preset25.classList.toggle("active-preset", pct === 25);
     ui.preset100.classList.toggle("active-preset", pct === 100);
 
-    // Sync offset display
+    // Sync offset display & header chip visibility
+    ui.syncChip.classList.toggle("visible", state.active);
     ui.syncVal.textContent =
       state.syncOffsetMs === 0 ? "0ms" : state.syncOffsetMs > 0 ? `+${state.syncOffsetMs}ms` : `${state.syncOffsetMs}ms`;
+    ui.syncToggleBtn.textContent = state.syncOffsetMs === 0 ? "同步" : ui.syncVal.textContent;
+    ui.syncToggleBtn.classList.toggle("active-preset", state.syncExpanded || state.syncOffsetMs !== 0);
+    ui.syncStepper.style.display = state.syncExpanded ? "inline-flex" : "none";
 
     // Lyrics toggle & fine-tune controls
     ui.lyricsToggleBtn.classList.toggle("active-preset", state.lyricsEnabled);
     if (state.lyricsLoading) {
-      ui.lyricsToggleBtn.textContent = "對齊中...";
+      ui.lyricsToggleBtn.textContent = "對齊中";
     } else {
       ui.lyricsToggleBtn.textContent = state.lyricsEnabled ? "開" : "關";
     }
@@ -1222,122 +1227,150 @@
       onClick: () => setVocalPreset(100),
     });
 
-    // Pitch shift controls (±6 semitones)
-    const pitchVal = el("span", { className: "ktv-val", textContent: "原調" });
-    const pitchDown = el("button", {
-      className: "ktv-mini-btn",
+    // Pitch shift controls (±6 semitones — click middle value to reset to original key)
+    const pitchVal = el("button", {
+      className: "ktv-mini-btn val-reset-btn",
       type: "button",
-      textContent: "−1",
+      title: "點擊重設回原調",
+      textContent: "原調",
       onClick: () => {
-        engine.setSemitones(engine.semitones - 1);
+        engine.setSemitones(0);
         updateUI();
       },
     });
-    const pitchReset = el("button", {
+    const pitchDown = el("button", {
       className: "ktv-mini-btn",
       type: "button",
-      textContent: "重設",
+      title: "降 1 個半音",
+      textContent: "−",
       onClick: () => {
-        engine.setSemitones(0);
+        engine.setSemitones(engine.semitones - 1);
         updateUI();
       },
     });
     const pitchUp = el("button", {
       className: "ktv-mini-btn",
       type: "button",
-      textContent: "+1",
+      title: "升 1 個半音",
+      textContent: "+",
       onClick: () => {
         engine.setSemitones(engine.semitones + 1);
         updateUI();
       },
     });
 
-    // Fine sync offset controls
-    const syncVal = el("span", { className: "ktv-val", textContent: "0ms" });
+    // Collapsible header sync-offset chip (keeps main mixer strictly 3 aligned columns)
+    const syncVal = el("button", {
+      className: "ktv-mini-btn val-reset-btn",
+      type: "button",
+      title: "點擊重設回 0ms",
+      textContent: "0ms",
+      onClick: () => {
+        state.syncOffsetMs = 0;
+        syncAudioNow(true);
+        updateUI();
+      },
+    });
     const adjustSync = (delta) => {
       state.syncOffsetMs = Math.max(-300, Math.min(300, state.syncOffsetMs + delta));
       syncAudioNow(true);
       updateUI();
     };
-
-    // On-demand KTV Lyrics toggle + timing + force AI align
-    const lyricsToggleBtn = el("button", {
-      className: "ktv-mini-btn",
+    const syncToggleBtn = el("button", {
+      className: "ktv-mini-btn pill-standalone",
       type: "button",
-      title: "段片本身無字幕先需要開（自動優先讀字幕，無字幕則用 AI 對準純人聲逐字生成）",
+      title: "微調伴奏與影片畫面同步",
+      textContent: "同步",
+      onClick: () => {
+        state.syncExpanded = !state.syncExpanded;
+        updateUI();
+      },
+    });
+    const syncStepper = el("div", { className: "ktv-seg", style: "display:none" }, [
+      el("button", {
+        className: "ktv-mini-btn",
+        type: "button",
+        textContent: "-25",
+        onClick: () => adjustSync(-25),
+      }),
+      syncVal,
+      el("button", {
+        className: "ktv-mini-btn",
+        type: "button",
+        textContent: "+25",
+        onClick: () => adjustSync(25),
+      }),
+    ]);
+    const syncChip = el("div", { className: "ktv-sync-chip" }, [syncToggleBtn, syncStepper]);
+
+    // On-demand KTV Lyrics toggle + unified timing stepper + AI align
+    const lyricsToggleBtn = el("button", {
+      className: "ktv-mini-btn pill-standalone",
+      type: "button",
+      title: "段片無字幕先需要開（自動抽字幕或用 AI 對準純人聲逐字生成）",
       textContent: "關",
       onClick: () => toggleLyrics(),
     });
-    const lyricsOffsetVal = el("span", { className: "ktv-val", textContent: "0.0s" });
+    const lyricsOffsetVal = el("button", {
+      className: "ktv-mini-btn val-reset-btn",
+      type: "button",
+      title: "點擊重設回 0.0s",
+      textContent: "0.0s",
+      onClick: () => {
+        state.lyricsOffsetSec = 0;
+        renderLyricsFrame();
+        updateUI();
+      },
+    });
     const adjustLyricsOffset = (delta) => {
       state.lyricsOffsetSec = Math.round((state.lyricsOffsetSec + delta) * 10) / 10;
       renderLyricsFrame();
       updateUI();
     };
     const lyricsAiBtn = el("button", {
-      className: "ktv-mini-btn",
+      className: "ktv-mini-btn pill-standalone",
       type: "button",
-      title: "強制用本地 AI 針對呢條片嘅純人聲重新逐字對齊（適合 Live 演唱會版）",
-      textContent: "AI 重對齊",
+      title: "強制用本地 AI 針對呢條片嘅純人聲重新逐字對齊（適合 Live 版）",
+      textContent: "AI 對齊",
       onClick: () => requestLyrics(true),
     });
-    const lyricsExtraWrap = el(
-      "span",
-      { style: "display:none;align-items:center;gap:6px;" },
-      [
+    const lyricsExtraWrap = el("span", { style: "display:none;align-items:center;gap:6px;" }, [
+      el("div", { className: "ktv-seg" }, [
         el("button", {
           className: "ktv-mini-btn",
           type: "button",
-          textContent: "-0.2s",
+          textContent: "−",
           onClick: () => adjustLyricsOffset(-0.2),
         }),
         lyricsOffsetVal,
         el("button", {
           className: "ktv-mini-btn",
           type: "button",
-          textContent: "+0.2s",
+          textContent: "+",
           onClick: () => adjustLyricsOffset(0.2),
         }),
-        lyricsAiBtn,
-      ]
-    );
+      ]),
+      lyricsAiBtn,
+    ]);
 
-    const mixerRow = el("div", { className: "ktv-row ktv-mixer-row" }, [
+    const mixerRow = el("div", { className: "ktv-mixer-row" }, [
       el("div", { className: "ktv-control-card" }, [
-        el("span", { className: "ktv-label" }, [ICONS.sliders(), "導唱音量"]),
-        vocalSlider,
-        vocalVal,
-        preset0,
-        preset25,
-        preset100,
+        el("span", { className: "ktv-label" }, [ICONS.sliders(), "導唱"]),
+        el("div", { className: "ktv-card-body" }, [
+          vocalSlider,
+          vocalVal,
+          el("div", { className: "ktv-seg" }, [preset0, preset25, preset100]),
+        ]),
       ]),
       el("div", { className: "ktv-control-card" }, [
         el("span", { className: "ktv-label" }, [ICONS.music(), "升降 Key"]),
-        pitchDown,
-        pitchVal,
-        pitchUp,
-        pitchReset,
+        el("div", { className: "ktv-card-body" }, [
+          el("div", { className: "ktv-seg" }, [pitchDown, pitchVal, pitchUp]),
+        ]),
       ]),
       el("div", { className: "ktv-control-card" }, [
         el("span", { className: "ktv-label" }, [ICONS.captions(), "KTV 歌詞"]),
-        lyricsToggleBtn,
-        lyricsExtraWrap,
-      ]),
-      el("div", { className: "ktv-control-card", title: "若伴奏與畫面有微細時間差可在此微調" }, [
-        el("span", { className: "ktv-label" }, [ICONS.clock(), "同步微調"]),
-        el("button", {
-          className: "ktv-mini-btn",
-          type: "button",
-          textContent: "-25ms",
-          onClick: () => adjustSync(-25),
-        }),
-        syncVal,
-        el("button", {
-          className: "ktv-mini-btn",
-          type: "button",
-          textContent: "+25ms",
-          onClick: () => adjustSync(25),
-        }),
+        el("div", { className: "ktv-card-body" }, [lyricsToggleBtn, lyricsExtraWrap]),
       ]),
     ]);
 
@@ -1350,6 +1383,7 @@
         cacheBadge,
       ]),
       el("div", { className: "ktv-controls-group" }, [
+        syncChip,
         el("div", { className: "ktv-mode-switch" }, [modePureBtn, modeKaraokeBtn]),
         toggleBtn,
       ]),
@@ -1376,6 +1410,9 @@
       preset100,
       pitchVal,
       syncVal,
+      syncChip,
+      syncToggleBtn,
+      syncStepper,
       lyricsToggleBtn,
       lyricsExtraWrap,
       lyricsOffsetVal,

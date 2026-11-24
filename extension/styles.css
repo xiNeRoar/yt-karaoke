@@ -223,23 +223,37 @@ ytd-app[dark] #yt-ai-ktv-panel {
   color: var(--ktv-accent-red);
 }
 
-/* Studio Mixer Strip */
+/* Studio Mixer Strip — Balanced 3-Column Grid (Zero Orphan Rows) */
 .ktv-mixer-row {
   display: none;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ktv-border);
+  grid-template-columns: minmax(280px, 1.4fr) minmax(175px, 0.85fr) minmax(240px, 1.15fr);
+  gap: 8px;
+  align-items: stretch;
 }
 
 .ktv-mixer-row.visible {
-  display: flex;
+  display: grid;
+}
+
+@media (max-width: 980px) {
+  .ktv-mixer-row {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 .ktv-control-card {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 10px;
   background: var(--ktv-card-bg);
   border: 1px solid var(--ktv-border);
   border-radius: 10px;
-  padding: 6px 10px;
+  padding: 7px 11px;
+  min-width: 0;
 }
 
 .ktv-label {
@@ -250,12 +264,24 @@ ytd-app[dark] #yt-ai-ktv-panel {
   font-weight: 500;
   color: var(--ktv-text-muted);
   white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.ktv-card-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .ktv-slider {
   -webkit-appearance: none;
   appearance: none;
-  width: 108px;
+  flex: 1;
+  min-width: 64px;
+  max-width: 120px;
   height: 3px;
   border-radius: 999px;
   background: var(--ktv-border-active);
@@ -279,7 +305,7 @@ ytd-app[dark] #yt-ai-ktv-panel {
 }
 
 .ktv-val {
-  min-width: 36px;
+  min-width: 34px;
   text-align: center;
   font-weight: 600;
   font-size: 12px;
@@ -287,8 +313,24 @@ ytd-app[dark] #yt-ai-ktv-panel {
   font-variant-numeric: tabular-nums;
 }
 
-.ktv-mini-btn {
+/* Unified Segmented Group (Presets & Steppers) */
+.ktv-seg {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.18);
   border: 1px solid var(--ktv-border);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.ktv-mini-btn {
+  border: none;
   background: transparent;
   color: var(--ktv-text-muted);
   border-radius: 6px;
@@ -296,7 +338,8 @@ ytd-app[dark] #yt-ai-ktv-panel {
   font-size: 11.5px;
   font-weight: 500;
   cursor: pointer;
-  transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  white-space: nowrap;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
 
 .ktv-mini-btn:hover {
@@ -307,8 +350,30 @@ ytd-app[dark] #yt-ai-ktv-panel {
 .ktv-mini-btn.active-preset {
   background: var(--ktv-pill-bg);
   color: var(--ktv-pill-text);
-  border-color: transparent;
   font-weight: 600;
+}
+
+.ktv-mini-btn.pill-standalone {
+  border: 1px solid var(--ktv-border);
+  border-radius: 8px;
+  padding: 4px 9px;
+}
+
+.ktv-mini-btn.val-reset-btn {
+  min-width: 44px;
+  color: var(--ktv-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.ktv-sync-chip {
+  display: none;
+  align-items: center;
+  gap: 4px;
+}
+
+.ktv-sync-chip.visible {
+  display: inline-flex;
 }
 
 /* Authentic HK KTV Staggered Dual-Line Sweeping Overlay (Modern High-DPI Typography) */
