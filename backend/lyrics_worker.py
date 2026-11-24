@@ -644,6 +644,24 @@ def search_official_lyrics_by_sung_phrases(asr_segs: list[dict]) -> list[str]:
     return rescued_all
 
 
+def _get_yt_js_runtimes() -> dict:
+    runtimes: dict = {}
+    for name, fallbacks in (
+        ("deno", [Path.home() / ".deno" / "bin" / "deno.exe"]),
+        ("node", [Path("C:/Program Files/nodejs/node.exe"), Path("C:/Program Files (x86)/nodejs/node.exe")]),
+        ("bun", [Path.home() / ".bun" / "bin" / "bun.exe"]),
+    ):
+        found = shutil.which(name)
+        if not found:
+            for fb in fallbacks:
+                if fb.exists():
+                    found = str(fb)
+                    break
+        if found:
+            runtimes[name] = {"path": found}
+    return {"js_runtimes": runtimes} if runtimes else {}
+
+
 def _get_yt_cookie_opts() -> dict:
     cookies_file = BASE_DIR / "cookies.txt"
     if cookies_file.exists() and cookies_file.stat().st_size > 0:
@@ -659,7 +677,7 @@ def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], 
 
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_get_yt_cookie_opts()}) as ydl:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, **_get_yt_cookie_opts(), **_get_yt_js_runtimes()}) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         print(f"[Lyrics] YouTube subtitle probe skipped ({video_id}): {str(exc)[:140]}", flush=True)

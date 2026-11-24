@@ -27,6 +27,25 @@ YT_COOKIES_FILE = BASE_DIR / "cookies.txt"
 YT_FIREFOX_PROFILE = BASE_DIR / ".yt_firefox_profile"
 
 
+def get_yt_js_runtimes() -> dict:
+    """Detect local JS runtime (node/deno/bun) so yt-dlp 2026+ solves YouTube player formats cleanly."""
+    runtimes: dict = {}
+    for name, fallbacks in (
+        ("deno", [Path.home() / ".deno" / "bin" / "deno.exe"]),
+        ("node", [Path("C:/Program Files/nodejs/node.exe"), Path("C:/Program Files (x86)/nodejs/node.exe")]),
+        ("bun", [Path.home() / ".bun" / "bin" / "bun.exe"]),
+    ):
+        found = shutil.which(name)
+        if not found:
+            for fb in fallbacks:
+                if fb.exists():
+                    found = str(fb)
+                    break
+        if found:
+            runtimes[name] = {"path": found}
+    return {"js_runtimes": runtimes} if runtimes else {}
+
+
 def get_yt_cookie_opts() -> dict:
     """Use optional owner-configured local cookies.txt or dedicated Firefox profile (never stored in git)."""
     if YT_COOKIES_FILE.exists() and YT_COOKIES_FILE.stat().st_size > 0:
@@ -158,6 +177,14 @@ def main() -> int:
                 return f"影片長度超過 15 分鐘（{int(dur // 60)} 分鐘），為保護磁碟同資源已暫停處理。"
             return None
 
+        cookie_opts = get_yt_cookie_opts()
+        js_opts = get_yt_js_runtimes()
+        print(
+            f"[Worker] yt-dlp init vid={args.video_id} auth={'firefox' if 'cookiesfrombrowser' in cookie_opts else ('cookies.txt' if 'cookiefile' in cookie_opts else 'none')} js={list(js_opts.get('js_runtimes', {}).keys())}",
+            file=sys.stderr,
+            flush=True,
+        )
+
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": out_template,
@@ -174,7 +201,8 @@ def main() -> int:
                     "preferredquality": "0",
                 }
             ],
-            **get_yt_cookie_opts(),
+            **cookie_opts,
+            **js_opts,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
