@@ -1554,9 +1554,9 @@ def _live_section_anchored_align(
                 cur_idx, nxt_idx = cur["_idx"], nxt["_idx"]
                 missing_n = (nxt_idx - cur_idx - 1) if (0 <= cur_idx < nxt_idx <= cur_idx + 31) else 0
                 gap_s, gap_e = cur["end"], nxt["start"]
-                if 1 <= missing_n <= 30 and (gap_e - gap_s) >= max(1.2, 0.9 * missing_n):
+                if 1 <= missing_n <= 30 and (gap_e - gap_s) >= max(1.6, 1.2 * missing_n):
                     act_sec, v_first, v_last = _active_vocal_span(gap_s, gap_e)
-                    if act_sec >= max(1.0, 0.75 * missing_n):
+                    if act_sec >= max(1.2, 1.0 * missing_n):
                         span_s = max(gap_s, v_first)
                         span_e = min(gap_e, max(span_s + 0.5, v_last))
                         step_t = (span_e - span_s) / missing_n
@@ -1625,25 +1625,44 @@ def _live_section_anchored_align(
         if len(audio_16k) > 0 and b_end > b_start + 0.5:
             chunk = audio_16k[int(b_start * 16000) : int(b_end * 16000)]
             blk_text = "\n".join(x["text"] for x in blk)
+            # Compress long instrumental/guitar-solo breaks inside the block BEFORE model.align()
+            # so lyrics NEVER stretch across solos or stick to the wrong side of an instrumental interlude!
+            blk_time_map: list[tuple[float, float, float]] = []
+            align_chunk = chunk
+            if (b_end - b_start) >= 20.0 and len(db_profile) > 0:
+                di0 = max(0, int(b_start / step_sec))
+                di1 = min(len(db_profile), int(b_end / step_sec))
+                if di1 > di0 + 20:
+                    align_chunk, blk_time_map = _compress_long_silences(
+                        chunk, db_profile[di0:di1], step_sec, min_silence_sec=5.0, keep_pad_sec=1.2
+                    )
             try:
-                al = model.align(chunk, blk_text, language=lang, original_split=True, verbose=False)
+                al = model.align(align_chunk, blk_text, language=lang, original_split=True, verbose=False)
                 al_segs = list(al.segments or [])
             except Exception:
                 al_segs = []
         else:
             al_segs = []
+            blk_time_map = []
 
         if len(al_segs) == len(blk):
             for seg, ref in zip(al_segs, blk):
-                raw_s = b_start + float(seg.start)
-                raw_e = b_start + float(seg.end)
+                seg_s = _map_comp_to_real(float(seg.start), blk_time_map) if blk_time_map else float(seg.start)
+                seg_e = _map_comp_to_real(float(seg.end), blk_time_map) if blk_time_map else float(seg.end)
+                raw_s = b_start + seg_s
+                raw_e = b_start + seg_e
+                raw_dur = raw_e - raw_s
+                n_chars = max(1, len(_norm_lyrics_cmp(ref["text"])))
+                is_real_anchor = float(ref.get("sim") or 0.0) > 0.0
+                # Acoustic verification for recovered non-anchor lines (sim == 0):
+                # If the forced aligner crushes a recovered line to near-zero duration, the singer skipped/abridged it live -> drop it!
+                if (not is_real_anchor) and (raw_dur <= 0.12 or (n_chars >= 4 and (raw_dur / n_chars) < 0.035)):
+                    continue
                 s_abs = round(max(first_onset, raw_s), 2)
                 e_abs = round(max(s_abs + 0.35, raw_e), 2)
-                is_real_anchor = float(ref.get("sim") or 0.0) > 0.0
                 # ONLY compare drift against ref["start"] for genuine ASR anchors (sim > 0)!
-                # Interpolated/recovered lines (sim == 0) have rough placeholder spans — NEVER overwrite real acoustic alignment with linear placeholders!
                 anchor_drifted = is_real_anchor and abs(s_abs - ref["start"]) > 6.0
-                totally_collapsed = (raw_e - raw_s) <= 0.05
+                totally_collapsed = raw_dur <= 0.05
                 if anchor_drifted or (is_real_anchor and totally_collapsed):
                     s_abs = round(max(first_onset, ref["start"]), 2)
                     e_abs = round(max(s_abs + 0.6, ref["end"]), 2)
@@ -1654,8 +1673,10 @@ def _live_section_anchored_align(
                         wt = (w.word or "").strip()
                         if not wt:
                             continue
-                        ws = round(max(s_abs, b_start + float(w.start)), 3)
-                        we = round(max(ws, b_start + float(w.end)), 3)
+                        ws_l = _map_comp_to_real(float(w.start), blk_time_map) if blk_time_map else float(w.start)
+                        we_l = _map_comp_to_real(float(w.end), blk_time_map) if blk_time_map else float(w.end)
+                        ws = round(max(s_abs, b_start + ws_l), 3)
+                        we = round(max(ws, b_start + we_l), 3)
                         words_out.append({"start": ws, "end": we, "word": wt})
                 final_lines.append({"start": s_abs, "end": e_abs, "text": ref["text"], "words": words_out})
         else:
