@@ -245,11 +245,11 @@ def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str)
     Returns 0.0 if track_name does NOT actually appear in yt_title_clean (prevents artist-only wrong-song hits
     like returning '張敬軒 - 斷點' when searching '張敬軒 - 春秋'!).
     """
-    t_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(track_name or "")).lower()
-    # Strip parenthetical suffixes from track_name like "春秋 (Live)" -> "春秋"
+    # Unify HK/TW/CN variant glyphs (著/着, 裡/裏, 說/説, 臺/台) via OpenCC Simplified for comparison ONLY
+    t_norm = re.sub(r"[\s\W_]+", "", to_simplified(track_name or "")).lower()
     t_base = re.sub(r"[\(\[（【].*?[\)\]）】]", "", track_name or "")
-    t_base_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(t_base)).lower()
-    y_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(yt_title_clean or "")).lower()
+    t_base_norm = re.sub(r"[\s\W_]+", "", to_simplified(t_base)).lower()
+    y_norm = re.sub(r"[\s\W_]+", "", to_simplified(yt_title_clean or "")).lower()
 
     if not t_base_norm or not y_norm:
         return 0.0
@@ -278,7 +278,7 @@ def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str)
         return 0.0
 
     # Bonus if artist name also appears in the YouTube title (disambiguates same-title songs)
-    a_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(artist_name or "")).lower()
+    a_norm = re.sub(r"[\s\W_]+", "", to_simplified(artist_name or "")).lower()
     if a_norm and len(a_norm) >= 2 and a_norm in y_norm:
         score += 0.4
     elif t_norm == t_base_norm:
