@@ -40,13 +40,14 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_FILE = DATA_DIR / "gdrive_index.json"
 
-# Optional Portainer 1-paste convenience: decode base64 rclone.conf from env var if file not mounted
+# Optional Portainer 1-paste convenience: decode base64 rclone.conf from env var
 _rclone_b64 = os.environ.get("RCLONE_CONF_B64", "").strip()
 _rclone_cfg_path = Path.home() / ".config" / "rclone" / "rclone.conf"
-if _rclone_b64 and not _rclone_cfg_path.exists():
+if _rclone_b64:
     try:
         _rclone_cfg_path.parent.mkdir(parents=True, exist_ok=True)
         _rclone_cfg_path.write_bytes(base64.b64decode(_rclone_b64))
+        os.chmod(_rclone_cfg_path, 0o600)
     except Exception as _exc:
         print(f"[Gateway] Failed to decode RCLONE_CONF_B64: {_exc}", flush=True)
 
@@ -137,13 +138,19 @@ class GatewayState:
 
     def sync_gdrive_index(self) -> int:
         try:
-            out = subprocess.check_output(
+            res = subprocess.run(
                 ["rclone", "lsjson", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}", "-R", "--files-only"],
+                capture_output=True,
                 text=True,
-                timeout=35,
+                timeout=45,
             )
-            files = json.loads(out)
-        except Exception:
+            if res.returncode != 0:
+                print(f"[Gateway] rclone lsjson failed (rc={res.returncode}): {res.stderr.strip()[:300]}", flush=True)
+                with self._lock:
+                    return len(self._index)
+            files = json.loads(res.stdout)
+        except Exception as exc:
+            print(f"[Gateway] rclone sync exception: {exc}", flush=True)
             with self._lock:
                 return len(self._index)
 
@@ -162,7 +169,9 @@ class GatewayState:
         with self._lock:
             snap = dict(self._index)
 
+        # Publish song IDs immediately so streaming works within ~2s of boot, then enrich titles
         new_idx: dict[str, dict] = {}
+        need_meta: list[tuple[str, str, str]] = []
         for (vid, mode), info in grouped.items():
             if "instrumental.mp3" in info["files"] and "vocals.mp3" in info["files"]:
                 key = f"{vid}__{mode}"
@@ -171,20 +180,6 @@ class GatewayState:
                 duration = ex.get("duration") or 0
                 created_at = ex.get("created_at") or time.time()
                 has_lyrics = "lyrics.json" in info["files"]
-                if title == vid and "meta.json" in info["files"]:
-                    try:
-                        mraw = subprocess.check_output(
-                            ["rclone", "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{vid}/{mode}/meta.json"],
-                            text=True,
-                            encoding="utf-8",
-                            timeout=12,
-                        )
-                        m = json.loads(mraw)
-                        title = m.get("title", vid)
-                        duration = m.get("duration", 0)
-                        created_at = m.get("created_at", created_at)
-                    except Exception:
-                        pass
                 new_idx[key] = {
                     "video_id": vid,
                     "mode": mode,
@@ -196,12 +191,36 @@ class GatewayState:
                     "storage": "gdrive",
                     "url": f"https://www.youtube.com/watch?v={vid}",
                 }
+                if title == vid and "meta.json" in info["files"]:
+                    need_meta.append((key, vid, mode))
 
         with self._lock:
             self._index = new_idx
             self._lyrics_missing.clear()
             self._save_index()
             self.last_index_sync = time.time()
+
+        print(f"[Gateway] Synced {len(new_idx)} songs from Google Drive", flush=True)
+
+        for key, vid, mode in need_meta:
+            try:
+                mraw = subprocess.check_output(
+                    ["rclone", "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{vid}/{mode}/meta.json"],
+                    text=True,
+                    encoding="utf-8",
+                    timeout=15,
+                )
+                m = json.loads(mraw)
+                with self._lock:
+                    if key in self._index:
+                        self._index[key]["title"] = m.get("title", vid)
+                        self._index[key]["duration"] = m.get("duration", 0)
+                        self._index[key]["created_at"] = m.get("created_at", self._index[key]["created_at"])
+                        self._save_index()
+            except Exception:
+                pass
+
+        with self._lock:
             return len(self._index)
 
     def has_song(self, video_id: str, mode: str = "pure") -> bool:
