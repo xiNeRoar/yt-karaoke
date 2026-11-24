@@ -113,13 +113,21 @@
       const timer = setTimeout(() => ctrl.abort(), 45000);
       try {
         const res = await fetch(`${API_BASE}${path}`, { headers, signal: ctrl.signal });
+        if (res.status === 401) {
+          chrome.runtime.sendMessage({ type: "AUTH_CLEAR" });
+          state.authRequired = true;
+          state.authenticated = false;
+          updateUI();
+          throw new Error("邀請碼已失效，請重新輸入邀請碼");
+        }
         if (res.ok) {
           const buf = await res.arrayBuffer();
           if (buf && buf.byteLength > 8192) {
             return buf;
           }
         }
-      } catch (_err) {
+      } catch (err) {
+        if (err && String(err.message || "").includes("邀請碼")) throw err;
         // Retry once, then fall through to chunked Port stream via Service Worker
       } finally {
         clearTimeout(timer);
@@ -171,6 +179,13 @@
           settled = true;
           clearTimeout(timeout);
           try { port.disconnect(); } catch (_e) {}
+          if (msg.status === 401) {
+            state.authRequired = true;
+            state.authenticated = false;
+            updateUI();
+            reject(new Error("邀請碼已失效，請重新輸入邀請碼"));
+            return;
+          }
           reject(new Error(msg.error || "無法載入分離後嘅音訊"));
         }
       });
@@ -1849,12 +1864,22 @@
   }
 
   function sendHeartbeat(leaving = false) {
+    if (state.authRequired && !state.authenticated) return;
     if (!state.backendOnline && !leaving) return;
     apiRequest("/api/heartbeat", "POST", {
       client_id: CLIENT_ID,
       video_id: state.videoId,
       singing: state.active,
       leaving,
+    });
+  }
+
+  // Instant cross-tab sync: if user enters/clears invite code in Popup, unlock/lock open YouTube tabs immediately!
+  if (chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes.ktv_access_token && state.videoId) {
+        refreshBackendAndVideoStatus();
+      }
     });
   }
 

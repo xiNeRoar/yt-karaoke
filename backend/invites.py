@@ -64,6 +64,35 @@ class InviteManager:
         self._bindings: dict[str, dict] = {}
         self._last_bindings_pull: float = 0.0
         self._load_local()
+        if not self._codes and self.gdrive.is_configured():
+            threading.Thread(target=self.pull_keys_from_gdrive, daemon=True, name="invites-boot-pull").start()
+
+    def pull_keys_from_gdrive(self) -> bool:
+        """Disaster-recovery pull: restore _access_keys.json from Google Drive if local file is missing."""
+        exe = self.gdrive.refresh_binary()
+        if not exe or not self.gdrive.is_configured():
+            return False
+        try:
+            res = subprocess.run(
+                [exe, "cat", ACCESS_KEYS_REMOTE, "--drive-pacer-min-sleep", "200ms"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=20,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                doc = json.loads(res.stdout)
+                codes = doc.get("codes") if isinstance(doc, dict) else None
+                if isinstance(codes, dict) and codes:
+                    with self._lock:
+                        if not self._codes:
+                            self._codes = codes
+                            self._save_keys_local()
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _load_local(self) -> None:
         if self.keys_file.exists():

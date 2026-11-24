@@ -212,7 +212,10 @@ chrome.runtime.onConnect.addListener((port) => {
       const res = await fetch(`${API_BASE}${msg.path}`, { headers, signal: ctrl.signal });
       if (disconnected) return;
       if (!res.ok) {
-        port.postMessage({ type: "error", error: `HTTP ${res.status}` });
+        if (res.status === 401) {
+          await saveAuthToken("");
+        }
+        port.postMessage({ type: "error", status: res.status, error: `HTTP ${res.status}` });
         return;
       }
       const buf = await res.arrayBuffer();
