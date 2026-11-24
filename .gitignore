@@ -24,4 +24,6 @@ backend/tmp/
 # Built binaries & release zips
 tray-app/*.exe
 tray-app/*.ico
+extension-prod/
+store-assets/
 *.zip

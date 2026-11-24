@@ -1,4 +1,4 @@
-const API_BASE = "https://karaoke.xinehub.com";
+const API_BASE = "http://127.0.0.1:18765";
 let lastReloadNonce = null;
 
 // Right after auto-reload finishes, gently refresh open YouTube watch tabs so new content.js takes effect

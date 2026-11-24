@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const API_BASE = "https://karaoke.xinehub.com";
+  const API_BASE = "http://127.0.0.1:18765";
   const CLIENT_ID = `yt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 
   // Trusted-Types-safe inline SVG icon factory (minimalist Lucide stroke icons)

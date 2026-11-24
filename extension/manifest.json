@@ -7,7 +7,8 @@
     "storage"
   ],
   "host_permissions": [
-    "https://karaoke.xinehub.com/*",
+    "http://127.0.0.1:18765/*",
+    "http://localhost:18765/*",
     "https://www.youtube.com/*"
   ],
   "background": {
