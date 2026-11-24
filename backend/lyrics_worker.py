@@ -1760,12 +1760,20 @@ def main() -> int:
             rescued_lines = search_official_lyrics_by_sung_phrases(ai_lines) if len(ai_lines) >= 4 else []
             if rescued_lines:
                 update("running", 75, "對齊歌詞中...")
-                ai_lines, used_dev, _ = align_official_lyrics_with_stable_ts(
+                q_lines, q_dev, _ = align_official_lyrics_with_qwen3(
                     vocals_path, audio_16k, db_profile, step_sec, rescued_lines,
-                    args.device_mode, first_onset, prefer_live=True,
-                    inst_path=inst_path, shazam_already_tried=True,
+                    args.device_mode, first_onset,
                 )
-                src = "phrase_rescue_align"
+                if q_lines and len(q_lines) >= 4:
+                    ai_lines, used_dev = q_lines, q_dev
+                    src = "qwen3_phrase_rescue_align"
+                else:
+                    ai_lines, used_dev, _ = align_official_lyrics_with_stable_ts(
+                        vocals_path, audio_16k, db_profile, step_sec, rescued_lines,
+                        args.device_mode, first_onset, prefer_live=True,
+                        inst_path=inst_path, shazam_already_tried=True,
+                    )
+                    src = "phrase_rescue_align"
             else:
                 src = "whisper_ai"
             label = "同步歌詞"
