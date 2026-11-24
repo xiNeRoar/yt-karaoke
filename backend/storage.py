@@ -136,6 +136,10 @@ class GoogleDriveStorage:
             raise RuntimeError(f"Google Drive 上傳失敗：{res.stderr.strip()}")
 
         size_bytes = sum(f.stat().st_size for f in local_dir.glob("*") if f.is_file())
+        model_name = meta.get("model", "")
+        quality_tier = meta.get("quality_tier") or (
+            "cpu_fast" if model_name == "UVR-MDX-NET-Inst_HQ_3.onnx" else "gpu_hq"
+        )
         entry = {
             "video_id": video_id,
             "mode": mode,
@@ -143,6 +147,8 @@ class GoogleDriveStorage:
             "duration": meta.get("duration", 0),
             "size_mb": round(size_bytes / (1024 * 1024), 2),
             "created_at": meta.get("created_at", time.time()),
+            "quality_tier": quality_tier,
+            "model": model_name,
             "storage": "gdrive",
             "url": f"https://www.youtube.com/watch?v={video_id}",
         }
@@ -349,6 +355,8 @@ class GoogleDriveStorage:
                 title = existing.get("title") or vid
                 duration = existing.get("duration") or 0
                 created_at = existing.get("created_at") or time.time()
+                quality_tier = existing.get("quality_tier") or "gpu_hq"
+                model_name = existing.get("model") or ""
                 if title == vid and "meta.json" in info["files"]:
                     try:
                         meta_raw = subprocess.check_output(
@@ -362,6 +370,10 @@ class GoogleDriveStorage:
                         title = m.get("title", vid)
                         duration = m.get("duration", 0)
                         created_at = m.get("created_at", created_at)
+                        model_name = m.get("model", model_name)
+                        quality_tier = m.get("quality_tier") or (
+                            "cpu_fast" if model_name == "UVR-MDX-NET-Inst_HQ_3.onnx" else "gpu_hq"
+                        )
                     except Exception:
                         pass
                 new_index[key] = {
@@ -371,6 +383,8 @@ class GoogleDriveStorage:
                     "duration": duration,
                     "size_mb": round(info["bytes"] / (1024 * 1024), 2),
                     "created_at": created_at,
+                    "quality_tier": quality_tier,
+                    "model": model_name,
                     "storage": "gdrive",
                     "url": f"https://www.youtube.com/watch?v={vid}",
                 }

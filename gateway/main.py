@@ -169,15 +169,28 @@ class GatewayState:
                                 "duration": entry.get("duration") or 0,
                                 "size_mb": entry.get("size_mb") or 0,
                                 "created_at": entry.get("created_at") or time.time(),
+                                "quality_tier": entry.get("quality_tier") or "gpu_hq",
                                 "storage": "gdrive",
                                 "url": f"https://www.youtube.com/watch?v={vid}",
                             }
                         if cleaned:
+                            evict_vids: list[str] = []
                             with self._lock:
+                                for k, new_ent in cleaned.items():
+                                    old_ent = self._index.get(k)
+                                    if old_ent and old_ent.get("quality_tier") == "cpu_fast" and new_ent.get("quality_tier") == "gpu_hq":
+                                        evict_vids.append(new_ent["video_id"])
                                 self._index = cleaned
                                 self._lyrics_missing.clear()
                                 self._save_index()
                                 self.last_index_sync = time.time()
+                            for evid in evict_vids:
+                                for stem in ("instrumental", "vocals"):
+                                    try:
+                                        (AUDIO_CACHE_DIR / f"{evid}_pure_{stem}.mp3").unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                                print(f"[Gateway] Evicted stale cpu_fast NAS cache for upgraded HQ song {evid}", flush=True)
                             print(f"[Gateway] Synced {len(cleaned)} songs via _catalog.json (fast path)", flush=True)
                             return len(cleaned)
             except Exception as exc:

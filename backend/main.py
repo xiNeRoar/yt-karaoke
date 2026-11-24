@@ -206,6 +206,7 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
         "active_clients": csnap["active_clients"],
         "active_singing": csnap["active_singing"],
         "queue_count": manager.get_queue_count(),
+        "pending_hq_upgrades": manager.count_pending_hq_upgrades(),
         "pause_new_jobs": manager.pause_new_jobs,
         "max_queue_size": manager.max_queue_size,
         "rate_limit_per_10min": manager.rate_limit_per_10min,

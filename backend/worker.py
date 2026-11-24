@@ -120,6 +120,7 @@ def main() -> int:
     parser.add_argument("--device-mode", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--cache-dir", default=str(CACHE_DIR))
     parser.add_argument("--status-file", required=True)
+    parser.add_argument("--force-hq", action="store_true", help="Require BS-RoFormer HQ on GPU; exit 2 if VRAM < 3000MB")
     args = parser.parse_args()
 
     device_mode = args.device_mode
@@ -328,7 +329,17 @@ def main() -> int:
             return 0.0
 
         initial_free_vram = query_nvidia_free_vram_mb() if cuda_ok else 0.0
-        use_cpu_fast_model = (not cuda_ok) or (device_mode == "cpu") or (device_mode == "auto" and initial_free_vram < 1800)
+        if args.force_hq:
+            if (not cuda_ok) or (initial_free_vram < 3000):
+                print(
+                    f"[Worker] Skipping HQ upgrade: insufficient free VRAM ({initial_free_vram:.0f}MB < 3000MB)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 2
+            use_cpu_fast_model = False
+        else:
+            use_cpu_fast_model = (not cuda_ok) or (device_mode == "cpu") or (device_mode == "auto" and initial_free_vram < 1800)
         model_filename = CPU_FAST_MODEL if use_cpu_fast_model else MODELS[args.mode]["filename"]
         print(
             f"[Worker] Selected model={model_filename} mode={device_mode} initial_free_vram={initial_free_vram:.0f}MB",
@@ -485,6 +496,7 @@ def main() -> int:
             "video_id": args.video_id,
             "mode": args.mode,
             "model": model_filename,
+            "quality_tier": "cpu_fast" if use_cpu_fast_model else "gpu_hq",
             "title": title,
             "duration": duration,
             "device_used": state["device_used"],

@@ -91,6 +91,8 @@ class KaraokeSeparatorManager:
         self._lyrics_mem_cache: Dict[str, dict] = {}
         self._lyrics_gdrive_missing: set[str] = set()
         self._lyrics_in_progress: set[str] = set()
+        self._hq_upgrade_backoff: Dict[str, float] = {}
+        self._hq_upgrade_min_vram_mb = int(os.environ.get("KARAOKE_HQ_UPGRADE_VRAM_MB", "3500"))
 
         self.cuda_available, self.gpu_name, _, _ = query_nvidia_gpu()
         env_mode = os.environ.get("KARAOKE_DEVICE", "auto").strip().lower()
@@ -149,6 +151,156 @@ class KaraokeSeparatorManager:
         # Background zero-local-disk reaper: automatically retries & migrates any song stranded on local disk
         # (e.g. after a transient Google Drive 403 rate-limit spike) so local disk ALWAYS returns to 0.0 MB!
         threading.Thread(target=self._bg_gdrive_reaper_loop, daemon=True, name="gdrive-auto-reaper").start()
+
+        # Background idle HQ upgrader: when GPU has ample free VRAM (>= 3.5 GB) and no user jobs are active,
+        # silently re-separates any 'cpu_fast' (MDX-Net HQ3) songs with BS-RoFormer 1297 and replaces them in cache!
+        threading.Thread(target=self._bg_gpu_hq_upgrader_loop, daemon=True, name="hq-idle-upgrader").start()
+
+    def count_pending_hq_upgrades(self) -> int:
+        return sum(1 for item in self.list_cache() if item.get("quality_tier") == "cpu_fast")
+
+    def _bg_gpu_hq_upgrader_loop(self) -> None:
+        time.sleep(45)
+        while True:
+            try:
+                self._maybe_upgrade_one_cpu_song()
+            except Exception as exc:
+                self.log.warning("HQUpgrade", f"Idle upgrader loop warning: {str(exc)[:240]}")
+            time.sleep(120)
+
+    def _maybe_upgrade_one_cpu_song(self) -> None:
+        if self.pause_new_jobs or self.device_mode == "cpu":
+            return
+        with self._lock:
+            if self._queued_keys or self._lyrics_in_progress or self._migration_state.get("running"):
+                return
+        has_gpu, _, free_mb, _ = query_nvidia_gpu()
+        if (not has_gpu) or (free_mb < self._hq_upgrade_min_vram_mb):
+            return
+
+        now = time.time()
+        candidate = None
+        for item in self.list_cache():
+            if item.get("quality_tier") != "cpu_fast":
+                continue
+            key = self._job_key(item["video_id"], item["mode"])
+            if self._hq_upgrade_backoff.get(key, 0.0) > now:
+                continue
+            candidate = item
+            break
+        if not candidate:
+            return
+
+        if not self._worker_lock.acquire(blocking=False):
+            return
+
+        vid = candidate["video_id"]
+        mode = candidate["mode"]
+        key = self._job_key(vid, mode)
+        staging_root = TEMP_DIR / f"hq_upgrade_{vid}_{int(now)}"
+        staging_status = TEMP_DIR / f"hq_upgrade_{vid}_{int(now)}.json"
+        try:
+            # Re-verify idle state & VRAM right after acquiring lock
+            with self._lock:
+                if self.pause_new_jobs or self._queued_keys or self._lyrics_in_progress:
+                    return
+            has_gpu, _, free_mb, _ = query_nvidia_gpu()
+            if (not has_gpu) or (free_mb < self._hq_upgrade_min_vram_mb):
+                return
+
+            staging_root.mkdir(parents=True, exist_ok=True)
+            self.log.info(
+                "HQUpgrade",
+                f"Start idle BS-RoFormer upgrade for {vid} ({mode}) | free_vram={free_mb:.0f}MB",
+            )
+            target_url = f"https://www.youtube.com/watch?v={vid}"
+            cmd = [
+                sys.executable,
+                "-u",
+                str(WORKER_SCRIPT),
+                f"--video-id={vid}",
+                f"--mode={mode}",
+                f"--url={target_url}",
+                "--device-mode=auto",
+                "--force-hq",
+                f"--cache-dir={staging_root}",
+                f"--status-file={staging_status}",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(BASE_DIR),
+                env=os.environ.copy(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+            )
+            try:
+                _, stderr_text = proc.communicate(timeout=360)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, stderr_text = proc.communicate()
+                self._hq_upgrade_backoff[key] = time.time() + 21600
+                self.log.warning("HQUpgrade", f"Timed out upgrading {vid} ({mode}); will retry in 6h")
+                return
+
+            if proc.returncode == 2:
+                # VRAM dipped before model load — skip cleanly without backoff
+                return
+            if proc.returncode != 0:
+                self._hq_upgrade_backoff[key] = time.time() + 21600
+                self.log.warning(
+                    "HQUpgrade",
+                    f"Upgrade skipped for {vid} ({mode}, rc={proc.returncode}), retry in 6h: {(stderr_text or '')[-400:]}",
+                )
+                return
+
+            staged_song_dir = staging_root / vid / mode
+            if not (staged_song_dir / "instrumental.mp3").exists() or not (staged_song_dir / "vocals.mp3").exists():
+                self._hq_upgrade_backoff[key] = time.time() + 21600
+                return
+
+            # Preserve original created_at so library ordering stays intact
+            meta_file = staged_song_dir / "meta.json"
+            upgraded_meta = json.loads(meta_file.read_text(encoding="utf-8")) if meta_file.exists() else {}
+            if candidate.get("created_at"):
+                upgraded_meta["created_at"] = candidate["created_at"]
+            upgraded_meta["quality_tier"] = "gpu_hq"
+            upgraded_meta["upgraded_at"] = time.time()
+            meta_file.write_text(json.dumps(upgraded_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            if self.storage_mode == "gdrive" and self.gdrive.is_configured():
+                self.gdrive.upload_song(vid, mode, staged_song_dir, upgraded_meta)
+                # Remove any stale local copy if present
+                local_dir = self.get_cache_dir(vid, mode)
+                if local_dir.exists():
+                    shutil.rmtree(local_dir, ignore_errors=True)
+            else:
+                local_dir = self.get_cache_dir(vid, mode)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                for fname in ("instrumental.mp3", "vocals.mp3", "meta.json"):
+                    src = staged_song_dir / fname
+                    if src.exists():
+                        os.replace(src, local_dir / fname)
+
+            self._hq_upgrade_backoff.pop(key, None)
+            self.log.info(
+                "HQUpgrade",
+                f"Upgraded {vid} ({mode}) cpu_fast -> gpu_hq (BS-RoFormer 1297) in {upgraded_meta.get('elapsed_sec', '?')}s",
+            )
+            self.log.trigger_sync_async()
+        except Exception as exc:
+            self._hq_upgrade_backoff[key] = time.time() + 21600
+            self.log.warning("HQUpgrade", f"Failed upgrading {vid} ({mode}), retry in 6h: {str(exc)[:240]}")
+        finally:
+            self._worker_lock.release()
+            shutil.rmtree(staging_root, ignore_errors=True)
+            try:
+                staging_status.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _bg_gdrive_reaper_loop(self) -> None:
         time.sleep(20)
@@ -688,6 +840,10 @@ class KaraokeSeparatorManager:
                 if inst.exists() and voc.exists():
                     meta = self.get_meta(vid_dir.name, mode_dir.name)
                     size_bytes = sum(f.stat().st_size for f in mode_dir.glob("*") if f.is_file())
+                    model_name = meta.get("model", "")
+                    quality_tier = meta.get("quality_tier") or (
+                        "cpu_fast" if model_name == "UVR-MDX-NET-Inst_HQ_3.onnx" else "gpu_hq"
+                    )
                     items.append(
                         {
                             "video_id": vid_dir.name,
@@ -696,6 +852,8 @@ class KaraokeSeparatorManager:
                             "duration": meta.get("duration", 0),
                             "size_mb": round(size_bytes / (1024 * 1024), 2),
                             "created_at": meta.get("created_at", 0),
+                            "quality_tier": quality_tier,
+                            "model": model_name,
                             "storage": "local",
                             "url": f"https://www.youtube.com/watch?v={vid_dir.name}",
                         }
