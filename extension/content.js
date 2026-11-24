@@ -501,11 +501,8 @@
       ui.deviceBadge.style.display = "none";
     }
 
-    const isCurrentModeCached = state.cachedModes.includes(state.mode);
+    const isCurrentModeCached = state.cachedModes.includes("pure");
     ui.cacheBadge.style.display = isCurrentModeCached ? "inline-block" : "none";
-
-    ui.modePureBtn.classList.toggle("selected", state.mode === "pure");
-    ui.modeKaraokeBtn.classList.toggle("selected", state.mode === "karaoke");
 
     ui.toggleBtn.disabled = state.busy || !state.backendOnline;
     ui.toggleBtn.classList.toggle("active", state.active);
@@ -1152,22 +1149,6 @@
       style: "display:none",
     });
 
-    const modePureBtn = el("button", {
-      className: "ktv-mode-btn selected",
-      type: "button",
-      title: "完全去除主唱及和音，純伴奏",
-      textContent: "純伴奏",
-      onClick: () => handleModeSelect("pure"),
-    });
-
-    const modeKaraokeBtn = el("button", {
-      className: "ktv-mode-btn",
-      type: "button",
-      title: "去除主唱並保留副歌和音",
-      textContent: "保留和音",
-      onClick: () => handleModeSelect("karaoke"),
-    });
-
     const toggleBtn = el("button", {
       className: "ktv-primary-btn",
       type: "button",
@@ -1384,7 +1365,6 @@
       ]),
       el("div", { className: "ktv-controls-group" }, [
         syncChip,
-        el("div", { className: "ktv-mode-switch" }, [modePureBtn, modeKaraokeBtn]),
         toggleBtn,
       ]),
     ]);
@@ -1396,8 +1376,6 @@
       dot,
       deviceBadge,
       cacheBadge,
-      modePureBtn,
-      modeKaraokeBtn,
       toggleBtn,
       progressWrap,
       progressFill,
@@ -1505,16 +1483,6 @@
       mountPanel();
     }
   }, 1500);
-
-  // Load saved default mode preference
-  try {
-    chrome.storage.local.get(["defaultMode"], (res) => {
-      if (res && (res.defaultMode === "pure" || res.defaultMode === "karaoke")) {
-        state.mode = res.defaultMode;
-        updateUI();
-      }
-    });
-  } catch (_e) {}
 
   // Initial kick-off
   setTimeout(onNavigate, 600);

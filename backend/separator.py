@@ -15,12 +15,7 @@ MODELS: Dict[str, Dict[str, str]] = {
     "pure": {
         "label": "純伴奏 (BS-RoFormer 1297)",
         "filename": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
-        "description": "完全去除所有主唱及和音，最高準確率純伴奏",
-    },
-    "karaoke": {
-        "label": "KTV 保留和音 (Mel-Band RoFormer Karaoke)",
-        "filename": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
-        "description": "去除主唱人聲，保留副歌和音，還原卡拉OK伴奏感",
+        "description": "完全去除人聲，最高準確率純伴奏",
     },
 }
 

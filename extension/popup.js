@@ -7,25 +7,10 @@ function apiRequest(path, method = "GET", body = null) {
   });
 }
 
-function updateModeButtons(mode) {
-  document.getElementById("btn-pure").classList.toggle("active", mode === "pure");
-  document.getElementById("btn-karaoke").classList.toggle("active", mode === "karaoke");
-}
-
-function setDefaultMode(mode) {
-  chrome.storage.local.set({ defaultMode: mode }, () => {
-    updateModeButtons(mode);
-  });
-}
-
 async function refresh() {
   const pill = document.getElementById("status-pill");
   const songCount = document.getElementById("song-count");
   const songList = document.getElementById("song-list");
-
-  chrome.storage.local.get(["defaultMode"], (res) => {
-    updateModeButtons(res && res.defaultMode === "karaoke" ? "karaoke" : "pure");
-  });
 
   const health = await apiRequest("/api/health");
   if (!health.ok || !health.data || health.data.status !== "ok") {
@@ -46,7 +31,7 @@ async function refresh() {
   const cacheRes = await apiRequest("/api/cache");
   songList.textContent = "";
   if (cacheRes.ok && cacheRes.data) {
-    const items = cacheRes.data.items || [];
+    const items = (cacheRes.data.items || []).filter((i) => i.mode === "pure");
     songCount.textContent = `${items.length} 首`;
     if (items.length === 0) {
       const empty = document.createElement("div");
@@ -65,19 +50,11 @@ async function refresh() {
         title.title = item.title;
         title.textContent = item.title;
 
-        const tag = document.createElement("span");
-        tag.className = "song-tag";
-        tag.textContent = item.mode === "pure" ? "純伴奏" : "保留和音";
-
         link.appendChild(title);
-        link.appendChild(tag);
         songList.appendChild(link);
       }
     }
   }
 }
-
-document.getElementById("btn-pure").addEventListener("click", () => setDefaultMode("pure"));
-document.getElementById("btn-karaoke").addEventListener("click", () => setDefaultMode("karaoke"));
 
 refresh();

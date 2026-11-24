@@ -107,12 +107,12 @@ async def security_and_cors_middleware(request: Request, call_next):
 
 class SeparateRequest(BaseModel):
     video_id: str
-    mode: Literal["pure", "karaoke"] = "pure"
+    mode: Literal["pure"] = "pure"
 
 
 class LyricsRequest(BaseModel):
     video_id: str
-    mode: Literal["pure", "karaoke"] = "pure"
+    mode: Literal["pure"] = "pure"
     force_ai: bool = False
 
 
