@@ -237,15 +237,20 @@ def parse_lrc(lrc_text: str) -> list[dict]:
 
 def _adaptive_vocal_threshold_db(db_profile: np.ndarray, margin_db: float = 0.0) -> float:
     """Compute a song-adaptive vocal activity threshold from the track's own loudness distribution.
-    Eliminates hardcoded dBFS constants so quiet live recordings (-21 dB) and loud rock (-11 dB) behave identically.
+    Handles both low-DR recordings AND wide-dynamic-range tracks (e.g. loud rock chorus at -5 dBFS
+    paired with soft ballad verses at -33 dBFS) without letting loud peaks blind quiet singing!
     """
     if len(db_profile) < 10:
         return -40.0 + margin_db
     p15 = float(np.percentile(db_profile, 15))
     p90 = float(np.percentile(db_profile, 90))
-    if p90 - p15 < 8.0:
+    dr = p90 - p15
+    if dr < 8.0:
         return (p90 - 10.0) + margin_db
-    return max(p15 + 6.0, p90 - 22.0) + margin_db
+    # When dynamic range is huge (e.g. rock/metal + soft ballad, dr > 28 dB), allow 30 dB below p90
+    # while staying safely >= 10 dB above the silence floor p15 so quiet verses stay visible!
+    headroom = 30.0 if dr >= 28.0 else 22.0
+    return max(p15 + 10.0, p90 - headroom) + margin_db
 
 
 def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, np.ndarray, float, float]:
@@ -1130,13 +1135,46 @@ def refine_alignment_with_acoustics(
 
         # 1) Acoustic Onset Snap + Full Dead-Space Trim:
         # Never let a line sit lit across >1.5s of pure silence/solo before or after the actual vocal burst!
+        # Filter isolated 1-frame (0.1s) cymbal/breath blips so a stray click never holds a 20s silent span open.
         i0_ln = max(0, int(s / step_sec))
         i1_ln = min(n_db, int(e / step_sec))
         if (e - s) > 3.5 and i1_ln > i0_ln:
-            act_frames = np.flatnonzero(db_profile[i0_ln:i1_ln] > thr_db)
+            raw_act = db_profile[i0_ln:i1_ln] > thr_db
+            # Keep only frames with at least one active neighbor (eliminates 100ms stray blips)
+            if len(raw_act) >= 3:
+                sustained = raw_act.copy()
+                sustained[0] = raw_act[0] and raw_act[1]
+                sustained[-1] = raw_act[-1] and raw_act[-2]
+                sustained[1:-1] = raw_act[1:-1] & (raw_act[:-2] | raw_act[2:])
+                act_frames = np.flatnonzero(sustained)
+                if len(act_frames) == 0:
+                    act_frames = np.flatnonzero(raw_act)
+            else:
+                act_frames = np.flatnonzero(raw_act)
             if len(act_frames) > 0:
-                v_first = (i0_ln + int(act_frames[0])) * step_sec
-                v_last = (i0_ln + int(act_frames[-1]) + 1) * step_sec
+                # If line still spans >8s with a >=4s internal dead gap, snap to the dominant active vocal island!
+                if (e - s) > 8.0 and len(act_frames) >= 2:
+                    islands = []
+                    st_f = int(act_frames[0])
+                    pv_f = st_f
+                    for af in act_frames[1:]:
+                        af_i = int(af)
+                        if (af_i - pv_f) * step_sec >= 4.0:
+                            islands.append((st_f, pv_f))
+                            st_f = af_i
+                        pv_f = af_i
+                    islands.append((st_f, pv_f))
+                    if len(islands) >= 2:
+                        # Pick island with the most active vocal frames
+                        best_isl = max(islands, key=lambda pair: int(np.sum(raw_act[pair[0] : pair[1] + 1])))
+                        v_first = (i0_ln + best_isl[0]) * step_sec
+                        v_last = (i0_ln + best_isl[1] + 1) * step_sec
+                    else:
+                        v_first = (i0_ln + int(act_frames[0])) * step_sec
+                        v_last = (i0_ln + int(act_frames[-1]) + 1) * step_sec
+                else:
+                    v_first = (i0_ln + int(act_frames[0])) * step_sec
+                    v_last = (i0_ln + int(act_frames[-1]) + 1) * step_sec
                 if (v_first - s) > 1.5 and (e - v_first) >= 0.45:
                     s = round(max(first_onset, v_first - 0.15), 2)
                 if (e - v_last) > 1.5 and (v_last - s) >= 0.45:

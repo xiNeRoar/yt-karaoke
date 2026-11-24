@@ -316,7 +316,12 @@ def test_word_bunching_deglitcher() -> None:
     ghost = [{"start": 4.0, "end": 16.0, "text": "(It's not over)", "words": [{"word": "over", "start": 4.0, "end": 16.0}]}]
     trimmed = lw.refine_alignment_with_acoustics(ghost, db_prof, 0.1, 20.0, 0.0)
     assert trimmed[0]["start"] >= 13.8 and (trimmed[0]["end"] - trimmed[0]["start"]) <= 2.5, f"Silent ghost line not trimmed: {trimmed[0]}"
-    print("[PASS] First-principles Energy-CDF collapse recovery + silent-solo trim")
+
+    # Case 4: High-dynamic-range rock (-5 dBFS) + quiet ballad (-33 dBFS) + silence (-60 dBFS) -> threshold must see ballad!
+    hdr_prof = np.concatenate([np.full(50, -60.0), np.full(50, -33.0), np.full(50, -5.0)]).astype(np.float32)
+    hdr_thr = lw._adaptive_vocal_threshold_db(hdr_prof)
+    assert -45.0 <= hdr_thr < -33.0, f"High-DR threshold blinded quiet ballad verse: {hdr_thr:.1f} dBFS"
+    print("[PASS] First-principles Energy-CDF recovery + silent-solo trim + high-DR adaptive threshold")
 
 
 def test_silence_collapse_and_mapping() -> None:
