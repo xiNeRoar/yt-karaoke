@@ -103,7 +103,7 @@ class GoogleDriveStorage:
         remote_dir = self._remote_base(video_id, mode)
         # Ensure remote directory exists and upload instrumental.mp3, vocals.mp3, meta.json
         res = subprocess.run(
-            [exe, "copy", str(local_dir), remote_dir, "--transfers", "3", "--quiet"],
+            [exe, "copy", str(local_dir), remote_dir, "--transfers", "3", "--drive-chunk-size", "32M", "--quiet"],
             capture_output=True,
             text=True,
             timeout=180,

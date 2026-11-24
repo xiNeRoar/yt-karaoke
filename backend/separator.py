@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
-from storage import GoogleDriveStorage
+from logger import CloudSyncedLogger
+from storage import GoogleDriveStorage, find_rclone_exe
 
 MODELS: Dict[str, Dict[str, str]] = {
     "pure": {
@@ -110,12 +111,29 @@ class KaraokeSeparatorManager:
         self.max_clients = 100
 
         self.gdrive = GoogleDriveStorage(GDRIVE_INDEX_FILE)
+        self.log = CloudSyncedLogger(TEMP_DIR, find_rclone_exe, self.gdrive.is_configured)
+        self._migration_state = {
+            "running": False,
+            "done": 0,
+            "total": 0,
+            "freed_mb": 0.0,
+            "message": "",
+            "error": None,
+        }
         self._load_config()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Auto-enable gdrive if configured and user chose it
-        if self.storage_mode == "gdrive" and not self.gdrive.is_configured():
+        # Always prefer Google Drive cloud mode automatically once connected!
+        if self.gdrive.is_configured():
+            self.storage_mode = "gdrive"
+            self.save_config()
+            threading.Thread(target=self.gdrive.sync_index_from_remote, daemon=True, name="gdrive-boot-sync").start()
+        elif self.storage_mode == "gdrive":
             self.storage_mode = "local"
+        self.log.info(
+            "Startup",
+            f"Backend ready | gpu={self.gpu_name} device_mode={self.device_mode} storage={self.storage_mode} gdrive={self.gdrive.is_configured()}",
+        )
 
         # Clean stale temp jobs from prior session
         for p in TEMP_DIR.iterdir():
@@ -339,9 +357,9 @@ class KaraokeSeparatorManager:
             with self._worker_lock:
                 has_gpu, gpu_name, free_mb, _ = query_nvidia_gpu()
                 effective_mode = self.device_mode if has_gpu else "cpu"
-                print(
-                    f"[Karaoke] Launching isolated worker for {video_id} ({mode}) mode={effective_mode} (free_vram={free_mb:.0f}MB)",
-                    flush=True,
+                self.log.info(
+                    "Separate",
+                    f"Start {video_id} ({mode}) mode={effective_mode} free_vram={free_mb:.0f}MB",
                 )
 
                 cmd = [
@@ -406,7 +424,7 @@ class KaraokeSeparatorManager:
                             }
                         )
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
-                    print(f"[Karaoke] Worker failed ({video_id}): {(stderr_text or '')[-400:]}", flush=True)
+                    self.log.error("Separate", f"Worker failed ({video_id}, {mode}): {(stderr_text or '')[-400:]}")
                     return
 
                 # If Google Drive storage is active, upload immediately and delete local MP3s (0 MB local disk!)
@@ -429,14 +447,17 @@ class KaraokeSeparatorManager:
 
                         cur.update({"status": "ready", "progress": 100, "stage_text": "已存上 Google Drive，隨時開唱！"})
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
-                        print(f"[Karaoke] Uploaded {video_id} ({mode}) to Google Drive and freed local disk!", flush=True)
+                        self.log.info("GDrive", f"Uploaded {video_id} ({mode}) & freed local disk")
+                        self.log.trigger_sync_async()
                     except Exception as gerr:
-                        print(f"[Karaoke] Google Drive upload fallback to local ({video_id}): {gerr}", flush=True)
+                        self.log.error("GDrive", f"Upload fallback to local ({video_id}): {gerr}")
                         self.enforce_cache_limit()
                 else:
                     self.enforce_cache_limit()
-                    print(f"[Karaoke] Worker finished cleanly ({video_id}, {mode}) — 100% VRAM reclaimed!", flush=True)
+                    self.log.info("Separate", f"Done {video_id} ({mode}) — 100% VRAM reclaimed")
+                    self.log.trigger_sync_async()
         except Exception as exc:
+            self.log.error("Separate", f"Exception ({video_id}, {mode}): {exc}")
             cur = self._read_job_status(video_id, mode) or {}
             cur.update(
                 {
@@ -456,31 +477,108 @@ class KaraokeSeparatorManager:
             with self._lock:
                 self._queued_keys.discard(key)
 
-    def migrate_local_to_gdrive(self) -> dict:
-        """Upload all existing local cached songs to Google Drive and remove local copies."""
+    def get_migration_state(self) -> dict:
+        with self._lock:
+            return dict(self._migration_state)
+
+    def start_migrate_local_to_gdrive(self) -> dict:
+        """Start non-blocking background migration of all local cached songs to Google Drive."""
         if not self.gdrive.is_configured():
             raise RuntimeError("尚未連接 Google Drive，請先喺控制台登入 Google Drive。")
-        local_items = self._list_local_cache()
-        migrated = 0
+
+        with self._lock:
+            if self._migration_state["running"]:
+                return dict(self._migration_state)
+            local_items = self._list_local_cache()
+            # Switch to gdrive mode immediately so any new songs go straight to Google Drive too!
+            self.storage_mode = "gdrive"
+            self.save_config()
+
+            if not local_items:
+                self._migration_state = {
+                    "running": False,
+                    "done": 0,
+                    "total": 0,
+                    "freed_mb": 0.0,
+                    "message": "已切換至 Google Drive 雲端模式（無本地檔需遷移）",
+                    "error": None,
+                }
+                return dict(self._migration_state)
+
+            self._migration_state = {
+                "running": True,
+                "done": 0,
+                "total": len(local_items),
+                "freed_mb": 0.0,
+                "message": f"遷移中 0/{len(local_items)} 首...",
+                "error": None,
+            }
+
+        self.log.info("Migrate", f"Starting background Google Drive migration for {len(local_items)} local songs")
+        t = threading.Thread(target=self._run_migration, args=(local_items,), daemon=True, name="gdrive-migrate")
+        t.start()
+        return self.get_migration_state()
+
+    def _run_migration(self, local_items: list[dict]) -> None:
+        done = 0
         freed_mb = 0.0
+        errors = []
+        total = len(local_items)
+
         for item in local_items:
             vid = item["video_id"]
             mode = item["mode"]
+            title = item.get("title", vid)
             local_dir = self.get_cache_dir(vid, mode)
-            meta = self.get_meta(vid, mode)
-            self.gdrive.upload_song(vid, mode, local_dir, meta)
-            shutil.rmtree(local_dir, ignore_errors=True)
-            parent = self.cache_dir / vid
-            if parent.exists() and not any(parent.iterdir()):
-                try:
-                    parent.rmdir()
-                except Exception:
-                    pass
-            migrated += 1
-            freed_mb += item["size_mb"]
-        self.storage_mode = "gdrive"
-        self.save_config()
-        return {"migrated": migrated, "freed_mb": round(freed_mb, 2)}
+            if not local_dir.exists():
+                done += 1
+                continue
+
+            with self._lock:
+                self._migration_state["message"] = f"上傳中 ({done + 1}/{total})：{title[:16]}"
+            try:
+                meta = self.get_meta(vid, mode)
+                self.gdrive.upload_song(vid, mode, local_dir, meta)
+                # Also upload lyrics.json if present for this video
+                lf = self._lyrics_file(vid)
+                if lf.exists():
+                    self.gdrive.upload_single_file(vid, mode, lf)
+                    try:
+                        lf.unlink()
+                    except Exception:
+                        pass
+                shutil.rmtree(local_dir, ignore_errors=True)
+                parent = self.cache_dir / vid
+                if parent.exists() and not any(parent.iterdir()):
+                    try:
+                        parent.rmdir()
+                    except Exception:
+                        pass
+                done += 1
+                freed_mb += float(item.get("size_mb", 0))
+                self.log.info("Migrate", f"Uploaded ({done}/{total}) {vid} ({mode}) {item.get('size_mb', 0)}MB")
+                with self._lock:
+                    self._migration_state["done"] = done
+                    self._migration_state["freed_mb"] = round(freed_mb, 2)
+                    self._migration_state["message"] = f"已完成 {done}/{total} 首（釋放 {freed_mb:.1f} MB）"
+            except Exception as exc:
+                err_txt = f"{vid}: {exc}"
+                errors.append(err_txt)
+                self.log.error("Migrate", f"Failed migrating {err_txt}")
+
+        with self._lock:
+            self._migration_state["running"] = False
+            self._migration_state["done"] = done
+            self._migration_state["freed_mb"] = round(freed_mb, 2)
+            if errors:
+                self._migration_state["error"] = "; ".join(errors[:2])
+                self._migration_state["message"] = f"遷移部分完成 ({done}/{total})，有 {len(errors)} 個錯誤"
+            else:
+                self._migration_state["error"] = None
+                self._migration_state["message"] = f"全部 {done} 首已上 Google Drive（釋放 {freed_mb:.1f} MB）"
+
+        self.log.info("Migrate", self._migration_state["message"])
+        self.log.trigger_sync_async()
 
     def get_vram_mb(self) -> float:
         return 0.0
@@ -677,13 +775,22 @@ class KaraokeSeparatorManager:
                         self._active_procs.pop(key, None)
 
                 if proc.returncode == 0 and out_file.exists():
-                    # Sync tiny lyrics.json (~4KB) to Google Drive if Drive is enabled
+                    # Sync tiny lyrics.json (~4KB) to Google Drive and remove local copy when in cloud mode
                     if self.storage_mode == "gdrive" and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
-                        self.gdrive.upload_single_file(video_id, mode, out_file)
-                    print(f"[Karaoke] Lyrics ready for {video_id} (force_ai={force_ai})", flush=True)
+                        if self.gdrive.upload_single_file(video_id, mode, out_file):
+                            try:
+                                out_file.unlink()
+                                parent = self.cache_dir / video_id
+                                if parent.exists() and not any(parent.iterdir()):
+                                    parent.rmdir()
+                            except Exception:
+                                pass
+                    self.log.info("Lyrics", f"Ready for {video_id} (force_ai={force_ai})")
+                    self.log.trigger_sync_async()
                 elif proc.returncode != 0:
-                    print(f"[Karaoke] Lyrics worker failed ({video_id}): {(stderr_text or '')[-400:]}", flush=True)
+                    self.log.error("Lyrics", f"Worker failed ({video_id}): {(stderr_text or '')[-400:]}")
         except Exception as exc:
+            self.log.error("Lyrics", f"Exception ({video_id}): {exc}")
             try:
                 status_file.write_text(
                     json.dumps(

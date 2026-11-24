@@ -802,12 +802,26 @@ namespace YtKaraokeTray
                 _lblVramNum.Text = totalVram > 0 ? string.Format("{0:F1} GB", freeVram / 1024.0) : "CPU";
                 _lblVramSub.Text = totalVram > 0 ? string.Format("總計 {0:F0} GB · 主服務 0 MB", totalVram / 1024.0) : "無 CUDA 顯卡";
 
-                _lblGdriveStatus.Text = _gdriveConnected
-                    ? (_storageMode == "gdrive" ? "Google Drive：已啟用 (雲端零佔用)" : "Google Drive：已連接 (目前本地)")
-                    : "Google Drive：未連接";
-                _lblGdriveStatus.ForeColor = _gdriveConnected ? Color.FromArgb(74, 222, 128) : TextMuted;
+                bool migRunning = GetBool(h, "migration_running");
+                string migMsg = GetStr(h, "migration_message", "");
+
+                if (migRunning)
+                {
+                    _lblGdriveStatus.Text = string.IsNullOrEmpty(migMsg) ? "正在遷移上 Google Drive..." : migMsg;
+                    _lblGdriveStatus.ForeColor = Color.FromArgb(250, 204, 21);
+                    _btnMigrateGdrive.Enabled = false;
+                    _btnMigrateGdrive.Text = "遷移中...";
+                }
+                else
+                {
+                    _lblGdriveStatus.Text = _gdriveConnected
+                        ? (_storageMode == "gdrive" ? "Google Drive：雲端模式 (0 本地)" : "Google Drive：已連接")
+                        : "Google Drive：未連接";
+                    _lblGdriveStatus.ForeColor = _gdriveConnected ? Color.FromArgb(74, 222, 128) : TextMuted;
+                    _btnMigrateGdrive.Enabled = _gdriveConnected && localMb > 0;
+                    _btnMigrateGdrive.Text = localMb > 0 ? "遷移本地上雲端" : "已全部上雲端";
+                }
                 _btnConnectGdrive.Text = _gdriveConnected ? "重新同步 Drive" : "連接 Google Drive";
-                _btnMigrateGdrive.Enabled = _gdriveConnected && localMb > 0;
                 _btnToggleStorage.Enabled = _gdriveConnected;
                 _btnToggleStorage.Text = _storageMode == "gdrive" ? "雲端模式" : "本地模式";
 
@@ -1059,15 +1073,17 @@ namespace YtKaraokeTray
         {
             if (!_backendOnline || !_gdriveConnected) return;
             _btnMigrateGdrive.Enabled = false;
-            _btnMigrateGdrive.Text = "遷移中...";
-            string resp = await HttpRequestAsync("POST", "/api/admin/gdrive/migrate", "{}", 300000, true);
-            _btnMigrateGdrive.Text = "遷移本地上雲端";
+            _btnMigrateGdrive.Text = "啟動遷移...";
+            string resp = await HttpRequestAsync("POST", "/api/admin/gdrive/migrate", "{}", 10000, true);
+            if (resp == null)
+            {
+                MessageBox.Show("啟動遷移失敗，請打開「日誌」查看原因。", "錯誤", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                _btnMigrateGdrive.Enabled = true;
+                _btnMigrateGdrive.Text = "遷移本地上雲端";
+                return;
+            }
             _lastCacheSig = "";
             await PollAllAsync();
-            if (resp != null)
-            {
-                MessageBox.Show("遷移完成！所有快取已存上 Google Drive 並釋放本地硬碟空間。", "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            }
         }
 
         private async Task ToggleStorageModeAsync()

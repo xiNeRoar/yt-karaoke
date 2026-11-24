@@ -85,6 +85,7 @@ app = FastAPI(title="YouTube Karaoke AI Backend", version="2.1.0", docs_url=None
 async def security_and_cors_middleware(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin and not _is_allowed_origin(origin):
+        manager.log.warning("Security", f"Blocked untrusted Origin={origin} on {request.method} {request.url.path}")
         return Response(content='{"detail":"Origin not allowed"}', status_code=403, media_type="application/json")
 
     if request.method == "OPTIONS":
@@ -156,6 +157,7 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
     free_vram_mb, total_vram_mb = manager.get_vram_free_total_mb()
     csnap = clients.snapshot()
 
+    mig = manager.get_migration_state()
     return {
         "status": "ok",
         "cuda_available": manager.cuda_available,
@@ -182,6 +184,11 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
         "rate_limit_per_10min": manager.rate_limit_per_10min,
         "max_clients": manager.max_clients,
         "extension_reload_nonce": EXTENSION_RELOAD_NONCE,
+        "migration_running": mig["running"],
+        "migration_done": mig["done"],
+        "migration_total": mig["total"],
+        "migration_message": mig["message"],
+        "migration_error": mig["error"],
     }
 
 
@@ -240,10 +247,24 @@ def trigger_extension_reload(x_admin_token: Optional[str] = Header(default=None)
 def gdrive_migrate(x_admin_token: Optional[str] = Header(default=None)):
     _require_admin(x_admin_token)
     try:
-        res = manager.migrate_local_to_gdrive()
+        res = manager.start_migrate_local_to_gdrive()
         return {"status": "ok", **res}
     except Exception as exc:
+        manager.log.error("Migrate", f"Failed to start migration: {exc}")
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admin/logs/sync")
+def sync_logs_now(x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    ok = manager.log.sync_to_gdrive()
+    return {"status": "ok", "synced": ok}
+
+
+@app.get("/api/admin/logs")
+def get_recent_logs(lines: int = 120, x_admin_token: Optional[str] = Header(default=None)):
+    _require_admin(x_admin_token)
+    return {"status": "ok", "log": manager.log.tail(max(10, min(500, lines)))}
 
 
 @app.post("/api/admin/gdrive/sync")
