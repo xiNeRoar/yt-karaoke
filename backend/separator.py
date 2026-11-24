@@ -448,6 +448,10 @@ class KaraokeSeparatorManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     _, stderr_text = proc.communicate()
+                    self.log.error(
+                        "Separate",
+                        f"Worker timeout ({video_id}, {mode}) after 600s | stderr: {(stderr_text or '')[-1500:]}",
+                    )
                     raise RuntimeError("處理逾時（超過 10 分鐘），已自動中止保護系統資源。")
                 finally:
                     with self._lock:
@@ -467,7 +471,10 @@ class KaraokeSeparatorManager:
                             }
                         )
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
-                    self.log.error("Separate", f"Worker failed ({video_id}, {mode}): {(stderr_text or '')[-400:]}")
+                    self.log.error(
+                        "Separate",
+                        f"Worker failed ({video_id}, {mode}, rc={proc.returncode}): {(stderr_text or '')[-1500:]}",
+                    )
                     return
 
                 # If Google Drive storage is active, upload immediately and delete local MP3s (0 MB local disk!)
@@ -903,6 +910,10 @@ class KaraokeSeparatorManager:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     _, stderr_text = proc.communicate()
+                    self.log.error(
+                        "Lyrics",
+                        f"Worker timeout ({video_id}) after 240s | stderr: {(stderr_text or '')[-1500:]}",
+                    )
                     raise RuntimeError("歌詞生成逾時")
                 finally:
                     with self._lock:
@@ -934,7 +945,10 @@ class KaraokeSeparatorManager:
                     self.log.info("Lyrics", f"Ready for {video_id} (force_ai={force_ai})")
                     self.log.trigger_sync_async()
                 elif proc.returncode != 0:
-                    self.log.error("Lyrics", f"Worker failed ({video_id}): {(stderr_text or '')[-400:]}")
+                    self.log.error(
+                        "Lyrics",
+                        f"Worker failed ({video_id}, rc={proc.returncode}): {(stderr_text or '')[-1500:]}",
+                    )
         except Exception as exc:
             self.log.error("Lyrics", f"Exception ({video_id}): {exc}")
             try:
