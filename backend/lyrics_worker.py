@@ -356,9 +356,11 @@ def _extract_query_candidates(
             _add(f"{artist} {track}")
         _add(track)
 
-    # 2) Explicitly quoted song titles
-    for m in re.finditer(r'[《「『〈"]([^》」』〉"]{2,48})[》」』〉"]', title or ""):
-        _add(clean_search_title(m.group(1)))
+    # 2) Explicitly quoted song titles (match each bracket pair cleanly so nested quotes like 《...「我」...》 stay intact)
+    for m in re.finditer(r'《([^》]{2,48})》|「([^」]{2,48})」|『([^』]{2,48})』|〈([^〉]{2,48})〉|"([^"]{2,48})"', title or ""):
+        inner = next((g for g in m.groups() if g), "")
+        if inner:
+            _add(clean_search_title(inner))
 
     # 3) Full cleaned title (keeps artist + song together for standard "Artist - Song" MVs)
     cleaned = clean_search_title(title)
@@ -518,6 +520,44 @@ def fetch_official_lyrics(
             best_source = "YouTube Description"
 
     return best_synced, best_lines, best_source
+
+
+def fetch_multi_song_lyrics_from_title(title: str, duration: float) -> list[list[str]]:
+    """Generic multi-song lookup for long videos (>=5.3 min) containing >=2 bracketed titles
+    (e.g. CHILL CLUB 2-song sets, concert medleys like '《Song A》《Song B》').
+    Zero hardcoded blacklists: queries each quoted piece in parallel and deduplicates by lyric content.
+    """
+    if duration < 320.0 or not title:
+        return []
+    raw_quotes = [
+        m.strip()
+        for m in re.findall(r"[《「『\"]([^《》「」『』\"]{2,40})[》」』\"]", title)
+        if m.strip()
+    ]
+    # Deduplicate preserving order
+    pieces = list(dict.fromkeys(raw_quotes))
+    if len(pieces) < 2:
+        return []
+
+    def _lookup_one(piece: str) -> list[str]:
+        try:
+            _, lines, _ = fetch_official_lyrics(piece, 240.0, "")
+            return lines if len(lines) >= 8 else []
+        except Exception:
+            return []
+
+    pools: list[list[str]] = []
+    seen_fps: set[str] = set()
+    with ThreadPoolExecutor(max_workers=min(4, len(pieces))) as ex:
+        results = list(ex.map(_lookup_one, pieces[:6]))
+    for lines in results:
+        if not lines:
+            continue
+        fp = "".join(_norm_lyrics_cmp(x) for x in lines[:4])[:40]
+        if fp and fp not in seen_fps:
+            seen_fps.add(fp)
+            pools.append(lines)
+    return pools if len(pools) >= 2 else []
 
 
 def _pcm16_wav_bytes(y: np.ndarray, sr: int = 16000) -> bytes:
@@ -1189,6 +1229,7 @@ def _live_section_anchored_align(
     use_cuda: bool = False,
     inst_path: Optional[Path] = None,
     shazam_already_tried: bool = False,
+    initial_song_pools: Optional[list[list[str]]] = None,
 ) -> list[dict]:
     """Live/Concert/Medley-aware alignment:
     1. Transcribes active vocal regions (using GPU BatchedInferencePipeline when available for 4-6x speed!)
@@ -1198,6 +1239,7 @@ def _live_section_anchored_align(
     """
     audio_input = audio_16k if len(audio_16k) > 0 else str(vocals_path)
     raw_segments = []
+    comp_time_map: list[tuple[float, float, float, float]] = []
 
     # Fast GPU BatchedInferencePipeline (~2-4s for a 4-min concert on RTX 5060 Ti!)
     if use_cuda and len(audio_16k) > 0:
@@ -1219,8 +1261,15 @@ def _live_section_anchored_align(
             raw_segments = []
 
     if not raw_segments:
+        transcribe_input = audio_input
+        if len(audio_16k) > 0 and len(db_profile) > 0:
+            comp_audio, comp_time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
+            if len(comp_audio) > 0 and comp_time_map:
+                transcribe_input = comp_audio
+            else:
+                comp_time_map = []
         res = model.transcribe(
-            audio_input,
+            transcribe_input,
             language=lang,
             beam_size=2,
             vad=False,
@@ -1230,15 +1279,28 @@ def _live_section_anchored_align(
         )
         raw_segments = list(res.segments or [])
 
+    norm_segments: list[dict] = []
     asr_segs = []
     for s in raw_segments:
         raw_t = (s.text or "").strip()
+        s_raw, e_raw = float(s.start), float(s.end)
+        s_real = _map_comp_to_real(s_raw, comp_time_map) if comp_time_map else s_raw
+        e_real = _map_comp_to_real(e_raw, comp_time_map) if comp_time_map else e_raw
+        e_real = max(s_real + 0.05, e_real)
+        words_mapped = []
+        for w in (getattr(s, "words", None) or []):
+            ws_r, we_r = float(w.start), float(w.end)
+            ws_real = _map_comp_to_real(ws_r, comp_time_map) if comp_time_map else ws_r
+            we_real = _map_comp_to_real(we_r, comp_time_map) if comp_time_map else we_r
+            words_mapped.append({"word": getattr(w, "word", "") or "", "start": ws_real, "end": max(ws_real, we_real)})
+        norm_segments.append({"start": s_real, "end": e_real, "text": raw_t, "words": words_mapped})
+
         txt = to_hk_traditional(raw_t) if lang == "zh" else raw_t
         if not txt or HALLUCINATION_RE.search(txt) or GARBAGE_CHARS_RE.search(txt):
             continue
-        if not segment_has_vocal_energy(db_profile, step_sec, float(s.start), float(s.end)):
+        if not segment_has_vocal_energy(db_profile, step_sec, s_real, e_real):
             continue
-        asr_segs.append({"start": float(s.start), "end": float(s.end), "text": txt})
+        asr_segs.append({"start": s_real, "end": e_real, "text": txt})
 
     if not asr_segs:
         return []
@@ -1301,6 +1363,11 @@ def _live_section_anchored_align(
                 idx_i += 1
         return m_out, u_gaps
 
+    song_pools: list[list[str]] = (
+        [list(p) for p in initial_song_pools if p]
+        if initial_song_pools
+        else ([list(official_lines)] if official_lines else [])
+    )
     matched, unmatched_gaps = _match_against_pool(official_lines)
     matched_asr_count = len(asr_segs) - len(unmatched_gaps)
 
@@ -1314,6 +1381,7 @@ def _live_section_anchored_align(
             m2, g2 = _match_against_pool(shz_lines)
             if (len(asr_segs) - len(g2)) > matched_asr_count:
                 official_lines = shz_lines
+                song_pools = [list(shz_lines)]
                 matched, unmatched_gaps = m2, g2
                 matched_asr_count = len(asr_segs) - len(unmatched_gaps)
 
@@ -1335,6 +1403,7 @@ def _live_section_anchored_align(
             rescued = search_official_lyrics_by_sung_phrases(cl)
             if rescued:
                 official_lines = list(official_lines) + rescued
+                song_pools.append(list(rescued))
                 added_pool = True
         if added_pool:
             matched, unmatched_gaps = _match_against_pool(official_lines)
@@ -1352,21 +1421,21 @@ def _live_section_anchored_align(
             flush=True,
         )
         direct_lines: list[dict] = []
-        for s in raw_segments:
-            raw_t = (s.text or "").strip()
+        for s in norm_segments:
+            raw_t = (s["text"] or "").strip()
             txt = to_hk_traditional(raw_t) if lang == "zh" else raw_t
             if not txt or HALLUCINATION_RE.search(txt) or GARBAGE_CHARS_RE.search(txt):
                 continue
-            s_start, s_end = float(s.start), float(s.end)
+            s_start, s_end = float(s["start"]), float(s["end"])
             if s_end < first_onset or not segment_has_vocal_energy(db_profile, step_sec, s_start, s_end):
                 continue
             words_out = []
-            for w in (getattr(s, "words", None) or []):
-                wt = (w.word or "").strip()
+            for w in (s.get("words") or []):
+                wt = (w["word"] or "").strip()
                 if not wt or GARBAGE_CHARS_RE.search(wt):
                     continue
-                ws = round(max(first_onset, float(w.start)), 3)
-                we = round(max(ws, float(w.end)), 3)
+                ws = round(max(first_onset, float(w["start"])), 3)
+                we = round(max(ws, float(w["end"])), 3)
                 words_out.append({
                     "start": ws,
                     "end": we,
@@ -1383,43 +1452,143 @@ def _live_section_anchored_align(
         audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
         return refine_alignment_with_acoustics(direct_lines, db_profile, step_sec, audio_dur, first_onset)
 
-    # Multi-line energy-verified gap recovery: if 1..6 official lines sit between matched[k] and matched[k+1]
-    # AND real vocal RMS confirms continuous singing in that span, restore ALL missing sung lines!
-    pos_map: dict[str, list[int]] = {}
-    for idx, off_txt in enumerate(official_lines):
-        pos_map.setdefault(off_txt, []).append(idx)
+    # Track-aware full-span energy-verified recovery (Leading + Internal up to 30 lines + Trailing!):
+    # Handles loud rock/live vocals and multi-song CHILL CLUB / Concert sets where Whisper only catches sparse anchors.
+    total_sec_est = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else (len(db_profile) * step_sec)
+    gap_thr = _adaptive_vocal_threshold_db(db_profile)
+
+    def _active_vocal_span(t_start: float, t_end: float) -> tuple[float, float, float]:
+        """Returns (active_vocal_seconds, first_active_t, last_active_t) inside [t_start, t_end]."""
+        if len(db_profile) == 0 or t_end <= t_start:
+            return (0.0, t_start, t_end)
+        i0 = max(0, int(t_start / step_sec))
+        i1 = min(len(db_profile), int(t_end / step_sec))
+        if i1 <= i0:
+            return (0.0, t_start, t_end)
+        mask = db_profile[i0:i1] > gap_thr
+        active_idx = np.flatnonzero(mask)
+        if len(active_idx) == 0:
+            return (0.0, t_start, t_end)
+        return (
+            float(len(active_idx)) * step_sec,
+            (i0 + int(active_idx[0])) * step_sec,
+            (i0 + int(active_idx[-1]) + 1) * step_sec,
+        )
+
+    # Assign each matched anchor to its originating song pool + line index (preferring monotonic progression)
+    pool_pos_maps: list[dict[str, list[int]]] = []
+    for pl in song_pools:
+        pm: dict[str, list[int]] = {}
+        for idx, txt in enumerate(pl):
+            pm.setdefault(txt, []).append(idx)
+        pool_pos_maps.append(pm)
+
+    annotated: list[dict] = []
+    cur_pool_i = 0
+    last_idx_in_pool: dict[int, int] = {}
+    for cur in matched:
+        txt = cur["text"]
+        # Prefer staying in current song pool if txt exists there; otherwise switch to the pool containing txt
+        chosen_p = -1
+        if cur_pool_i < len(pool_pos_maps) and txt in pool_pos_maps[cur_pool_i]:
+            chosen_p = cur_pool_i
+        else:
+            for pi, pm in enumerate(pool_pos_maps):
+                if txt in pm:
+                    chosen_p = pi
+                    break
+        if chosen_p >= 0:
+            cur_pool_i = chosen_p
+            cands = pool_pos_maps[chosen_p][txt]
+            prev_i = last_idx_in_pool.get(chosen_p, -1)
+            l_idx = next((p for p in cands if p > prev_i), cands[0])
+            last_idx_in_pool[chosen_p] = l_idx
+            annotated.append({**cur, "_pool": chosen_p, "_idx": l_idx})
+        else:
+            annotated.append({**cur, "_pool": -1, "_idx": -1})
+
+    # Partition annotated anchors into contiguous song runs (e.g. Run 0 = Song 1, Run 1 = Song 2)
+    song_runs: list[list[dict]] = []
+    for item in annotated:
+        if not song_runs or item["_pool"] != song_runs[-1][0]["_pool"] or item["_pool"] < 0:
+            song_runs.append([item])
+        else:
+            song_runs[-1].append(item)
 
     filled: list[dict] = []
-    last_off_idx = -1
-    for k, cur in enumerate(matched):
-        cands_cur = pos_map.get(cur["text"]) or []
-        cur_idx = next((p for p in cands_cur if p > last_off_idx), cands_cur[0] if cands_cur else -1)
-        filled.append(cur)
-        if cur_idx >= 0:
-            last_off_idx = cur_idx
-        if k + 1 < len(matched) and cur_idx >= 0:
-            nxt = matched[k + 1]
-            cands_nxt = pos_map.get(nxt["text"]) or []
-            nxt_idx = next((p for p in cands_nxt if cur_idx < p <= cur_idx + 7), -1)
-            missing_n = (nxt_idx - cur_idx - 1) if nxt_idx > cur_idx else 0
-            gap_s = cur["end"]
-            gap_e = nxt["start"]
-            if 1 <= missing_n <= 6 and (gap_e - gap_s) >= max(1.6, 1.5 * missing_n):
-                # Measure real active singing seconds in [gap_s .. gap_e]
-                i0 = max(0, int(gap_s / step_sec))
-                i1 = min(len(db_profile), int(gap_e / step_sec))
-                gap_thr = _adaptive_vocal_threshold_db(db_profile)
-                active_sec = float(np.sum(db_profile[i0:i1] > gap_thr)) * step_sec if i1 > i0 else 0.0
-                if active_sec >= max(1.4, 1.6 * missing_n):
-                    step_t = (gap_e - gap_s) / missing_n
-                    for m_i in range(missing_n):
+    for r_i, run in enumerate(song_runs):
+        pi = run[0]["_pool"]
+        if pi < 0 or pi >= len(song_pools):
+            filled.extend(run)
+            continue
+        pl = song_pools[pi]
+        prev_bound = (song_runs[r_i - 1][-1]["end"] + 0.5) if r_i > 0 else first_onset
+        next_bound = (song_runs[r_i + 1][0]["start"] - 0.5) if (r_i + 1 < len(song_runs)) else total_sec_est
+
+        # 1) Leading lines recovery (0 .. first_idx - 1) if continuous vocals precede the first anchor!
+        first_item = run[0]
+        first_idx = first_item["_idx"]
+        if first_idx > 0 and first_item["start"] - prev_bound >= 2.0:
+            lead_n = first_idx
+            max_lead_window = min(first_item["start"] - prev_bound, max(12.0, lead_n * 5.2))
+            win_s = max(prev_bound, first_item["start"] - max_lead_window)
+            act_sec, v_first, _ = _active_vocal_span(win_s, first_item["start"])
+            if act_sec >= max(1.2, 0.75 * lead_n):
+                span_s = max(prev_bound, v_first)
+                span_e = first_item["start"]
+                if span_e > span_s + 0.5:
+                    step_t = (span_e - span_s) / lead_n
+                    for m_i in range(lead_n):
                         filled.append({
-                            "start": round(gap_s + m_i * step_t, 2),
-                            "end": round(gap_s + (m_i + 1) * step_t, 2),
-                            "text": official_lines[cur_idx + 1 + m_i],
+                            "start": round(span_s + m_i * step_t, 2),
+                            "end": round(span_s + (m_i + 1) * step_t, 2),
+                            "text": pl[m_i],
                             "sim": 0.0,
                         })
-                    last_off_idx = nxt_idx - 1
+
+        # 2) Anchors + internal gap recovery (up to 30 missing lines within the same song!)
+        for k, cur in enumerate(run):
+            filled.append({k2: v2 for k2, v2 in cur.items() if not k2.startswith("_")})
+            if k + 1 < len(run):
+                nxt = run[k + 1]
+                cur_idx, nxt_idx = cur["_idx"], nxt["_idx"]
+                missing_n = (nxt_idx - cur_idx - 1) if (0 <= cur_idx < nxt_idx <= cur_idx + 31) else 0
+                gap_s, gap_e = cur["end"], nxt["start"]
+                if 1 <= missing_n <= 30 and (gap_e - gap_s) >= max(1.2, 0.9 * missing_n):
+                    act_sec, v_first, v_last = _active_vocal_span(gap_s, gap_e)
+                    if act_sec >= max(1.0, 0.75 * missing_n):
+                        span_s = max(gap_s, v_first)
+                        span_e = min(gap_e, max(span_s + 0.5, v_last))
+                        step_t = (span_e - span_s) / missing_n
+                        for m_i in range(missing_n):
+                            filled.append({
+                                "start": round(span_s + m_i * step_t, 2),
+                                "end": round(span_s + (m_i + 1) * step_t, 2),
+                                "text": pl[cur_idx + 1 + m_i],
+                                "sim": 0.0,
+                            })
+
+        # 3) Trailing lines recovery (last_idx + 1 .. len(pl) - 1) if continuous vocals follow the last anchor!
+        last_item = run[-1]
+        last_idx = last_item["_idx"]
+        if 0 <= last_idx < len(pl) - 1 and next_bound - last_item["end"] >= 2.0:
+            trail_n = len(pl) - 1 - last_idx
+            max_trail_window = min(next_bound - last_item["end"], max(12.0, trail_n * 5.2))
+            win_e = min(next_bound, last_item["end"] + max_trail_window)
+            act_sec, _, v_last = _active_vocal_span(last_item["end"], win_e)
+            if act_sec >= max(1.2, 0.75 * trail_n):
+                span_s = last_item["end"]
+                span_e = min(next_bound, v_last)
+                if span_e > span_s + 0.5:
+                    step_t = (span_e - span_s) / trail_n
+                    for m_i in range(trail_n):
+                        filled.append({
+                            "start": round(span_s + m_i * step_t, 2),
+                            "end": round(span_s + (m_i + 1) * step_t, 2),
+                            "text": pl[last_idx + 1 + m_i],
+                            "sim": 0.0,
+                        })
+
     matched = filled
 
     # If a sustained unrecognized singing cluster STILL remains (e.g. an unreleased/parody section inside a Mashup),
@@ -1677,6 +1846,7 @@ def align_official_lyrics_with_stable_ts(
     prefer_live: bool = False,
     inst_path: Optional[Path] = None,
     shazam_already_tried: bool = False,
+    initial_song_pools: Optional[list[list[str]]] = None,
 ) -> tuple[list[dict], str, bool]:
     """Force-align 100% REAL official lyrics text directly onto isolated vocals.mp3.
     Automatically detects mid-song starts, skipped/swapped concert verses, or encores and
@@ -1716,6 +1886,7 @@ def align_official_lyrics_with_stable_ts(
             return _live_section_anchored_align(
                 model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
                 use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
+                initial_song_pools=initial_song_pools,
             )
         except Exception as e:
             if used_dev == "cuda":
@@ -1725,6 +1896,7 @@ def align_official_lyrics_with_stable_ts(
                 return _live_section_anchored_align(
                     model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
                     use_cuda=False, inst_path=inst_path, shazam_already_tried=shazam_already_tried,
+                    initial_song_pools=initial_song_pools,
                 )
             raise
 
@@ -2083,20 +2255,31 @@ def main() -> int:
             # GPU busy / Qwen3 skipped -> keep these exact human YouTube lines for CPU stable-ts word alignment!
             yt_human_official_lines = clean_lyric_lines([ln["text"] for ln in yt_lines])
 
-        # Layer 2: Generic parallel official lyrics lookup (LRCLIB + NetEase + YT Desc)
+        # Layer 2: Generic parallel official lyrics lookup (Multi-Song Title Set -> LRCLIB + NetEase + YT Desc)
         update("running", 25, "搜尋歌詞中...")
-        is_mashup_title = bool(MASHUP_KEYWORDS_RE.search(title))
+        is_mashup_title = bool(MASHUP_KEYWORDS_RE.search(title)) or (
+            len(re.findall(r"《[^》]{2,48}》", title or "")) >= 3
+        ) or (
+            (duration == 0.0 or duration >= 330.0) and bool(re.search(r"》\s*《|」\s*「|』\s*『", title or ""))
+        )
+        multi_song_pools: list[list[str]] = []
         if yt_human_official_lines:
             lrc_synced, official_lines, lrc_src = None, yt_human_official_lines, "YouTube Human Subtitles"
         else:
-            lrc_synced, official_lines, lrc_src = (
-                (None, [], "")
-                if is_mashup_title
-                else fetch_official_lyrics(
-                    title, duration, yt_desc,
-                    yt_track=yt_track, yt_artist=yt_artist, yt_channel=yt_channel,
+            multi_song_pools = fetch_multi_song_lyrics_from_title(title, duration)
+            if multi_song_pools:
+                lrc_synced = None
+                official_lines = [ln for pool in multi_song_pools for ln in pool]
+                lrc_src = f"Multi-Song Official ({len(multi_song_pools)} songs)"
+            else:
+                lrc_synced, official_lines, lrc_src = (
+                    (None, [], "")
+                    if is_mashup_title
+                    else fetch_official_lyrics(
+                        title, duration, yt_desc,
+                        yt_track=yt_track, yt_artist=yt_artist, yt_channel=yt_channel,
+                    )
                 )
-            )
 
         # Only return raw line-only LRC if vocals.mp3 is unavailable; otherwise ALWAYS acoustically align
         # against THIS video's actual vocals (eliminates MV-vs-Spotify intro offsets and fake 8s 0-word sweeps!).
@@ -2168,11 +2351,12 @@ def main() -> int:
         # Stage 2: Qwen3-ForcedAligner-0.6B windowed refinement (~2-3s GPU, native Cantonese/CJK/EN/JP/KR precision!).
         if official_lines:
             update("running", 50, "對齊歌詞中...")
-            is_multi_song_mashup = is_mashup_title or len(shazam_tracks) >= 2
+            is_multi_song_mashup = is_mashup_title or len(shazam_tracks) >= 2 or len(multi_song_pools) >= 2
             ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
                 vocals_path, audio_16k, db_profile, step_sec, official_lines,
                 args.device_mode, first_onset, prefer_live=is_multi_song_mashup,
-                inst_path=inst_path, shazam_already_tried=shazam_tried,
+                inst_path=inst_path, shazam_already_tried=(shazam_tried or len(multi_song_pools) >= 2),
+                initial_song_pools=(multi_song_pools if multi_song_pools else None),
             )
             qwen_ok = False
             if ai_lines:
