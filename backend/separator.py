@@ -430,6 +430,7 @@ class KaraokeSeparatorManager:
 
                 # If Google Drive storage is active, upload immediately and delete local MP3s (0 MB local disk!)
                 pre_voc_hint: Optional[Path] = None
+                pre_inst_hint: Optional[Path] = None
                 if self.storage_mode == "gdrive" and self.gdrive.is_configured():
                     local_song_dir = self.get_cache_dir(video_id, mode)
                     meta = self.get_meta(video_id, mode)
@@ -438,14 +439,21 @@ class KaraokeSeparatorManager:
                         cur.update({"status": "finalizing", "progress": 96, "stage_text": "最後整理中..."})
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
 
-                        # Keep a tiny temporary copy of vocals.mp3 so background lyrics pre-gen runs in 0s download!
+                        # Keep tiny temporary copies of vocals & instrumental so background lyrics & Shazam run at 0s download!
                         local_voc = local_song_dir / "vocals.mp3"
+                        local_inst = local_song_dir / "instrumental.mp3"
                         if local_voc.exists():
                             try:
                                 pre_voc_hint = TEMP_DIR / f"pre_voc_{video_id}_{int(time.time())}.mp3"
                                 shutil.copy2(local_voc, pre_voc_hint)
                             except Exception:
                                 pre_voc_hint = None
+                        if local_inst.exists():
+                            try:
+                                pre_inst_hint = TEMP_DIR / f"pre_inst_{video_id}_{int(time.time())}.mp3"
+                                shutil.copy2(local_inst, pre_inst_hint)
+                            except Exception:
+                                pre_inst_hint = None
 
                         self.gdrive.upload_song(video_id, mode, local_song_dir, meta)
                         shutil.rmtree(local_song_dir, ignore_errors=True)
@@ -468,15 +476,19 @@ class KaraokeSeparatorManager:
                     self.log.info("Separate", f"Done {video_id} ({mode}) — 100% VRAM reclaimed")
                     self.log.trigger_sync_async()
 
-                # Auto pre-generate lyrics in background while vocals.mp3 is hot on SSD -> 0.05s instant lyrics!
+                # Auto pre-generate lyrics in background while stems are hot on SSD -> 0.05s instant lyrics!
                 try:
-                    self.start_lyrics_generation(video_id, mode, force_ai=False, local_vocals_hint=pre_voc_hint)
+                    self.start_lyrics_generation(
+                        video_id, mode, force_ai=False,
+                        local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                    )
                 except Exception:
-                    if pre_voc_hint and pre_voc_hint.exists():
-                        try:
-                            pre_voc_hint.unlink()
-                        except Exception:
-                            pass
+                    for _p in (pre_voc_hint, pre_inst_hint):
+                        if _p and _p.exists():
+                            try:
+                                _p.unlink()
+                            except Exception:
+                                pass
         except Exception as exc:
             self.log.error("Separate", f"Exception ({video_id}, {mode}): {exc}")
             cur = self._read_job_status(video_id, mode) or {}
@@ -736,15 +748,20 @@ class KaraokeSeparatorManager:
         mode: str = "pure",
         force_ai: bool = False,
         local_vocals_hint: Optional[Path] = None,
+        local_inst_hint: Optional[Path] = None,
     ) -> dict:
+        def _cleanup_hints():
+            for _p in (local_vocals_hint, local_inst_hint):
+                if _p and _p.exists():
+                    try:
+                        _p.unlink()
+                    except Exception:
+                        pass
+
         if not force_ai:
             existing = self.get_lyrics(video_id, mode)
             if existing.get("status") == "ready":
-                if local_vocals_hint and local_vocals_hint.exists():
-                    try:
-                        local_vocals_hint.unlink()
-                    except Exception:
-                        pass
+                _cleanup_hints()
                 return existing
         else:
             with self._lock:
@@ -753,11 +770,7 @@ class KaraokeSeparatorManager:
 
         with self._lock:
             if video_id in self._lyrics_in_progress:
-                if local_vocals_hint and local_vocals_hint.exists():
-                    try:
-                        local_vocals_hint.unlink()
-                    except Exception:
-                        pass
+                _cleanup_hints()
                 return self.get_lyrics(video_id, mode)
             self._lyrics_in_progress.add(video_id)
 
@@ -774,7 +787,7 @@ class KaraokeSeparatorManager:
 
         t = threading.Thread(
             target=self._run_lyrics_worker,
-            args=(video_id, mode, force_ai, sf, local_vocals_hint),
+            args=(video_id, mode, force_ai, sf, local_vocals_hint, local_inst_hint),
             daemon=True,
             name=f"lyrics-{video_id}",
         )
@@ -788,21 +801,23 @@ class KaraokeSeparatorManager:
         force_ai: bool,
         status_file: Path,
         local_vocals_hint: Optional[Path] = None,
+        local_inst_hint: Optional[Path] = None,
     ) -> None:
         key = f"lyrics__{video_id}"
         temp_vocals: Optional[Path] = local_vocals_hint
+        temp_inst: Optional[Path] = local_inst_hint
         try:
             with self._lyrics_lock:
                 if local_vocals_hint and local_vocals_hint.exists():
                     vocals_path = local_vocals_hint
                 else:
                     vocals_path = self.get_cache_dir(video_id, mode) / "vocals.mp3"
-                    # If audio lives only on Google Drive, pull vocals.mp3 temporarily for alignment
                     if not vocals_path.exists() and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
                         temp_vocals = TEMP_DIR / f"voc_{video_id}_{int(time.time())}.mp3"
                         if self.gdrive.download_file(video_id, mode, "vocals.mp3", temp_vocals):
                             vocals_path = temp_vocals
 
+                inst_path = local_inst_hint if (local_inst_hint and local_inst_hint.exists()) else (self.get_cache_dir(video_id, mode) / "instrumental.mp3")
                 out_file = self._lyrics_file(video_id)
                 has_gpu, _, _, _ = query_nvidia_gpu()
                 eff_mode = self.device_mode if has_gpu else "cpu"
@@ -829,6 +844,8 @@ class KaraokeSeparatorManager:
                     "--duration",
                     str(float(meta.get("duration") or 0.0)),
                 ]
+                if inst_path and inst_path.exists():
+                    cmd.extend(["--inst-path", str(inst_path)])
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(BASE_DIR),
@@ -901,11 +918,12 @@ class KaraokeSeparatorManager:
         finally:
             with self._lock:
                 self._lyrics_in_progress.discard(video_id)
-            if temp_vocals and temp_vocals.exists():
-                try:
-                    temp_vocals.unlink()
-                except Exception:
-                    pass
+            for _tf in (temp_vocals, temp_inst):
+                if _tf and _tf.exists():
+                    try:
+                        _tf.unlink()
+                    except Exception:
+                        pass
 
 
 manager = KaraokeSeparatorManager()

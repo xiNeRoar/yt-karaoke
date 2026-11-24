@@ -14,7 +14,9 @@ Priority:
 """
 
 import argparse
+import asyncio
 from difflib import SequenceMatcher
+import io
 import json
 import os
 import re
@@ -22,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -36,7 +39,11 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LIVE_KEYWORDS_RE = re.compile(
-    r"(live|concert|演唱會|演唱会|音樂會|音乐会|現場|现场|cover|翻唱|acoustic|unplugged|remix|plug\s*dj|medley|串燒|ktv|試聽|试听|短版|cut|clip|片段)",
+    r"(live|concert|演唱會|演唱会|音樂會|音乐会|現場|现场|cover|翻唱|acoustic|unplugged|remix|plug\s*dj|medley|串燒|ktv|試聽|试听|短版|cut|clip|片段|mashup|組曲|组曲|合集|精選|精选|聯唱|联唱)",
+    re.IGNORECASE,
+)
+MASHUP_KEYWORDS_RE = re.compile(
+    r"(mashup|medley|串燒|串烧|組曲|组曲|合集|合輯|精選|精选|聯唱|联唱|top\s*\d+|金曲|歌單|歌单|連播|连播|特輯|特辑|勁歌金曲|劲歌金曲)",
     re.IGNORECASE,
 )
 HALLUCINATION_RE = re.compile(
@@ -391,6 +398,228 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
     return best_synced, best_lines, best_source
 
 
+def _pcm16_wav_bytes(y: np.ndarray, sr: int = 16000) -> bytes:
+    y16 = np.clip(y * 32767.0, -32768, 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(y16.tobytes())
+    return buf.getvalue()
+
+
+def shazam_scan_and_fetch_lyrics(
+    audio_16k: np.ndarray,
+    db_profile: np.ndarray,
+    step_sec: float,
+    inst_path: Optional[Path] = None,
+    scan_mashup: bool = False,
+) -> tuple[list[str], list[dict]]:
+    """Use free shazamio acoustic fingerprinting to identify song(s) even when YouTube title has NO song name
+    or when the video is a multi-song Mashup / Medley (up to 15 min)!
+    Returns (combined_official_lines, identified_tracks_list).
+    """
+    if len(audio_16k) < 16000 * 8:
+        return [], []
+    try:
+        from shazamio import Shazam
+    except Exception:
+        return [], []
+
+    # Mix instrumental + vocals if inst_path is available locally (10x faster & more accurate Shazam lock!)
+    probe_audio = audio_16k
+    if inst_path and inst_path.exists():
+        try:
+            import librosa
+            yi, _ = librosa.load(str(inst_path), sr=16000, mono=True)
+            n = min(len(audio_16k), len(yi))
+            if n > 16000 * 8:
+                probe_audio = np.clip(audio_16k[:n] + yi[:n], -1.0, 1.0).astype(np.float32)
+        except Exception:
+            pass
+
+    total_sec = len(probe_audio) / 16000.0
+    clip_sec = 10.0
+
+    # Pick smart active probe timestamps
+    if scan_mashup:
+        step_probe = 25.0 if total_sec <= 360 else max(35.0, total_sec / 16.0)
+        offsets = []
+        t_cur = 10.0
+        while t_cur + clip_sec < total_sec and len(offsets) < 16:
+            if segment_has_vocal_energy(db_profile, step_sec, t_cur, t_cur + clip_sec):
+                offsets.append(t_cur)
+            t_cur += step_probe
+        if not offsets:
+            offsets = [min(total_sec * 0.25, max(0.0, total_sec - clip_sec))]
+    else:
+        # Single song: probe 2 active singing windows (fast ~0.5-1.5s!)
+        cands = [total_sec * 0.25, total_sec * 0.55, total_sec * 0.12]
+        offsets = []
+        for t_c in cands:
+            if t_c + clip_sec < total_sec and segment_has_vocal_energy(db_profile, step_sec, t_c, t_c + clip_sec):
+                offsets.append(t_c)
+            if len(offsets) >= 2:
+                break
+        if not offsets:
+            offsets = [max(0.0, min(total_sec * 0.3, total_sec - clip_sec))]
+
+    async def _run_probes() -> list[dict]:
+        shazam = Shazam()
+        sem = asyncio.Semaphore(3)
+
+        async def _probe_one(off_sec: float) -> Optional[dict]:
+            s0 = int(off_sec * 16000)
+            s1 = min(len(probe_audio), int((off_sec + clip_sec) * 16000))
+            wav_b = _pcm16_wav_bytes(probe_audio[s0:s1], 16000)
+            async with sem:
+                try:
+                    res = await asyncio.wait_for(shazam.recognize(wav_b), timeout=14.0)
+                except Exception:
+                    return None
+            tr = (res or {}).get("track") or {}
+            tr_title = (tr.get("title") or "").strip()
+            tr_artist = (tr.get("subtitle") or "").strip()
+            if not tr_title:
+                return None
+            # Also grab embedded official lyrics directly from Shazam response if present!
+            shz_lyrics: list[str] = []
+            for sec in (tr.get("sections") or []):
+                if sec.get("type") == "LYRICS" and isinstance(sec.get("text"), list):
+                    shz_lyrics = clean_lyric_lines(sec["text"])
+                    break
+            return {"offset": round(off_sec, 1), "title": tr_title, "artist": tr_artist, "shz_lyrics": shz_lyrics}
+
+        results = await asyncio.gather(*[_probe_one(o) for o in offsets])
+        return [r for r in results if r]
+
+    try:
+        hits = asyncio.run(_run_probes())
+    except Exception as exc:
+        print(f"[Lyrics] Shazam scan error: {exc}", flush=True)
+        return [], []
+
+    # Deduplicate unique tracks chronologically
+    seen_keys: set[str] = set()
+    unique_tracks: list[dict] = []
+    for h in sorted(hits, key=lambda x: x["offset"]):
+        key = _norm_lyrics_cmp(re.sub(r"[\(\[（【].*?[\)\]）】]", "", h["title"]))
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_tracks.append(h)
+
+    if not unique_tracks:
+        return [], []
+
+    print(
+        "[Lyrics] Shazam identified %d track(s): %s"
+        % (len(unique_tracks), ", ".join(f"{t['artist']} - {t['title']} @{t['offset']}s" for t in unique_tracks)),
+        flush=True,
+    )
+
+    # Fetch 100% official lyrics for every identified song and combine into one multi-song pool!
+    combined_lines: list[str] = []
+    for tr in unique_tracks:
+        query_title = f"{tr['artist']} {tr['title']}".strip()
+        _, lines, _ = fetch_official_lyrics(query_title, 0.0)
+        if not lines:
+            _, lines, _ = fetch_official_lyrics(tr["title"], 0.0)
+        if not lines and tr.get("shz_lyrics"):
+            lines = tr["shz_lyrics"]
+        if lines:
+            combined_lines.extend(lines)
+
+    return combined_lines, unique_tracks
+
+
+def search_official_lyrics_by_sung_phrases(asr_segs: list[dict]) -> list[str]:
+    """Identify unknown song(s) inside a Mashup / Live Cover / Acoustic Medley directly from sung lyric phrases!
+    Uses NetEase Cloud Music full-text lyrics search (type=1006) which even tolerates Whisper homophone typos
+    and discovers MULTIPLE back-to-back songs inside a single continuous Mashup cluster!
+    """
+    cands = [
+        s["text"].strip()
+        for s in asr_segs
+        if 5 <= len(_norm_lyrics_cmp(s["text"])) <= 20
+    ]
+    if not cands:
+        return []
+
+    # Sample up to 6 phrases evenly across the span so back-to-back songs in one Mashup are ALL discovered!
+    n_probes = min(6, len(cands))
+    if len(cands) <= n_probes:
+        probes = cands
+    else:
+        idxs = sorted({int(round(i * (len(cands) - 1) / (n_probes - 1))) for i in range(n_probes)})
+        probes = [cands[i] for i in idxs]
+
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
+    asr_blob = "".join(_norm_lyrics_cmp(s["text"]) for s in asr_segs)
+
+    seen_song_ids: set[int] = set()
+    seen_titles: set[str] = set()
+    rescued_all: list[str] = []
+
+    for q in probes:
+        qs = to_simplified(q)
+        try:
+            r = httpx.get(
+                "https://music.163.com/api/search/get",
+                params={"s": qs, "type": 1006, "limit": 4},
+                headers=headers,
+                timeout=7,
+            )
+            songs = (r.json().get("result") or {}).get("songs") or []
+        except Exception:
+            continue
+
+        for s in songs[:3]:
+            sid = s.get("id")
+            tr_name = s.get("name") or ""
+            base_t = _norm_lyrics_cmp(re.sub(r"[\(\[（【].*?[\)\]）】]", "", tr_name))
+            if not sid or sid in seen_song_ids or (base_t and base_t in seen_titles):
+                continue
+            seen_song_ids.add(sid)
+            try:
+                lr = httpx.get(
+                    "https://music.163.com/api/song/lyric",
+                    params={"id": sid, "lv": 1, "tv": -1},
+                    headers=headers,
+                    timeout=7,
+                )
+                lrc = (lr.json().get("lrc") or {}).get("lyric", "")
+                if not lrc:
+                    continue
+                parsed = parse_lrc(lrc)
+                lines = [x["text"] for x in parsed]
+                if len(lines) < 6:
+                    continue
+                # Verify this song genuinely matches >= 3 sung lines in our unrecognized span!
+                hit_lines = sum(
+                    1 for ln in set(lines)
+                    if len(_norm_lyrics_cmp(ln)) >= 4 and (
+                        _norm_lyrics_cmp(ln)[:4] in asr_blob
+                        or any(_lyric_similarity(seg["text"], ln) >= 0.45 for seg in asr_segs)
+                    )
+                )
+                if hit_lines >= 3:
+                    if base_t:
+                        seen_titles.add(base_t)
+                    artists = "/".join((a.get("name") or "") for a in (s.get("artists") or []))
+                    print(
+                        f"[Lyrics] Phrase-search rescued song: {artists} - {tr_name} (matched {hit_lines} lines)",
+                        flush=True,
+                    )
+                    rescued_all.extend(lines)
+                    break  # Found the song for this probe phrase; move to next probe in Mashup!
+            except Exception:
+                continue
+
+    return rescued_all
+
+
 def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], str, str, float, str]:
     import yt_dlp
 
@@ -541,6 +770,8 @@ def _live_section_anchored_align(
     lang: str,
     first_onset: float,
     use_cuda: bool = False,
+    inst_path: Optional[Path] = None,
+    shazam_already_tried: bool = False,
 ) -> list[dict]:
     """Live/Concert/Medley-aware alignment:
     1. Transcribes active vocal regions (using GPU BatchedInferencePipeline when available for 4-6x speed!)
@@ -597,66 +828,105 @@ def _live_section_anchored_align(
     if not asr_segs:
         return []
 
-    unique_off = list(dict.fromkeys(official_lines))
-    next_map: dict[str, set[str]] = {}
-    for idx in range(len(official_lines) - 1):
-        next_map.setdefault(official_lines[idx], set()).add(official_lines[idx + 1])
+    def _match_against_pool(pool_lines: list[str]) -> tuple[list[dict], list[dict]]:
+        u_off = list(dict.fromkeys(pool_lines))
+        n_map: dict[str, set[str]] = {}
+        for idx in range(len(pool_lines) - 1):
+            n_map.setdefault(pool_lines[idx], set()).add(pool_lines[idx + 1])
 
-    def _best_single(text: str, prev_l: Optional[str]) -> Optional[tuple[float, str, float, bool]]:
-        c_len = len(_norm_lyrics_cmp(text))
-        if c_len < 2:
-            return None
-        best = None
-        for off in unique_off:
-            o_len = len(_norm_lyrics_cmp(off))
-            if o_len == 0 or c_len > o_len * 2.1 or o_len > c_len * 2.6:
-                continue
-            sim = _lyric_similarity(text, off)
-            is_next = bool(prev_l and off in next_map.get(prev_l, set()))
-            bonus = 0.22 if (is_next and sim >= 0.22) else (0.12 if is_next else 0.0)
-            score = sim + bonus
-            if best is None or score > best[0]:
-                best = (score, off, sim, is_next)
-        return best
+        def _best_single(text: str, prev_l: Optional[str]) -> Optional[tuple[float, str, float, bool]]:
+            c_len = len(_norm_lyrics_cmp(text))
+            if c_len < 2:
+                return None
+            best = None
+            for off in u_off:
+                o_len = len(_norm_lyrics_cmp(off))
+                if o_len == 0 or c_len > o_len * 2.1 or o_len > c_len * 2.6:
+                    continue
+                sim = _lyric_similarity(text, off)
+                is_next = bool(prev_l and off in n_map.get(prev_l, set()))
+                bonus = 0.22 if (is_next and sim >= 0.22) else (0.12 if is_next else 0.0)
+                score = sim + bonus
+                if best is None or score > best[0]:
+                    best = (score, off, sim, is_next)
+            return best
 
-    matched = []
-    unmatched_gaps = []
-    i = 0
-    prev_line: Optional[str] = None
-    while i < len(asr_segs):
-        b1 = _best_single(asr_segs[i]["text"], prev_line)
-        chosen_span = 1
-        chosen = b1
+        m_out: list[dict] = []
+        u_gaps: list[dict] = []
+        idx_i = 0
+        prev_l: Optional[str] = None
+        while idx_i < len(asr_segs):
+            b1 = _best_single(asr_segs[idx_i]["text"], prev_l)
+            chosen_span = 1
+            chosen = b1
 
-        # Only merge 2 adjacent segments if merging STRICTLY improves similarity over matching either half alone!
-        if i + 1 < len(asr_segs) and (asr_segs[i + 1]["start"] - asr_segs[i]["end"]) <= 1.8:
-            comb = f"{asr_segs[i]['text']} {asr_segs[i + 1]['text']}"
-            b2 = _best_single(comb, prev_line)
-            b_next = _best_single(asr_segs[i + 1]["text"], b1[1] if b1 else prev_line)
-            s1_raw = b1[2] if b1 else 0.0
-            s_next_raw = b_next[2] if b_next else 0.0
-            if b2 and b2[2] > max(s1_raw, s_next_raw) + 0.06:
-                chosen_span = 2
-                chosen = b2
+            if idx_i + 1 < len(asr_segs) and (asr_segs[idx_i + 1]["start"] - asr_segs[idx_i]["end"]) <= 1.8:
+                comb = f"{asr_segs[idx_i]['text']} {asr_segs[idx_i + 1]['text']}"
+                b2 = _best_single(comb, prev_l)
+                b_next = _best_single(asr_segs[idx_i + 1]["text"], b1[1] if b1 else prev_l)
+                s1_raw = b1[2] if b1 else 0.0
+                s_next_raw = b_next[2] if b_next else 0.0
+                if b2 and b2[2] > max(s1_raw, s_next_raw) + 0.06:
+                    chosen_span = 2
+                    chosen = b2
 
-        if chosen and (chosen[2] >= 0.30 or (chosen[3] and chosen[2] >= 0.20)):
-            _, off, raw_sim, _ = chosen
-            ts = asr_segs[i]["start"]
-            te = asr_segs[i + chosen_span - 1]["end"]
-            if not (matched and matched[-1]["text"] == off and (ts - matched[-1]["end"]) < 2.5):
-                matched.append({"start": ts, "end": te, "text": off, "sim": raw_sim})
-                prev_line = off
-            i += chosen_span
-        else:
-            unmatched_gaps.append(asr_segs[i])
-            i += 1
+            if chosen and (chosen[2] >= 0.30 or (chosen[3] and chosen[2] >= 0.20)):
+                _, off, raw_sim, _ = chosen
+                ts = asr_segs[idx_i]["start"]
+                te = asr_segs[idx_i + chosen_span - 1]["end"]
+                if not (m_out and m_out[-1]["text"] == off and (ts - m_out[-1]["end"]) < 2.5):
+                    m_out.append({"start": ts, "end": te, "text": off, "sim": raw_sim})
+                    prev_l = off
+                idx_i += chosen_span
+            else:
+                u_gaps.append(asr_segs[idx_i])
+                idx_i += 1
+        return m_out, u_gaps
+
+    matched, unmatched_gaps = _match_against_pool(official_lines)
+    matched_asr_count = len(asr_segs) - len(unmatched_gaps)
+
+    # Smart Shazam rescue: if title-based lyrics poorly matched (<35%) — e.g. clickbait title or unlisted Mashup —
+    # run Shazam multi-track fingerprinting and re-match the ALREADY-transcribed ASR segments (0 extra Whisper time!)
+    if not shazam_already_tried and (not matched or (len(asr_segs) >= 6 and (matched_asr_count / len(asr_segs)) < 0.35)):
+        shz_lines, shz_tracks = shazam_scan_and_fetch_lyrics(
+            audio_16k, db_profile, step_sec, inst_path=inst_path, scan_mashup=True
+        )
+        if shz_lines:
+            m2, g2 = _match_against_pool(shz_lines)
+            if (len(asr_segs) - len(g2)) > matched_asr_count:
+                official_lines = shz_lines
+                matched, unmatched_gaps = m2, g2
+                matched_asr_count = len(asr_segs) - len(unmatched_gaps)
+
+    # Mashup / Medley Lyric-Phrase Rescue: if there is a sustained unrecognized singing cluster (>= 4 segments, >= 16s)
+    # — e.g. Song #2 in a live/acoustic Mashup that Shazam couldn't fingerprint — identify it by sung lyric phrases!
+    def _find_sustained_unmatched_clusters(gaps: list[dict]) -> list[list[dict]]:
+        clusters: list[list[dict]] = []
+        for g in gaps:
+            if not clusters or (g["start"] - clusters[-1][-1]["end"]) > 10.0:
+                clusters.append([g])
+            else:
+                clusters[-1].append(g)
+        return [c for c in clusters if len(c) >= 4 and (c[-1]["end"] - c[0]["start"]) >= 16.0]
+
+    extra_clusters = _find_sustained_unmatched_clusters(unmatched_gaps)
+    if extra_clusters:
+        added_pool = False
+        for cl in extra_clusters[:3]:
+            rescued = search_official_lyrics_by_sung_phrases(cl)
+            if rescued:
+                official_lines = list(official_lines) + rescued
+                added_pool = True
+        if added_pool:
+            matched, unmatched_gaps = _match_against_pool(official_lines)
+            matched_asr_count = len(asr_segs) - len(unmatched_gaps)
 
     if not matched:
         return []
 
-    # Parody / Rewritten-lyrics detection: if < 35% of active singing segments match official lyrics
-    # (e.g. singer rewrote/adapted the lyrics), show what the singer ACTUALLY sang instead of forcing wrong lyrics!
-    matched_asr_count = len(asr_segs) - len(unmatched_gaps)
+    # Parody / Rewritten-lyrics detection: if < 35% of active singing segments STILL don't match any official lyrics,
+    # show what the singer ACTUALLY sang instead of forcing wrong lyrics!
     if len(asr_segs) >= 6 and (matched_asr_count / len(asr_segs)) < 0.35:
         print(
             f"[Lyrics] Low official-lyrics match ({matched_asr_count}/{len(asr_segs)}); "
@@ -708,6 +978,13 @@ def _live_section_anchored_align(
                 if bridge:
                     filled.append({"start": between[0]["start"], "end": between[-1]["end"], "text": bridge, "sim": 0.0})
     matched = filled
+
+    # If a sustained unrecognized singing cluster STILL remains (e.g. an unreleased/parody section inside a Mashup),
+    # keep those sung ASR lines so Mashup viewers never face a blank screen!
+    for cl in _find_sustained_unmatched_clusters(unmatched_gaps):
+        for g in cl:
+            matched.append({"start": g["start"], "end": g["end"], "text": g["text"], "sim": 0.0})
+    matched.sort(key=lambda x: x["start"])
 
     # Group into contiguous singing blocks (split on gaps > 4.5s) and align each block on its own audio slice!
     blocks: list[list[dict]] = []
@@ -782,6 +1059,8 @@ def align_official_lyrics_with_stable_ts(
     device_mode: str,
     first_onset: float,
     prefer_live: bool = False,
+    inst_path: Optional[Path] = None,
+    shazam_already_tried: bool = False,
 ) -> tuple[list[dict], str, bool]:
     """Force-align 100% REAL official lyrics text directly onto isolated vocals.mp3.
     Automatically detects mid-song starts, skipped/swapped concert verses, or encores and
@@ -815,11 +1094,11 @@ def align_official_lyrics_with_stable_ts(
         else:
             raise
 
-    # For known Live/Concert/Short clips, skip the wasted monolithic Pass 1 and run fast section-anchored directly!
+    # For known Live/Concert/Short/Mashup clips, skip wasted monolithic Pass 1 and run fast section-anchored directly!
     if prefer_live:
         live_lines = _live_section_anchored_align(
             model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
-            use_cuda=(used_dev == "cuda"),
+            use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
         )
         if len(live_lines) >= 4:
             return live_lines, used_dev, True
@@ -852,7 +1131,7 @@ def align_official_lyrics_with_stable_ts(
         print(f"[Lyrics] Detected non-standard live/abridged structure ({reason}); engaging section-anchored live alignment...", flush=True)
         live_lines = _live_section_anchored_align(
             model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
-            use_cuda=(used_dev == "cuda"),
+            use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
         )
         if len(live_lines) >= 4:
             return live_lines, used_dev, True
@@ -972,11 +1251,13 @@ def main() -> int:
     parser.add_argument("--force-ai", choices=["0", "1"], default="0")
     parser.add_argument("--title", default="")
     parser.add_argument("--duration", type=float, default=0.0)
+    parser.add_argument("--inst-path", default="")
     args = parser.parse_args()
 
     status_file = Path(args.status_file)
     out_file = Path(args.out_file)
     vocals_path = Path(args.vocals_path)
+    inst_path = Path(args.inst_path) if args.inst_path else None
     force_ai = args.force_ai == "1"
     started = time.time()
 
@@ -1017,9 +1298,12 @@ def main() -> int:
             update("ready", 100, "歌詞已就緒")
             return 0
 
-        # Layer 2: Multi-source official lyrics lookup (LRCLIB + NetEase)
+        # Layer 2: Multi-source official lyrics lookup (LRCLIB + NetEase + YT Desc)
         update("running", 25, "搜尋歌詞中...")
-        lrc_synced, official_lines, lrc_src = fetch_official_lyrics(title, duration, yt_desc)
+        is_mashup_title = bool(MASHUP_KEYWORDS_RE.search(title))
+        lrc_synced, official_lines, lrc_src = (
+            (None, [], "") if is_mashup_title else fetch_official_lyrics(title, duration, yt_desc)
+        )
 
         if lrc_synced and not force_ai:
             result = {
@@ -1040,24 +1324,47 @@ def main() -> int:
 
         audio_16k, db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
 
+        # Layer 2B: Automatic Shazam audio fingerprinting for Mashups/Medleys OR videos whose title has no song name!
+        shazam_tried = False
+        shazam_tracks: list[dict] = []
+        if is_mashup_title or not official_lines:
+            update("running", 35, "辨識歌曲中...")
+            shazam_tried = True
+            shz_lines, shazam_tracks = shazam_scan_and_fetch_lyrics(
+                audio_16k, db_profile, step_sec, inst_path=inst_path, scan_mashup=is_mashup_title
+            )
+            if shz_lines:
+                official_lines = shz_lines
+
         # Layer 3A (BEST): Forced Alignment of 100% REAL official lyrics onto vocals.mp3!
-        # Automatically detects skipped/swapped concert sections or mid-song starts & re-anchors!
+        # Automatically detects skipped/swapped concert sections, mid-song starts, or mashup switches!
         if official_lines:
             update("running", 50, "對齊歌詞中...")
-            is_live_title = bool(LIVE_KEYWORDS_RE.search(title))
+            is_live_or_mashup = bool(LIVE_KEYWORDS_RE.search(title)) or is_mashup_title or len(shazam_tracks) >= 2
             ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
                 vocals_path, audio_16k, db_profile, step_sec, official_lines,
-                args.device_mode, first_onset, prefer_live=is_live_title,
+                args.device_mode, first_onset, prefer_live=is_live_or_mashup,
+                inst_path=inst_path, shazam_already_tried=shazam_tried,
             )
-            src = "live_anchored_align" if used_live else "forced_align"
+            src = "mashup_shazam_align" if len(shazam_tracks) >= 2 else ("live_anchored_align" if used_live else "forced_align")
             label = "同步歌詞"
         else:
-            # Layer 3B: Free transcription with strict RMS silence gate & HK Traditional prompt
+            # Layer 3B: Free transcription + automatic Lyric-Phrase Rescue (identifies acoustic/live covers with no title!)
             update("running", 50, "辨識歌詞中...")
             ai_lines, used_dev = fallback_free_transcribe(
                 vocals_path, args.device_mode, db_profile, step_sec, first_onset, title_hint=title
             )
-            src = "whisper_ai"
+            rescued_lines = search_official_lyrics_by_sung_phrases(ai_lines) if len(ai_lines) >= 4 else []
+            if rescued_lines:
+                update("running", 75, "對齊歌詞中...")
+                ai_lines, used_dev, _ = align_official_lyrics_with_stable_ts(
+                    vocals_path, audio_16k, db_profile, step_sec, rescued_lines,
+                    args.device_mode, first_onset, prefer_live=True,
+                    inst_path=inst_path, shazam_already_tried=True,
+                )
+                src = "phrase_rescue_align"
+            else:
+                src = "whisper_ai"
             label = "同步歌詞"
 
         if not ai_lines:
