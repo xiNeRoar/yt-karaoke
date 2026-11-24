@@ -411,22 +411,17 @@ class KaraokeSeparatorManager:
                     f"Start {video_id} ({mode}) mode={effective_mode} free_vram={free_mb:.0f}MB",
                 )
 
+                # Use --flag=value syntax so YouTube video IDs starting with '-' (e.g. -8HPO9tXnZU) never break argparse!
                 cmd = [
                     sys.executable,
                     "-u",
                     str(WORKER_SCRIPT),
-                    "--video-id",
-                    video_id,
-                    "--mode",
-                    mode,
-                    "--url",
-                    target_url,
-                    "--device-mode",
-                    effective_mode,
-                    "--cache-dir",
-                    str(self.cache_dir),
-                    "--status-file",
-                    str(status_file),
+                    f"--video-id={video_id}",
+                    f"--mode={mode}",
+                    f"--url={target_url}",
+                    f"--device-mode={effective_mode}",
+                    f"--cache-dir={self.cache_dir}",
+                    f"--status-file={status_file}",
                 ]
 
                 env = os.environ.copy()
@@ -870,29 +865,22 @@ class KaraokeSeparatorManager:
                 eff_mode = self.device_mode if has_gpu else "cpu"
                 meta = self.get_meta(video_id, mode)
 
+                # Use --flag=value syntax so video IDs or song titles starting with '-' (e.g. -8HPO9tXnZU) never break argparse!
                 cmd = [
                     sys.executable,
                     "-u",
                     str(LYRICS_WORKER_SCRIPT),
-                    "--video-id",
-                    video_id,
-                    "--vocals-path",
-                    str(vocals_path),
-                    "--out-file",
-                    str(out_file),
-                    "--status-file",
-                    str(status_file),
-                    "--device-mode",
-                    eff_mode,
-                    "--force-ai",
-                    "1" if force_ai else "0",
-                    "--title",
-                    str(meta.get("title") or ""),
-                    "--duration",
-                    str(float(meta.get("duration") or 0.0)),
+                    f"--video-id={video_id}",
+                    f"--vocals-path={vocals_path}",
+                    f"--out-file={out_file}",
+                    f"--status-file={status_file}",
+                    f"--device-mode={eff_mode}",
+                    f"--force-ai={'1' if force_ai else '0'}",
+                    f"--title={meta.get('title') or ''}",
+                    f"--duration={float(meta.get('duration') or 0.0)}",
                 ]
                 if inst_path and inst_path.exists():
-                    cmd.extend(["--inst-path", str(inst_path)])
+                    cmd.append(f"--inst-path={inst_path}")
                 ly_env = os.environ.copy()
                 if eff_mode == "cpu":
                     ly_env["CUDA_VISIBLE_DEVICES"] = "-1"
