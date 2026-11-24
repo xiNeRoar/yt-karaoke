@@ -102,14 +102,11 @@ def friendly_error_message(exc: Exception) -> str:
     return "暫時無法處理此影片，請稍後再試"
 
 
+from atomic_io import write_json_atomic
+
+
 def write_status(status_file: Path, payload: dict) -> None:
-    payload["updated_at"] = time.time()
-    tmp = status_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.replace(tmp, status_file)
-    except Exception:
-        status_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    write_json_atomic(status_file, payload, stamp_updated_at=True)
 
 
 def main() -> int:

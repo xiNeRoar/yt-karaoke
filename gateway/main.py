@@ -195,7 +195,10 @@ class GatewayState:
                                         (AUDIO_CACHE_DIR / f"{evid}_pure_{stem}.mp3").unlink(missing_ok=True)
                                     except Exception:
                                         pass
-                                print(f"[Gateway] Evicted stale cpu_fast NAS cache for upgraded HQ song {evid}", flush=True)
+                                with self._lock:
+                                    self._lyrics_ram.pop(evid, None)
+                                    self._lyrics_missing.discard(evid)
+                                print(f"[Gateway] Evicted stale NAS audio + lyrics cache for upgraded HQ song {evid}", flush=True)
                             print(f"[Gateway] Synced {len(cleaned)} songs via _catalog.json (fast path)", flush=True)
                             return len(cleaned)
             except Exception as exc:
@@ -531,13 +534,16 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
         gw.touch_client(x_karaoke_client, _client_ip(request))
     songs = gw.list_songs()
     ai_available = gw.gpu_online and not gw.gpu_pause_new
+    total_mb = round(sum(float(s.get("size_mb") or 0) for s in songs), 2)
+    latest_ts = max((float(s.get("created_at") or 0) for s in songs), default=0.0)
     return {
         "status": "ok",
         "gateway_mode": True,
         "gpu_online": ai_available,
         "gpu_offline_message": "" if ai_available else OFFLINE_MSG,
         "cache_count": len(songs),
-        "cache_size_mb": round(sum(s["size_mb"] for s in songs), 2),
+        "catalog_version": f"{len(songs)}:{total_mb:.2f}:{latest_ts:.2f}" if songs else "0:0:0",
+        "cache_size_mb": total_mb,
         "queue_count": gw.gpu_queue_count if gw.gpu_online else 0,
         **gw.client_counts(),
     }
@@ -684,15 +690,32 @@ def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental"
             media_type="audio/mpeg",
             headers={"Cache-Control": "public, max-age=86400"},
         )
-    # Fallback proxy to GPU PC if just finished separating before index synced
+    # Fallback proxy to GPU PC if just finished separating before index synced.
+    # Verify upstream HTTP 200 BEFORE starting StreamingResponse so errors NEVER return a 200 OK 0-byte MP3!
     if gw.gpu_online and GPU_NODE_URL:
+        client = httpx.Client(timeout=120.0)
+        try:
+            req = client.build_request("GET", f"{GPU_NODE_URL}/api/audio/{video_id}/{mode}/{stem}", headers=gw._worker_headers())
+            upstream = client.send(req, stream=True)
+            if upstream.status_code != 200:
+                upstream.close()
+                client.close()
+                raise HTTPException(status_code=upstream.status_code if upstream.status_code in (404, 503) else 502, detail="Audio stem not ready")
+        except HTTPException:
+            raise
+        except Exception:
+            client.close()
+            raise HTTPException(status_code=502, detail="Upstream audio unavailable")
+
         def _proxy_stream():
-            with httpx.stream("GET", f"{GPU_NODE_URL}/api/audio/{video_id}/{mode}/{stem}", headers=gw._worker_headers(), timeout=120.0) as r:
-                if r.status_code != 200:
-                    return
-                for chunk in r.iter_bytes(65536):
+            try:
+                for chunk in upstream.iter_bytes(65536):
                     yield chunk
-        return StreamingResponse(_proxy_stream(), media_type="audio/mpeg", headers={"Cache-Control": "public, max-age=86400"})
+            finally:
+                upstream.close()
+                client.close()
+
+        return StreamingResponse(_proxy_stream(), media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
     raise HTTPException(status_code=404, detail="Audio stem not found")
 
 

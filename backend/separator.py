@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+from atomic_io import write_json_atomic as _write_json_atomic
 from logger import CloudSyncedLogger
 from storage import GoogleDriveStorage, find_rclone_exe
 
@@ -54,18 +55,6 @@ def find_ffmpeg_dir() -> Optional[str]:
         for match in root.rglob("ffmpeg.exe"):
             return str(match.parent)
     return None
-
-
-def _write_json_atomic(path: Path, payload: dict) -> None:
-    """Atomically write JSON status files via tmp + os.replace so concurrent /api/status reads never see torn JSON."""
-    payload["updated_at"] = time.time()
-    tmp = path.with_suffix(".tmp")
-    text = json.dumps(payload, ensure_ascii=False)
-    tmp.write_text(text, encoding="utf-8")
-    try:
-        os.replace(tmp, path)
-    except Exception:
-        path.write_text(text, encoding="utf-8")
 
 
 def query_nvidia_gpu() -> tuple[bool, str, float, float]:

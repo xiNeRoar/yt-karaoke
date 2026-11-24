@@ -981,14 +981,23 @@
     if (now <= line.start) return 0;
     if (now >= line.end) return 1;
 
-    // Smooth word-weighted sweep when word-level timestamps exist
+    // Smooth visual-width-weighted sweep when word-level timestamps exist (accurate for mixed CJK + English!)
     if (line.words && line.words.length > 0) {
+      const wordVisualWidth = (s) => {
+        let u = 0;
+        for (const ch of s || "") {
+          if (/\s/.test(ch)) u += 0.35;
+          else if (/[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(ch)) u += 1.0;
+          else u += 0.56;
+        }
+        return Math.max(0.4, u);
+      };
       let totalWeight = 0;
       const weights = [];
       for (const w of line.words) {
-        const len = Math.max(1, (w.word || "").length);
-        weights.push(len);
-        totalWeight += len;
+        const wt = wordVisualWidth(w.word || "");
+        weights.push(wt);
+        totalWeight += wt;
       }
       let acc = 0;
       for (let i = 0; i < line.words.length; i++) {
@@ -1216,10 +1225,10 @@
           state.lyricsSourceLabel = d.source_label || "";
           startLyricsRenderLoop();
           updateUI();
-        } else if (d.status === "error") {
+        } else if (d.status === "error" || d.status === "idle") {
           stopLyricsPolling();
           state.lyricsLoading = false;
-          if (ov) ov.statusEl.textContent = d.stage_text || d.error || "無法生成歌詞";
+          if (ov) ov.statusEl.textContent = d.status === "idle" ? "請再按一次載入歌詞" : (d.stage_text || d.error || "無法生成歌詞");
           updateUI();
         } else if (ov) {
           ov.statusEl.textContent = d.stage_text || "載入歌詞中...";
