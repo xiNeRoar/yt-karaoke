@@ -254,11 +254,13 @@ def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str)
     if not t_base_norm or not y_norm:
         return 0.0
 
-    # Must actually match the song's track name (not just the artist name!)
+    # Must actually match the song's track name (not a 1-char substring of an artist name!)
     score = 0.0
-    if t_base_norm in y_norm:
-        # Strong exact track-name containment; longer track names score higher
-        score = 1.0 + min(0.5, len(t_base_norm) * 0.05)
+    if t_base_norm == y_norm:
+        score = 2.0
+    elif len(t_base_norm) >= 2 and t_base_norm in y_norm:
+        # Strong exact track-name containment; longer track names score clearly higher
+        score = 1.0 + min(0.8, len(t_base_norm) * 0.12)
     else:
         # Fuzzy fallback for minor spelling differences (Traditional/Simplified/punctuation)
         cjk_t = set(re.findall(r"[\u4e00-\u9fff]", t_base_norm))
@@ -267,7 +269,7 @@ def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str)
             overlap = len(cjk_t & cjk_y) / len(cjk_t)
             if overlap >= 0.75:
                 score = overlap
-        else:
+        elif len(t_base_norm) >= 2:
             sim = SequenceMatcher(None, t_base_norm, y_norm).ratio()
             if sim >= 0.65:
                 score = sim
