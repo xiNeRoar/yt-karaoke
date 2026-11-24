@@ -740,19 +740,33 @@
     }
   }
 
-  // Real HK KTV line-breaking standard: keep every CJK line crisp (<= 11 chars) and English <= 34 chars,
-  // splitting on natural phrase spaces or the singer's actual breath pause from word timestamps!
-  function normalizeKtvLines(rawLines) {
+  // Real HK KTV line-breaking standard (NO font shrinking ever!):
+  // Uses Chromium's native Intl.Segmenter("zh-Hant", { granularity: "word" }) + singer breath pauses
+  // so Chinese words/idioms (e.g. 傷春悲秋) are NEVER torn in half and every line keeps 100% uniform KTV font size!
+  const _zhWordSegmenter =
+    typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+      ? new Intl.Segmenter("zh-Hant", { granularity: "word" })
+      : null;
+
+  function normalizeKtvLines(rawLines, maxCjkUnits = 10.5) {
     if (!Array.isArray(rawLines) || rawLines.length === 0) return [];
     const out = [];
 
     const nonSpaceLen = (s) => (s || "").replace(/\s+/g, "").length;
+    const visualUnits = (s) => {
+      let u = 0;
+      for (const ch of s || "") {
+        if (/\s/.test(ch)) u += 0.35;
+        else if (/[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(ch)) u += 1.0;
+        else u += 0.56;
+      }
+      return u;
+    };
     const isCjkText = (s) => {
       const cjk = (s.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
       return cjk >= 3 || (nonSpaceLen(s) > 0 && cjk / nonSpaceLen(s) >= 0.35);
     };
 
-    // Map character offsets (ignoring spaces) to word objects for exact breath-pause splitting
     function buildCharWordMap(words) {
       const map = [];
       if (!Array.isArray(words)) return map;
@@ -760,40 +774,67 @@
         const w = words[wi];
         const clean = (w.word || "").replace(/\s+/g, "");
         for (let k = 0; k < clean.length; k++) {
-          map.push({ wi, isLastInWord: k === clean.length - 1, w });
+          map.push({ wi, w });
         }
       }
       return map;
     }
 
-    function splitLongCjkPiece(piece, charOffset, charMap, maxChars) {
-      const len = piece.length;
-      if (len <= maxChars) return [piece];
-      const partsNeeded = Math.ceil(len / maxChars);
-      const target = Math.round(len / partsNeeded);
-      const minCut = Math.max(3, Math.floor(target * 0.68));
-      const maxCut = Math.min(len - 3, Math.ceil(target * 1.32));
+    function getValidCjkWordCuts(piece) {
+      const cuts = new Set();
+      if (_zhWordSegmenter) {
+        for (const seg of _zhWordSegmenter.segment(piece)) {
+          const endIdx = seg.index + seg.segment.length;
+          if (endIdx > 0 && endIdx < piece.length) cuts.add(endIdx);
+        }
+      }
+      return cuts;
+    }
 
-      // Prefer splitting right at the singer's longest breath pause between words inside [minCut..maxCut]
+    function splitLongCjkPiece(piece, charOffset, charMap, maxUnits) {
+      if (visualUnits(piece) <= maxUnits || piece.length <= 4) return [piece];
+      const len = piece.length;
+      const partsNeeded = Math.max(2, Math.ceil(visualUnits(piece) / (maxUnits - 0.5)));
+      const target = Math.round(len / partsNeeded);
+      const minCut = Math.max(3, Math.floor(target * 0.58));
+      const maxCut = Math.min(len - 3, Math.ceil(target * 1.42));
+      const wordCuts = getValidCjkWordCuts(piece);
+
       let bestCut = Math.max(minCut, Math.min(maxCut, target));
-      let bestGap = -1;
+      let bestScore = -1e9;
+
       for (let c = minCut; c <= maxCut; c++) {
+        const headText = piece.slice(0, c);
+        // Never allow a head chunk that still exceeds maxUnits if a shorter valid cut exists
+        const overPenalty = visualUnits(headText) > maxUnits ? -3.0 : 0.0;
+        // Strong preference for real Chinese word/idiom boundaries from Intl.Segmenter
+        const isGrammaticalCut = wordCuts.size === 0 || wordCuts.has(c);
+        const grammarBonus = isGrammaticalCut ? 2.5 : -2.5;
+
+        // Breath pause bonus from Whisper word timestamps
+        let gapBonus = 0;
         const idxA = charOffset + c - 1;
         const idxB = charOffset + c;
         if (idxA >= 0 && idxB < charMap.length && charMap[idxA].wi !== charMap[idxB].wi) {
-          const gap = (charMap[idxB].w.start || 0) - (charMap[idxA].w.end || 0);
-          // Slight tie-breaker favoring balanced split near target
-          const score = gap - Math.abs(c - target) * 0.015;
-          if (score > bestGap) {
-            bestGap = score;
-            bestCut = c;
-          }
+          const gap = Math.max(0, (charMap[idxB].w.start || 0) - (charMap[idxA].w.end || 0));
+          gapBonus = Math.min(2.0, gap * 2.2);
+        }
+
+        // Balance bonus: stay close to balanced split and avoid tiny 2-char tails
+        const tailLen = len - c;
+        const orphanPenalty = (c <= 2 || tailLen <= 2) ? -2.0 : 0.0;
+        const balancePenalty = -Math.abs(c - target) * 0.28;
+
+        const score = overPenalty + grammarBonus + gapBonus + orphanPenalty + balancePenalty;
+        if (score > bestScore) {
+          bestScore = score;
+          bestCut = c;
         }
       }
 
       const head = piece.slice(0, bestCut).trim();
       const tail = piece.slice(bestCut).trim();
-      return [head, ...splitLongCjkPiece(tail, charOffset + bestCut, charMap, maxChars)];
+      return [head, ...splitLongCjkPiece(tail, charOffset + bestCut, charMap, maxUnits)];
     }
 
     for (const line of rawLines) {
@@ -805,19 +846,19 @@
       const cjk = isCjkText(text);
 
       let subTexts = [text];
-      if (cjk && nonSpaceLen(text) > 11) {
+      if (cjk && visualUnits(text) > maxCjkUnits) {
         const charMap = buildCharWordMap(words);
         const rawPieces = text
           .split(/[\s,，、；;]+/)
           .map((s) => s.trim())
           .filter(Boolean);
 
-        // First break any overly long spaceless chunk (e.g. 17-char lyric) at breath pause / balanced midpoint
+        // Break any overly long spaceless chunk at real Chinese word boundaries + breath pauses
         const atomPieces = [];
         let cursor = 0;
         for (const p of rawPieces) {
-          if (p.length > 11) {
-            const broken = splitLongCjkPiece(p, cursor, charMap, 10);
+          if (visualUnits(p) > maxCjkUnits) {
+            const broken = splitLongCjkPiece(p, cursor, charMap, maxCjkUnits);
             for (const b of broken) atomPieces.push(b);
           } else {
             atomPieces.push(p);
@@ -825,25 +866,27 @@
           cursor += p.length;
         }
 
-        // Greedily combine short adjacent phrases only if combined <= 11 CJK chars
+        // Greedily combine short adjacent phrases ONLY when combined fits cleanly within maxCjkUnits
         subTexts = [];
         for (const p of atomPieces) {
-          if (subTexts.length > 0 && nonSpaceLen(subTexts[subTexts.length - 1]) + nonSpaceLen(p) <= 11) {
+          if (subTexts.length > 0 && visualUnits(`${subTexts[subTexts.length - 1]} ${p}`) <= maxCjkUnits) {
             subTexts[subTexts.length - 1] = `${subTexts[subTexts.length - 1]} ${p}`;
           } else {
             subTexts.push(p);
           }
         }
-      } else if (!cjk && text.length > 34) {
+      } else if (!cjk && visualUnits(text) > maxCjkUnits * 1.45) {
         const toks = text.split(/\s+/).filter(Boolean);
+        const enBudget = maxCjkUnits * 1.4;
         subTexts = [];
         let cur = "";
         for (const tk of toks) {
-          if (cur && (cur.length + 1 + tk.length) > 32) {
+          const cand = cur ? `${cur} ${tk}` : tk;
+          if (cur && visualUnits(cand) > enBudget) {
             subTexts.push(cur);
             cur = tk;
           } else {
-            cur = cur ? `${cur} ${tk}` : tk;
+            cur = cand;
           }
         }
         if (cur) subTexts.push(cur);
@@ -869,7 +912,6 @@
           while (wordIdx < words.length && (si === subTexts.length - 1 || collected < need)) {
             const w = words[wordIdx];
             const wlen = Math.max(1, nonSpaceLen(w.word || ""));
-            // Don't overshoot into next sub-line unless this is the first word of the sub-line
             if (si < subTexts.length - 1 && subWords.length > 0 && collected + wlen > need + 1) {
               break;
             }
@@ -937,12 +979,11 @@
     return Math.max(0, Math.min(1, (now - line.start) / dur));
   }
 
-  function setSlotContent(slot, text, progress, alignRight = false) {
+  function setSlotContent(slot, text, progress) {
     if (!text) {
       if (slot.lastText !== "") {
         slot.baseEl.textContent = "";
         slot.fillEl.textContent = "";
-        slot.wrap.style.transform = "";
         slot.lastText = "";
       }
       slot.fillEl.style.clipPath = "inset(0 100% 0 0)";
@@ -952,18 +993,6 @@
       slot.baseEl.textContent = text;
       slot.fillEl.textContent = text;
       slot.lastText = text;
-      // Auto-fit safety net: never clip off-screen on narrow windows or dense phrases
-      slot.wrap.style.transform = "";
-      const row = slot.wrap.parentElement;
-      if (row) {
-        const avail = row.clientWidth * 0.92;
-        const natural = slot.wrap.scrollWidth;
-        if (avail > 80 && natural > avail) {
-          const scale = Math.max(0.62, avail / natural);
-          slot.wrap.style.transformOrigin = alignRight ? "right center" : "left center";
-          slot.wrap.style.transform = `scale(${scale.toFixed(3)})`;
-        }
-      }
     }
     const rightPct = Math.max(0, Math.min(100, (1 - progress) * 100));
     slot.fillEl.style.clipPath = `inset(0 ${rightPct.toFixed(2)}% 0 0)`;
@@ -1070,8 +1099,8 @@
     const topLine = topIdx >= 0 ? lines[topIdx] : null;
     const bottomLine = bottomIdx >= 0 ? lines[bottomIdx] : null;
 
-    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0, false);
-    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0, true);
+    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0);
+    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0);
   }
 
   async function requestLyrics(forceAi = false) {
