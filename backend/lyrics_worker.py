@@ -197,19 +197,65 @@ def segment_has_vocal_energy(db_profile: np.ndarray, step_sec: float, start_s: f
     return float(np.percentile(seg_db, 85)) > -38.0
 
 
+def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str) -> float:
+    """Score how well a lyrics DB candidate (track_name, artist_name) matches the YouTube video title.
+    Returns 0.0 if track_name does NOT actually appear in yt_title_clean (prevents artist-only wrong-song hits
+    like returning '張敬軒 - 斷點' when searching '張敬軒 - 春秋'!).
+    """
+    t_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(track_name or "")).lower()
+    # Strip parenthetical suffixes from track_name like "春秋 (Live)" -> "春秋"
+    t_base = re.sub(r"[\(\[（【].*?[\)\]）】]", "", track_name or "")
+    t_base_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(t_base)).lower()
+    y_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(yt_title_clean or "")).lower()
+
+    if not t_base_norm or not y_norm:
+        return 0.0
+
+    # Must actually match the song's track name (not just the artist name!)
+    score = 0.0
+    if t_base_norm in y_norm:
+        # Strong exact track-name containment; longer track names score higher
+        score = 1.0 + min(0.5, len(t_base_norm) * 0.05)
+    else:
+        # Fuzzy fallback for minor spelling differences (Traditional/Simplified/punctuation)
+        cjk_t = set(re.findall(r"[\u4e00-\u9fff]", t_base_norm))
+        cjk_y = set(re.findall(r"[\u4e00-\u9fff]", y_norm))
+        if len(cjk_t) >= 2:
+            overlap = len(cjk_t & cjk_y) / len(cjk_t)
+            if overlap >= 0.75:
+                score = overlap
+        else:
+            sim = SequenceMatcher(None, t_base_norm, y_norm).ratio()
+            if sim >= 0.65:
+                score = sim
+
+    if score <= 0.0:
+        return 0.0
+
+    # Bonus if artist name also appears in the YouTube title (disambiguates same-title songs)
+    a_norm = re.sub(r"[\s\W_]+", "", to_hk_traditional(artist_name or "")).lower()
+    if a_norm and len(a_norm) >= 2 and a_norm in y_norm:
+        score += 0.4
+    elif t_norm == t_base_norm:
+        score += 0.05
+    return score
+
+
 def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tuple[Optional[list[dict]], list[str], str]:
     """Search LRCLIB + NetEase Cloud Music for 100% official lyrics text (even for live covers!).
-    Returns (exact_studio_synced_or_None, official_plain_lines, source_hint).
+    Strictly validates that the returned trackName matches the YouTube video title so artist-name queries
+    NEVER pull the wrong song (e.g. '斷點' for '張敬軒 - 春秋').
     """
     cleaned = clean_search_title(title)
     queries = []
-    # Prioritize primary CJK song title first (crucial for covers like "戀愛腦之死 Feanna Wong _17"!)
+    # 1) Always try full cleaned title FIRST ("張敬軒 春秋") so artist + song stay together!
+    if cleaned:
+        queries.append(cleaned)
+    # 2) Then try individual CJK segments (both shorter and longer, e.g. "春秋" AND "戀愛腦之死")
     cjk_parts = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
-    for p in sorted(cjk_parts, key=len, reverse=True)[:2]:
+    for p in cjk_parts:
         if p not in queries:
             queries.append(p)
-    if cleaned not in queries:
-        queries.append(cleaned)
     if title not in queries:
         queries.append(title)
 
@@ -217,9 +263,10 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
     best_synced = None
     best_lines: list[str] = []
     best_source = ""
+    best_score = 0.0
 
     # 1) LRCLIB (cleanest Traditional/English/Japanese lyrics)
-    for q in queries:
+    for q in queries[:4]:
         try:
             r = httpx.get("https://lrclib.net/api/search", params={"q": q}, timeout=8)
             if r.status_code != 200:
@@ -227,23 +274,30 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
             items = r.json()
             if not isinstance(items, list) or not items:
                 continue
-            for it in items[:5]:
+            for it in items[:10]:
+                tr_name = it.get("trackName") or ""
+                ar_name = it.get("artistName") or ""
+                match_sc = _track_matches_title(tr_name, ar_name, cleaned)
+                if match_sc <= 0.0:
+                    continue
+
                 pl = (it.get("plainLyrics") or "").strip()
                 sl = (it.get("syncedLyrics") or "").strip()
                 cand_lines = clean_lyric_lines(pl.splitlines()) if pl else [x["text"] for x in parse_lrc(sl)]
-                if len(cand_lines) >= 6 and not best_lines:
+                if len(cand_lines) >= 6 and match_sc > best_score:
+                    best_score = match_sc
                     best_lines = cand_lines
-                    best_source = f"LRCLIB ({it.get('trackName', '')})"
+                    best_source = f"LRCLIB ({tr_name})"
 
-                if not is_live_or_alt and sl and duration > 0:
+                if not is_live_or_alt and sl and duration > 0 and match_sc >= best_score:
                     it_dur = float(it.get("duration") or 0)
                     if abs(it_dur - duration) <= 2.0:
                         parsed = parse_lrc(sl)
                         if len(parsed) >= 6:
                             best_synced = parsed
                             best_source = "LRCLIB"
-                            break
-            if best_synced or best_lines:
+                            best_score = match_sc
+            if best_synced or best_score >= 1.35:
                 break
         except Exception:
             continue
@@ -251,21 +305,26 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
     # 2) NetEase Cloud Music fallback (massive HK Cantopop / Mandopop library!)
     if not best_lines:
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
-        for q in queries[:2]:
+        for q in queries[:3]:
             try:
-                r = httpx.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 5}, headers=headers, timeout=8)
+                r = httpx.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 8}, headers=headers, timeout=8)
                 songs = (r.json().get("result") or {}).get("songs") or []
-                for s in songs[:5]:
+                for s in songs[:8]:
+                    tr_name = s.get("name") or ""
+                    ar_name = " ".join((a.get("name") or "") for a in (s.get("artists") or []))
+                    match_sc = _track_matches_title(tr_name, ar_name, cleaned)
+                    if match_sc <= 0.0 or match_sc <= best_score:
+                        continue
                     lr = httpx.get("https://music.163.com/api/song/lyric", params={"id": s["id"], "lv": 1, "tv": -1}, headers=headers, timeout=8)
                     lrc = (lr.json().get("lrc") or {}).get("lyric", "")
                     if not lrc:
                         continue
                     parsed = parse_lrc(lrc)
                     if len(parsed) >= 6:
+                        best_score = match_sc
                         best_lines = [x["text"] for x in parsed]
-                        best_source = f"NetEase ({s.get('name', '')})"
-                        break
-                if best_lines:
+                        best_source = f"NetEase ({tr_name})"
+                if best_score >= 1.35:
                     break
             except Exception:
                 continue
