@@ -43,8 +43,9 @@ def test_python_compile_and_ast() -> None:
         py_files.append(WATCHER)
     builtin_names = set(dir(builtins))
     for pf in py_files:
-        py_compile.compile(str(pf), doraise=True)
-        tree = ast.parse(pf.read_text(encoding="utf-8"), filename=str(pf))
+        src = pf.read_text(encoding="utf-8")
+        compile(src, str(pf), "exec")
+        tree = ast.parse(src, filename=str(pf))
         # Structural undefined-call guard: collect every defined/imported/assigned/parameter name in module
         defined = set(builtin_names)
         for node in ast.walk(tree):
@@ -149,6 +150,7 @@ def test_worker_and_separator_invariants() -> None:
     assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
+    assert "async with Shazam() as shazam:" in lw_src, "Shazam probes must close aiohttp ClientSession via async context manager"
     # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
     assert "OrderedDict" in gw_src and "_lyrics_ram_max" in gw_src, "Gateway lyrics cache must be bounded LRU"
@@ -306,7 +308,38 @@ def test_word_bunching_deglitcher() -> None:
     ]
     rap_out = lw._smooth_bunched_words(fast_rap, 10.00, 12.10, np.array([]), 0.1)
     assert abs(rap_out[4]["end"] - 10.40) < 0.02, f"Fast rap was wrongly smeared into pause: {rap_out[4]}"
-    print("[PASS] First-principles Energy-CDF collapse recovery (fixes 0.00s collapses, 0 distortion on fast rap)")
+
+    # Case 3: Over-stretched line across a 10s silent guitar solo -> must trim to actual active vocal burst!
+    db_prof = np.full(200, -60.0, dtype=np.float32)  # 20.0s @ 0.1s/step
+    db_prof[10:25] = -14.0  # normal singing so adaptive threshold sits cleanly around -26 dBFS
+    db_prof[142:156] = -15.0  # real vocal burst at 14.2s-15.6s
+    ghost = [{"start": 4.0, "end": 16.0, "text": "(It's not over)", "words": [{"word": "over", "start": 4.0, "end": 16.0}]}]
+    trimmed = lw.refine_alignment_with_acoustics(ghost, db_prof, 0.1, 20.0, 0.0)
+    assert trimmed[0]["start"] >= 13.8 and (trimmed[0]["end"] - trimmed[0]["start"]) <= 2.5, f"Silent ghost line not trimmed: {trimmed[0]}"
+    print("[PASS] First-principles Energy-CDF collapse recovery + silent-solo trim")
+
+
+def test_silence_collapse_and_mapping() -> None:
+    import numpy as np
+    import lyrics_worker as lw
+
+    sr = 16000
+    step_s = 0.1
+    # 30s block: [2s-8s] vocal island 1, [8s-20s] 12s guitar solo (silent vocals), [20s-27s] vocal island 2
+    y = np.zeros(30 * sr, dtype=np.float32)
+    y[2 * sr : 8 * sr] = 0.2
+    y[20 * sr : 27 * sr] = 0.2
+    db_prof = np.full(300, -70.0, dtype=np.float32)
+    db_prof[20:80] = -14.0
+    db_prof[200:270] = -14.0
+
+    comp, tmap = lw.build_silence_collapsed_audio(y, db_prof, step_s, sr=sr, thr_db=-30.0)
+    assert len(tmap) == 2, f"Expected 2 vocal islands around 12s solo, got {tmap}"
+    assert len(comp) < len(y) * 0.65, "12s instrumental solo should be compressed"
+    # Second island starts around 20s - 0.35s pad = 19.65s in real time
+    mapped_second = lw._map_comp_to_real(tmap[1][0] + 0.5, tmap)
+    assert 19.5 <= mapped_second <= 21.0, f"Unexpected real-time mapping for island 2: {mapped_second}"
+    print("[PASS] Silence collapse & piecewise real-time mapping across instrumental breaks")
 
 
 def test_sidecar_watcher_cp1252_safety() -> None:
@@ -347,6 +380,7 @@ def main() -> int:
     test_invite_code_device_binding_and_revocation()
     test_generic_title_decomposition()
     test_word_bunching_deglitcher()
+    test_silence_collapse_and_mapping()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()
     print("\nALL REGRESSION TESTS PASSED!")
