@@ -1517,6 +1517,7 @@ def refine_lines_with_qwen3(
     device_mode: str,
     first_onset: float,
     max_pad_sec: float = 1.5,
+    require_all_windows: bool = False,
 ) -> tuple[list[dict], bool]:
     """Windowed batched Cantonese/multilingual word-level timestamp refinement using Qwen3-ForcedAligner-0.6B.
 
@@ -1645,7 +1646,7 @@ def refine_lines_with_qwen3(
         except Exception:
             pass
 
-        if refined_windows == 0:
+        if refined_windows == 0 or (require_all_windows and refined_windows < len(windows)):
             return lines, False
 
         # Ensure strict monotonic non-overlapping line boundaries across window edges
@@ -1920,13 +1921,24 @@ def fallback_free_transcribe(
             wt = (w.word or "").strip()
             if not wt or GARBAGE_CHARS_RE.search(wt):
                 continue
+            ws = round(max(first_onset, float(w.start)), 3)
+            we = round(max(ws, float(w.end)), 3)
             words_out.append({
-                "start": round(float(w.start), 2),
-                "end": round(float(w.end), 2),
+                "start": ws,
+                "end": we,
                 "word": to_hk_traditional(wt) if is_cjk else wt,
             })
-        lines.append({"start": round(s_start, 2), "end": round(s_end, 2), "text": txt, "words": words_out})
+        s_clamped = round(max(first_onset, s_start), 2)
+        e_clamped = round(max(s_clamped + 0.4, s_end), 2)
+        lines.append({
+            "start": s_clamped,
+            "end": e_clamped,
+            "text": txt,
+            "words": words_out or _even_words_for_line(txt, s_clamped, e_clamped),
+        })
 
+    audio_dur = (len(db_profile) * step_sec) if len(db_profile) > 0 else 0.0
+    lines = refine_alignment_with_acoustics(lines, db_profile, step_sec, audio_dur, first_onset)
     return lines, used_dev
 
 
@@ -2026,7 +2038,8 @@ def main() -> int:
             if len(audio_16k_yt) > 0:
                 update("running", 65, "精修歌詞時間軸...")
                 yt_ref, q_ok = refine_lines_with_qwen3(
-                    yt_lines, audio_16k_yt, db_prof_yt, step_yt, args.device_mode, onset_yt, max_pad_sec=1.5
+                    yt_lines, audio_16k_yt, db_prof_yt, step_yt, args.device_mode, onset_yt,
+                    max_pad_sec=1.5, require_all_windows=True,
                 )
                 if q_ok and len(yt_ref) >= 4:
                     result = {
@@ -2084,7 +2097,7 @@ def main() -> int:
 
         # Fast-path acoustic alignment when we have studio LRC scaffold + free GPU VRAM (~2.5s total with Qwen3!):
         # Auto-compensate MV-vs-Spotify intro offset using detected first_onset before running windowed Qwen3 refinement.
-        if lrc_synced and len(lrc_synced) >= 4 and len(audio_16k) > 0:
+        if lrc_synced and not force_ai and len(lrc_synced) >= 4 and len(audio_16k) > 0:
             shift = first_onset - float(lrc_synced[0]["start"])
             if abs(shift) <= 12.0:
                 audio_dur = len(audio_16k) / 16000.0
@@ -2095,7 +2108,8 @@ def main() -> int:
                     shifted_lrc.append({"start": ns, "end": ne, "text": ln["text"], "words": []})
                 update("running", 65, "精修歌詞時間軸...")
                 q_lines, q_ok = refine_lines_with_qwen3(
-                    shifted_lrc, audio_16k, db_profile, step_sec, args.device_mode, first_onset, max_pad_sec=2.5
+                    shifted_lrc, audio_16k, db_profile, step_sec, args.device_mode, first_onset,
+                    max_pad_sec=2.5, require_all_windows=True,
                 )
                 if q_ok and len(q_lines) >= 4:
                     result = {
@@ -2173,7 +2187,12 @@ def main() -> int:
                     )
                 src = "qwen3_phrase_rescue_align" if qwen_ok else "phrase_rescue_align"
             else:
-                src = "whisper_ai"
+                qwen_ok = False
+                if ai_lines:
+                    ai_lines, qwen_ok = refine_lines_with_qwen3(
+                        ai_lines, audio_16k, db_profile, step_sec, args.device_mode, first_onset
+                    )
+                src = "whisper_qwen3_ai" if qwen_ok else "whisper_ai"
             label = "同步歌詞"
 
         if not ai_lines:

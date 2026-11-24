@@ -110,11 +110,14 @@ def test_worker_and_separator_invariants() -> None:
     # 4) gateway/main.py must NEVER set max-age=86400 on fallback proxy stream and must evict _lyrics_ram on HQ upgrade
     assert 'headers={"Cache-Control": "no-store"}' in gw_src, "Gateway proxy stream must not cache 24h"
     assert "_lyrics_ram.pop(evid" in gw_src, "Gateway must evict stale lyrics RAM on HQ upgrade"
-    # 5) lyrics_worker.py must NEVER return raw 0-word youtube_sub or lrclib_exact when vocals.mp3 exists
+    # 5) Exhaustive lyrics_worker.py exit-path invariants (ALL branches under BOTH GPU-free and low-VRAM CPU!)
     lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
     assert "if not vocals_path.exists():" in lw_src, "Layer 1 youtube_sub must require word alignment when vocals exist"
     assert "if lrc_synced and not force_ai and not vocals_path.exists():" in lw_src, "Layer 2 LRC must require word alignment when vocals exist"
-    print("[PASS] Structural lifecycle & concurrency invariants (worker + separator + gateway + zero-0w lyrics)")
+    assert "require_all_windows=True" in lw_src, "0-word scaffolds must require 100% window coverage from Qwen3"
+    assert "if lrc_synced and not force_ai and len(lrc_synced)" in lw_src, "force_ai=True must bypass LRC scaffold shortcut"
+    assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
+    print("[PASS] Structural lifecycle, concurrency & ALL-6-exit-path invariants")
 
 
 def test_generic_title_decomposition() -> None:
