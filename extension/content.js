@@ -740,6 +740,167 @@
     }
   }
 
+  // Real HK KTV line-breaking standard: keep every CJK line crisp (<= 11 chars) and English <= 34 chars,
+  // splitting on natural phrase spaces or the singer's actual breath pause from word timestamps!
+  function normalizeKtvLines(rawLines) {
+    if (!Array.isArray(rawLines) || rawLines.length === 0) return [];
+    const out = [];
+
+    const nonSpaceLen = (s) => (s || "").replace(/\s+/g, "").length;
+    const isCjkText = (s) => {
+      const cjk = (s.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g) || []).length;
+      return cjk >= 3 || (nonSpaceLen(s) > 0 && cjk / nonSpaceLen(s) >= 0.35);
+    };
+
+    // Map character offsets (ignoring spaces) to word objects for exact breath-pause splitting
+    function buildCharWordMap(words) {
+      const map = [];
+      if (!Array.isArray(words)) return map;
+      for (let wi = 0; wi < words.length; wi++) {
+        const w = words[wi];
+        const clean = (w.word || "").replace(/\s+/g, "");
+        for (let k = 0; k < clean.length; k++) {
+          map.push({ wi, isLastInWord: k === clean.length - 1, w });
+        }
+      }
+      return map;
+    }
+
+    function splitLongCjkPiece(piece, charOffset, charMap, maxChars) {
+      const len = piece.length;
+      if (len <= maxChars) return [piece];
+      const partsNeeded = Math.ceil(len / maxChars);
+      const target = Math.round(len / partsNeeded);
+      const minCut = Math.max(3, Math.floor(target * 0.68));
+      const maxCut = Math.min(len - 3, Math.ceil(target * 1.32));
+
+      // Prefer splitting right at the singer's longest breath pause between words inside [minCut..maxCut]
+      let bestCut = Math.max(minCut, Math.min(maxCut, target));
+      let bestGap = -1;
+      for (let c = minCut; c <= maxCut; c++) {
+        const idxA = charOffset + c - 1;
+        const idxB = charOffset + c;
+        if (idxA >= 0 && idxB < charMap.length && charMap[idxA].wi !== charMap[idxB].wi) {
+          const gap = (charMap[idxB].w.start || 0) - (charMap[idxA].w.end || 0);
+          // Slight tie-breaker favoring balanced split near target
+          const score = gap - Math.abs(c - target) * 0.015;
+          if (score > bestGap) {
+            bestGap = score;
+            bestCut = c;
+          }
+        }
+      }
+
+      const head = piece.slice(0, bestCut).trim();
+      const tail = piece.slice(bestCut).trim();
+      return [head, ...splitLongCjkPiece(tail, charOffset + bestCut, charMap, maxChars)];
+    }
+
+    for (const line of rawLines) {
+      const text = (line && line.text ? String(line.text) : "").trim();
+      if (!text) continue;
+      const start = Number(line.start) || 0;
+      const end = Math.max(start + 0.3, Number(line.end) || start + 3);
+      const words = Array.isArray(line.words) ? line.words : [];
+      const cjk = isCjkText(text);
+
+      let subTexts = [text];
+      if (cjk && nonSpaceLen(text) > 11) {
+        const charMap = buildCharWordMap(words);
+        const rawPieces = text
+          .split(/[\s,，、；;]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+        // First break any overly long spaceless chunk (e.g. 17-char lyric) at breath pause / balanced midpoint
+        const atomPieces = [];
+        let cursor = 0;
+        for (const p of rawPieces) {
+          if (p.length > 11) {
+            const broken = splitLongCjkPiece(p, cursor, charMap, 10);
+            for (const b of broken) atomPieces.push(b);
+          } else {
+            atomPieces.push(p);
+          }
+          cursor += p.length;
+        }
+
+        // Greedily combine short adjacent phrases only if combined <= 11 CJK chars
+        subTexts = [];
+        for (const p of atomPieces) {
+          if (subTexts.length > 0 && nonSpaceLen(subTexts[subTexts.length - 1]) + nonSpaceLen(p) <= 11) {
+            subTexts[subTexts.length - 1] = `${subTexts[subTexts.length - 1]} ${p}`;
+          } else {
+            subTexts.push(p);
+          }
+        }
+      } else if (!cjk && text.length > 34) {
+        const toks = text.split(/\s+/).filter(Boolean);
+        subTexts = [];
+        let cur = "";
+        for (const tk of toks) {
+          if (cur && (cur.length + 1 + tk.length) > 32) {
+            subTexts.push(cur);
+            cur = tk;
+          } else {
+            cur = cur ? `${cur} ${tk}` : tk;
+          }
+        }
+        if (cur) subTexts.push(cur);
+      }
+
+      if (subTexts.length <= 1) {
+        out.push({ start, end, text, words });
+        continue;
+      }
+
+      // Slice word timestamps (or proportional timing) cleanly across every split KTV sub-line
+      const totalChars = Math.max(1, subTexts.reduce((acc, s) => acc + nonSpaceLen(s), 0));
+      let wordIdx = 0;
+      let elapsedChars = 0;
+
+      for (let si = 0; si < subTexts.length; si++) {
+        const stxt = subTexts[si];
+        const need = Math.max(1, nonSpaceLen(stxt));
+        const subWords = [];
+
+        if (words.length > 0 && wordIdx < words.length) {
+          let collected = 0;
+          while (wordIdx < words.length && (si === subTexts.length - 1 || collected < need)) {
+            const w = words[wordIdx];
+            const wlen = Math.max(1, nonSpaceLen(w.word || ""));
+            // Don't overshoot into next sub-line unless this is the first word of the sub-line
+            if (si < subTexts.length - 1 && subWords.length > 0 && collected + wlen > need + 1) {
+              break;
+            }
+            subWords.push(w);
+            collected += wlen;
+            wordIdx++;
+          }
+        }
+
+        let subStart;
+        let subEnd;
+        if (subWords.length > 0) {
+          subStart = Number(subWords[0].start);
+          subEnd = Math.max(subStart + 0.25, Number(subWords[subWords.length - 1].end));
+        } else {
+          subStart = start + ((end - start) * elapsedChars) / totalChars;
+          subEnd = start + ((end - start) * (elapsedChars + need)) / totalChars;
+        }
+        elapsedChars += need;
+        out.push({
+          start: Math.round(subStart * 100) / 100,
+          end: Math.round(Math.max(subStart + 0.25, subEnd) * 100) / 100,
+          text: stxt,
+          words: subWords,
+        });
+      }
+    }
+
+    return out;
+  }
+
   function computeLineSweepProgress(line, now) {
     if (!line) return 0;
     if (now <= line.start) return 0;
@@ -776,11 +937,12 @@
     return Math.max(0, Math.min(1, (now - line.start) / dur));
   }
 
-  function setSlotContent(slot, text, progress) {
+  function setSlotContent(slot, text, progress, alignRight = false) {
     if (!text) {
       if (slot.lastText !== "") {
         slot.baseEl.textContent = "";
         slot.fillEl.textContent = "";
+        slot.wrap.style.transform = "";
         slot.lastText = "";
       }
       slot.fillEl.style.clipPath = "inset(0 100% 0 0)";
@@ -790,6 +952,18 @@
       slot.baseEl.textContent = text;
       slot.fillEl.textContent = text;
       slot.lastText = text;
+      // Auto-fit safety net: never clip off-screen on narrow windows or dense phrases
+      slot.wrap.style.transform = "";
+      const row = slot.wrap.parentElement;
+      if (row) {
+        const avail = row.clientWidth * 0.92;
+        const natural = slot.wrap.scrollWidth;
+        if (avail > 80 && natural > avail) {
+          const scale = Math.max(0.62, avail / natural);
+          slot.wrap.style.transformOrigin = alignRight ? "right center" : "left center";
+          slot.wrap.style.transform = `scale(${scale.toFixed(3)})`;
+        }
+      }
     }
     const rightPct = Math.max(0, Math.min(100, (1 - progress) * 100));
     slot.fillEl.style.clipPath = `inset(0 ${rightPct.toFixed(2)}% 0 0)`;
@@ -896,8 +1070,8 @@
     const topLine = topIdx >= 0 ? lines[topIdx] : null;
     const bottomLine = bottomIdx >= 0 ? lines[bottomIdx] : null;
 
-    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0);
-    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0);
+    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0, false);
+    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0, true);
   }
 
   async function requestLyrics(forceAi = false) {
@@ -935,7 +1109,7 @@
 
     if (res.data && res.data.status === "ready" && res.data.lines) {
       state.lyricsLoading = false;
-      state.lyricsLines = res.data.lines;
+      state.lyricsLines = normalizeKtvLines(res.data.lines);
       state.lyricsSourceLabel = res.data.source_label || "";
       startLyricsRenderLoop();
       updateUI();
@@ -954,7 +1128,7 @@
         if (d.status === "ready" && d.lines) {
           stopLyricsPolling();
           state.lyricsLoading = false;
-          state.lyricsLines = d.lines;
+          state.lyricsLines = normalizeKtvLines(d.lines);
           state.lyricsSourceLabel = d.source_label || "";
           startLyricsRenderLoop();
           updateUI();
