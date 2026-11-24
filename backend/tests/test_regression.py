@@ -317,11 +317,14 @@ def test_word_bunching_deglitcher() -> None:
     trimmed = lw.refine_alignment_with_acoustics(ghost, db_prof, 0.1, 20.0, 0.0)
     assert trimmed[0]["start"] >= 13.8 and (trimmed[0]["end"] - trimmed[0]["start"]) <= 2.5, f"Silent ghost line not trimmed: {trimmed[0]}"
 
-    # Case 4: High-dynamic-range rock (-5 dBFS) + quiet ballad (-33 dBFS) + silence (-60 dBFS) -> threshold must see ballad!
+    # Case 4: Adaptive threshold mathematical invariant (p15 < thr < p90) across BOTH high-DR AND compressed live stems!
     hdr_prof = np.concatenate([np.full(50, -60.0), np.full(50, -33.0), np.full(50, -5.0)]).astype(np.float32)
     hdr_thr = lw._adaptive_vocal_threshold_db(hdr_prof)
     assert -45.0 <= hdr_thr < -33.0, f"High-DR threshold blinded quiet ballad verse: {hdr_thr:.1f} dBFS"
-    print("[PASS] First-principles Energy-CDF recovery + silent-solo trim + high-DR adaptive threshold")
+    comp_live = np.concatenate([np.full(30, -33.0), np.full(60, -28.0), np.full(30, -24.1)]).astype(np.float32)
+    comp_thr = lw._adaptive_vocal_threshold_db(comp_live)
+    assert -33.0 < comp_thr < -28.0, f"Compressed live threshold must lie strictly between p15 (-33) and p50 (-28), got {comp_thr:.1f}"
+    print("[PASS] First-principles Energy-CDF recovery + silent-solo trim + bounded scale-invariant threshold")
 
 
 def test_silence_collapse_and_mapping() -> None:

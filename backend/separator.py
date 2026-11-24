@@ -1214,7 +1214,7 @@ class KaraokeSeparatorManager:
                     self._active_procs[key] = proc
 
                 dur_sec = float(meta.get("duration") or 0.0)
-                lyrics_timeout = max(240, min(900, int(dur_sec * 1.15)))
+                lyrics_timeout = max(240, min(900, int(dur_sec * 1.25)))
                 try:
                     _, stderr_text = proc.communicate(timeout=lyrics_timeout)
                 except subprocess.TimeoutExpired:
@@ -1235,6 +1235,10 @@ class KaraokeSeparatorManager:
                         data = json.loads(out_file.read_text(encoding="utf-8"))
                         if data.get("lines"):
                             self._put_lyrics_mem(video_id, data)
+                            _write_json_atomic(
+                                status_file,
+                                {"video_id": video_id, "status": "ready", "progress": 100, "stage_text": "歌詞已就緒", "error": None},
+                            )
                     except Exception:
                         pass
 
@@ -1252,11 +1256,23 @@ class KaraokeSeparatorManager:
                         threading.Thread(target=_bg_upload_lyrics, daemon=True, name=f"ul-lyrics-{video_id}").start()
                     self.log.info("Lyrics", f"Ready for {video_id} (force_ai={force_ai})")
                     self.log.trigger_sync_async()
-                elif proc.returncode != 0:
-                    self.log.error(
-                        "Lyrics",
-                        f"Worker failed ({video_id}, rc={proc.returncode}): {(stderr_text or '')[-1500:]}",
-                    )
+                else:
+                    if proc.returncode != 0:
+                        self.log.error(
+                            "Lyrics",
+                            f"Worker failed ({video_id}, rc={proc.returncode}): {(stderr_text or '')[-1500:]}",
+                        )
+                    else:
+                        self.log.error("Lyrics", f"Worker exited 0 without output ({video_id})")
+                    # Never leave status_file stuck in "running" if worker crashed/exited unexpectedly
+                    cur_status = ""
+                    if status_file.exists():
+                        try:
+                            cur_status = str(json.loads(status_file.read_text(encoding="utf-8")).get("status") or "")
+                        except Exception:
+                            cur_status = ""
+                    if cur_status != "error":
+                        raise RuntimeError("暫未能對齊歌詞")
         except Exception as exc:
             self.log.error("Lyrics", f"Exception ({video_id}): {exc}")
             try:

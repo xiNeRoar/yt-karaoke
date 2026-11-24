@@ -236,21 +236,17 @@ def parse_lrc(lrc_text: str) -> list[dict]:
 
 
 def _adaptive_vocal_threshold_db(db_profile: np.ndarray, margin_db: float = 0.0) -> float:
-    """Compute a song-adaptive vocal activity threshold from the track's own loudness distribution.
-    Handles both low-DR recordings AND wide-dynamic-range tracks (e.g. loud rock chorus at -5 dBFS
-    paired with soft ballad verses at -33 dBFS) without letting loud peaks blind quiet singing!
+    """Compute a mathematically bounded, scale-invariant vocal activity threshold strictly inside (p15, p90).
+    Handles compressed live stems (dr ~ 9 dB), clean studio stems (dr ~ 50 dB), and high-DR rock+ballad tracks!
     """
     if len(db_profile) < 10:
         return -40.0 + margin_db
     p15 = float(np.percentile(db_profile, 15))
     p90 = float(np.percentile(db_profile, 90))
-    dr = p90 - p15
-    if dr < 8.0:
-        return (p90 - 10.0) + margin_db
-    # When dynamic range is huge (e.g. rock/metal + soft ballad, dr > 28 dB), allow 30 dB below p90
-    # while staying safely >= 10 dB above the silence floor p15 so quiet verses stay visible!
-    headroom = 30.0 if dr >= 28.0 else 22.0
-    return max(p15 + 10.0, p90 - headroom) + margin_db
+    dr = max(0.0, p90 - p15)
+    base = max(p15 + 0.30 * dr, p90 - 30.0)
+    base = min(base, p15 + 0.55 * dr)
+    return base + margin_db
 
 
 def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, np.ndarray, float, float]:
@@ -2580,7 +2576,7 @@ def main() -> int:
         }
         out_file.parent.mkdir(parents=True, exist_ok=True)
         write_json_atomic(out_file, result, stamp_updated_at=False)
-        update("ready", 100, "歌詞已就緒")
+        update("finalizing", 98, "載入歌詞中...")
         return 0
     except Exception as exc:
         update("error", 0, "暫未能載入歌詞", error=str(exc))
