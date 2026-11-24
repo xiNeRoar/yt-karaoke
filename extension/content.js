@@ -1139,7 +1139,11 @@
 
     if (!res.ok) {
       state.lyricsLoading = false;
-      if (ov) ov.statusEl.textContent = "暫未能載入歌詞";
+      const friendlyErr =
+        res.status === 503 && res.data && res.data.detail
+          ? res.data.detail
+          : "暫未能載入歌詞";
+      if (ov) ov.statusEl.textContent = friendlyErr;
       updateUI();
       return;
     }
