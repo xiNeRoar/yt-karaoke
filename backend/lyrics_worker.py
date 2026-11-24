@@ -405,6 +405,8 @@ def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tup
                         best_score = match_sc
                         best_lines = clean_lyric_lines([x["text"] for x in parsed])
                         best_source = f"NetEase ({tr_name})"
+                        if not best_synced and not is_live_or_alt:
+                            best_synced = parsed
                 if best_score >= 1.35:
                     break
             except Exception:

@@ -239,6 +239,17 @@
       this.semitones = 0;
       this.masterVolume = 1.0;
       this.loadedKey = null; // `${videoId}_${mode}`
+
+      // Real-time <video> 3-band Mid-Side karaoke fallback graph (0 yt-dlp, <5ms lip-sync)
+      this.mediaSourceMap = new WeakMap(); // videoEl -> MediaElementAudioSourceNode
+      this.liveVideoEl = null;
+      this.liveSource = null;
+      this.dryBypassGain = null;
+      this.liveInputGain = null;
+      this.liveMidGain = null;
+      this.liveSideGainL = null;
+      this.liveSideGainR = null;
+      this.liveMode = false;
     }
 
     async ensureContext() {
@@ -285,6 +296,88 @@
         this.mixBus.connect(this.masterGain);
         this.masterGain.connect(this.ctx.destination);
         this.pitchRouted = false;
+
+        // Build 3-band Frequency-Split Mid-Side Vocal Remover chain (<5ms latency):
+        // Preserves bass/kick (<180Hz) & cymbals/air (>4.5kHz) while cancelling center-panned vocals (180Hz-4.5kHz)
+        this.dryBypassGain = this.ctx.createGain();
+        this.dryBypassGain.gain.value = 1.0;
+        this.dryBypassGain.connect(this.ctx.destination);
+
+        this.liveInputGain = this.ctx.createGain();
+        this.liveInputGain.gain.value = 0.0;
+
+        // Band 1: Low (<180Hz) — keep full stereo bass & kick drum
+        const lowFilter = this.ctx.createBiquadFilter();
+        lowFilter.type = "lowpass";
+        lowFilter.frequency.value = 180;
+        lowFilter.Q.value = 0.707;
+        this.liveInputGain.connect(lowFilter);
+        lowFilter.connect(this.mixBus);
+
+        // Band 3: High (>4500Hz) — keep stereo cymbals & air shimmer
+        const highFilter = this.ctx.createBiquadFilter();
+        highFilter.type = "highpass";
+        highFilter.frequency.value = 4500;
+        highFilter.Q.value = 0.707;
+        this.liveInputGain.connect(highFilter);
+        highFilter.connect(this.mixBus);
+
+        // Band 2: Vocal Mid Band (180Hz - 4500Hz) -> exact Mid/Side matrix:
+        // Mid = 0.5*(L+R) scaled by vocalVolume; SideL = 0.5*(L-R), SideR = 0.5*(R-L)
+        const midLo = this.ctx.createBiquadFilter();
+        midLo.type = "highpass";
+        midLo.frequency.value = 180;
+        midLo.Q.value = 0.707;
+        const midHi = this.ctx.createBiquadFilter();
+        midHi.type = "lowpass";
+        midHi.frequency.value = 4500;
+        midHi.Q.value = 0.707;
+        this.liveInputGain.connect(midLo);
+        midLo.connect(midHi);
+
+        const splitter = this.ctx.createChannelSplitter(2);
+        const merger = this.ctx.createChannelMerger(2);
+        midHi.connect(splitter);
+
+        // Center (Mid = 0.5*(L+R)) controlled by guide vocal slider
+        const midSum = this.ctx.createGain();
+        midSum.gain.value = 0.5;
+        splitter.connect(midSum, 0);
+        splitter.connect(midSum, 1);
+        this.liveMidGain = this.ctx.createGain();
+        this.liveMidGain.gain.value = this.vocalVolume;
+        midSum.connect(this.liveMidGain);
+        this.liveMidGain.connect(merger, 0, 0);
+        this.liveMidGain.connect(merger, 0, 1);
+
+        // SideL = 0.5*(L - R)
+        const sideLPos = this.ctx.createGain();
+        sideLPos.gain.value = 0.5;
+        const sideLNeg = this.ctx.createGain();
+        sideLNeg.gain.value = -0.5;
+        splitter.connect(sideLPos, 0);
+        splitter.connect(sideLNeg, 1);
+        this.liveSideGainL = this.ctx.createGain();
+        this.liveSideGainL.gain.value = 1.35;
+        sideLPos.connect(this.liveSideGainL);
+        sideLNeg.connect(this.liveSideGainL);
+        this.liveSideGainL.connect(merger, 0, 0);
+
+        // SideR = 0.5*(R - L)
+        const sideRPos = this.ctx.createGain();
+        sideRPos.gain.value = 0.5;
+        const sideRNeg = this.ctx.createGain();
+        sideRNeg.gain.value = -0.5;
+        splitter.connect(sideRPos, 1);
+        splitter.connect(sideRNeg, 0);
+        this.liveSideGainR = this.ctx.createGain();
+        this.liveSideGainR.gain.value = 1.35;
+        sideRPos.connect(this.liveSideGainR);
+        sideRNeg.connect(this.liveSideGainR);
+        this.liveSideGainR.connect(merger, 0, 1);
+
+        merger.connect(this.mixBus);
+        this._syncLiveVocalGains();
       }
 
       // Never hang indefinitely if AudioContext.resume() waits for a user gesture
@@ -405,11 +498,65 @@
       return this.startOffset + (this.ctx.currentTime - this.startCtxTime) * this.playbackRate;
     }
 
+    _syncLiveVocalGains() {
+      if (!this.ctx || !this.liveMidGain || !this.liveSideGainL || !this.liveSideGainR) return;
+      const now = this.ctx.currentTime;
+      const v = this.vocalVolume;
+      // Gentle loudness compensation when vocals are removed (1.35 at 0% -> 1.0 exact stereo at 100%)
+      const sideBoost = 1.0 + 0.35 * (1.0 - v);
+      this.liveMidGain.gain.setTargetAtTime(v, now, 0.02);
+      this.liveSideGainL.gain.setTargetAtTime(sideBoost, now, 0.02);
+      this.liveSideGainR.gain.setTargetAtTime(sideBoost, now, 0.02);
+    }
+
+    async attachLiveVideo(video) {
+      await this.ensureContext();
+      if (!video || !this.ctx) throw new Error("搵唔到 YouTube 影片播放器");
+
+      let src = this.mediaSourceMap.get(video);
+      if (!src) {
+        src = this.ctx.createMediaElementSource(video);
+        this.mediaSourceMap.set(video, src);
+        src.connect(this.dryBypassGain);
+        src.connect(this.liveInputGain);
+      }
+      this.liveVideoEl = video;
+      this.liveSource = src;
+      this.stopSources();
+      this.liveMode = true;
+      this.setLiveRouting("karaoke");
+      this._syncLiveVocalGains();
+      // MediaElementSource already reflects video.volume, so keep masterGain at 1.0
+      this.setMasterVolume(1.0);
+    }
+
+    setLiveRouting(mode) {
+      // mode: "karaoke" (live 3-band vocal cancel) | "bypass" (original YouTube audio) | "muted" (AI stem mode)
+      if (!this.ctx || !this.dryBypassGain || !this.liveInputGain) return;
+      const now = this.ctx.currentTime;
+      if (mode === "karaoke") {
+        this.dryBypassGain.gain.setTargetAtTime(0.0, now, 0.015);
+        this.liveInputGain.gain.setTargetAtTime(1.0, now, 0.015);
+      } else if (mode === "muted") {
+        this.dryBypassGain.gain.setTargetAtTime(0.0, now, 0.015);
+        this.liveInputGain.gain.setTargetAtTime(0.0, now, 0.015);
+      } else {
+        this.dryBypassGain.gain.setTargetAtTime(1.0, now, 0.015);
+        this.liveInputGain.gain.setTargetAtTime(0.0, now, 0.015);
+      }
+    }
+
+    detachLiveVideo() {
+      this.liveMode = false;
+      this.setLiveRouting("bypass");
+    }
+
     setVocalVolume(level) {
       this.vocalVolume = Math.max(0, Math.min(1, level));
       if (this.vocGain && this.ctx) {
         this.vocGain.gain.setTargetAtTime(this.vocalVolume, this.ctx.currentTime, 0.02);
       }
+      this._syncLiveVocalGains();
     }
 
     setMasterVolume(vol) {
@@ -441,6 +588,7 @@
     videoId: null,
     mode: "pure", // "pure" | "karaoke"
     active: false,
+    liveFallback: false,
     busy: false,
     backendOnline: false,
     gpuOnline: true,
@@ -492,6 +640,7 @@
       ui.progressWrap.classList.remove("visible");
     } else {
       ui.progressWrap.classList.add("visible");
+      ui.progressFill.style.width = "0%";
     }
     ui.statusText.textContent = text || "";
     ui.statusText.classList.toggle("error", !!isError);
@@ -518,7 +667,8 @@
       ui.deviceBadge.style.display = "none";
     }
 
-    ui.toggleBtn.disabled = state.busy || !state.backendOnline || gpuRestingForNewSong;
+    // Even if backend is offline or GPU is resting, allow clicking "開始唱K" (uses instant <video> fallback!)
+    ui.toggleBtn.disabled = state.busy;
     ui.toggleBtn.classList.toggle("active", state.active);
     if (state.busy) {
       ui.toggleBtn.textContent = "準備伴奏中...";
@@ -526,8 +676,8 @@
       ui.toggleBtn.textContent = "關閉唱K";
     } else if (isCurrentModeCached) {
       ui.toggleBtn.textContent = "立即開唱";
-    } else if (gpuRestingForNewSong) {
-      ui.toggleBtn.textContent = "AI 休息中";
+    } else if (!state.backendOnline || gpuRestingForNewSong) {
+      ui.toggleBtn.textContent = "即時唱K";
     } else {
       ui.toggleBtn.textContent = "開始唱K";
     }
@@ -546,8 +696,8 @@
     ui.preset25.classList.toggle("active-preset", pct === 25);
     ui.preset100.classList.toggle("active-preset", pct === 100);
 
-    // Sync offset display & header chip visibility
-    ui.syncChip.classList.toggle("visible", state.active);
+    // Sync offset display & header chip visibility (hidden in zero-latency <video> live mode)
+    ui.syncChip.classList.toggle("visible", state.active && !state.liveFallback);
     ui.syncVal.textContent =
       state.syncOffsetMs === 0 ? "0ms" : state.syncOffsetMs > 0 ? `+${state.syncOffsetMs}ms` : `${state.syncOffsetMs}ms`;
     ui.syncToggleBtn.textContent = state.syncOffsetMs === 0 ? "同步" : ui.syncVal.textContent;
@@ -582,11 +732,26 @@
     const video = getVideoElement();
     if (!video) return;
 
-    if (isAdPlaying()) {
-      if (engine.isPlaying) engine.stopSources();
+    if (state.liveFallback) {
+      if (isAdPlaying()) {
+        engine.setLiveRouting("bypass");
+      } else {
+        engine.setLiveRouting("karaoke");
+        if (video.muted) video.muted = false;
+        if (engine.ctx && engine.ctx.state === "suspended" && !video.paused) {
+          engine.ctx.resume().catch(() => {});
+        }
+      }
       return;
     }
 
+    if (isAdPlaying()) {
+      if (engine.isPlaying) engine.stopSources();
+      engine.setLiveRouting("bypass");
+      return;
+    }
+
+    engine.setLiveRouting("muted");
     if (!video.muted) {
       video.muted = true;
     }
@@ -664,6 +829,7 @@
     }
 
     engine.stopSources();
+    engine.detachLiveVideo();
     const video = state.attachedVideo || getVideoElement();
     detachVideoListeners();
 
@@ -672,6 +838,7 @@
     }
 
     state.active = false;
+    state.liveFallback = false;
     state.busy = false;
     disableLyricsOverlay();
     updateUI();
@@ -1246,12 +1413,54 @@
     }
   }
 
+  async function activateLiveVideoKaraoke(reasonText = "") {
+    const video = getVideoElement();
+    if (!video) {
+      state.busy = false;
+      setStatus("搵唔到影片播放器，請重整頁面再試", true, 0);
+      updateUI();
+      return;
+    }
+    try {
+      state.prevVideoMuted = video.muted;
+      await engine.attachLiveVideo(video);
+      video.muted = false;
+      state.active = true;
+      state.liveFallback = true;
+      state.busy = false;
+
+      detachVideoListeners();
+      const onPlay = () => syncAudioNow(false);
+      const pairs = [
+        ["play", onPlay],
+        ["playing", onPlay],
+      ];
+      for (const [ev, fn] of pairs) video.addEventListener(ev, fn);
+      state.attachedVideo = video;
+      state.videoListeners = pairs;
+      if (state.syncTimer) clearInterval(state.syncTimer);
+      state.syncTimer = setInterval(() => syncAudioNow(false), 300);
+
+      setStatus(reasonText || "已切換即時消人聲模式（瀏覽器直出）", false, null);
+      updateUI();
+      sendHeartbeat(false);
+    } catch (err) {
+      state.busy = false;
+      state.liveFallback = false;
+      setStatus(`啟動即時消人聲失敗：${err.message}`, true, 0);
+      updateUI();
+    }
+  }
+
   async function activateLoadedTracks(videoId, mode) {
     await engine.loadTracks(videoId, mode, (msg, pct) => {
       if (state.videoId === videoId) setStatus(msg, false, pct);
     });
     if (state.videoId !== videoId || state.mode !== mode) return;
+    engine.detachLiveVideo();
+    engine.setLiveRouting("muted");
     state.active = true;
+    state.liveFallback = false;
     state.busy = false;
     attachVideoSync();
     setStatus("", false, null);
@@ -1300,9 +1509,15 @@
           }
         } else if (st.status === "error") {
           stopPolling();
-          state.busy = false;
-          setStatus(st.stage_text || st.error || "處理失敗", true, 0);
-          updateUI();
+          const errTxt = st.stage_text || st.error || "處理失敗";
+          // Auto-engage real-time <video> karaoke fallback when YouTube blocks server fetch (e.g. ViuTV / bot check / live / >15m)!
+          if (autoActivate) {
+            await activateLiveVideoKaraoke("已自動切換即時消人聲模式（瀏覽器直出，支援升降 Key 與導唱）");
+          } else {
+            state.busy = false;
+            setStatus(errTxt, true, 0);
+            updateUI();
+          }
         } else if (st.status === "idle") {
           stopPolling();
           state.busy = false;
@@ -1334,6 +1549,11 @@
       await engine.ensureContext();
 
       setStatus("正在準備歌曲...", false, 5);
+      // If backend is offline or GPU is resting for an uncached song, skip server call -> instant <video> mode!
+      if (!state.backendOnline || (!state.gpuOnline && !state.cachedModes.includes(targetMode))) {
+        await activateLiveVideoKaraoke("已切換即時消人聲模式（瀏覽器直出，支援升降 Key 與導唱）");
+        return;
+      }
       const res = await apiRequest("/api/separate", "POST", {
         video_id: targetVideoId,
         mode: targetMode,
@@ -1341,6 +1561,11 @@
       if (state.videoId !== targetVideoId || state.mode !== targetMode) return;
 
       if (!res.ok) {
+        // When server is resting (503) or rejects uncached song, seamlessly fall back to instant <video> karaoke!
+        if (res.status === 503 || res.status === 429 || res.status >= 500) {
+          await activateLiveVideoKaraoke("已切換即時消人聲模式（瀏覽器直出，支援升降 Key 與導唱）");
+          return;
+        }
         throw new Error(res.error || (res.data && res.data.detail) || "未能連線伺服器");
       }
 
