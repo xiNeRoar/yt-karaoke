@@ -1,0 +1,19 @@
+services:
+  yt-karaoke-gateway:
+    build: .
+    container_name: yt-karaoke-gateway
+    restart: unless-stopped
+    ports:
+      - "18766:8080"
+    env_file:
+      - .env
+    volumes:
+      # Mount your rclone.conf containing the least-privilege ytkaraoke_gdrive remote
+      - ./rclone.conf:/root/.config/rclone/rclone.conf:ro
+      # Persist cached song index across container restarts
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

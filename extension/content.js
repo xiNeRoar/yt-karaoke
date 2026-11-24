@@ -435,6 +435,8 @@
     active: false,
     busy: false,
     backendOnline: false,
+    gpuOnline: true,
+    gpuOfflineMsg: "AI 伺服器休息中，現有歌庫仍可免費唱",
     deviceMode: "gpu",
     gpuName: "",
     cachedModes: [],
@@ -493,18 +495,22 @@
     ui.panel.classList.toggle("ktv-active", state.active);
     ui.dot.classList.toggle("online", state.backendOnline);
 
+    const isCurrentModeCached = state.cachedModes.includes("pure");
+    ui.cacheBadge.style.display = isCurrentModeCached ? "inline-block" : "none";
+
+    const gpuRestingForNewSong = state.backendOnline && !state.gpuOnline && !isCurrentModeCached && !state.active;
+
     if (!state.backendOnline) {
       ui.deviceBadge.textContent = "服務未連線";
-      ui.deviceBadge.className = "ktv-badge";
+      ui.deviceBadge.style.display = "inline-block";
+    } else if (!state.gpuOnline) {
+      ui.deviceBadge.textContent = "歌庫在線 · AI 休息中";
       ui.deviceBadge.style.display = "inline-block";
     } else {
       ui.deviceBadge.style.display = "none";
     }
 
-    const isCurrentModeCached = state.cachedModes.includes("pure");
-    ui.cacheBadge.style.display = isCurrentModeCached ? "inline-block" : "none";
-
-    ui.toggleBtn.disabled = state.busy || !state.backendOnline;
+    ui.toggleBtn.disabled = state.busy || !state.backendOnline || gpuRestingForNewSong;
     ui.toggleBtn.classList.toggle("active", state.active);
     if (state.busy) {
       ui.toggleBtn.textContent = "準備伴奏中...";
@@ -512,6 +518,8 @@
       ui.toggleBtn.textContent = "關閉唱K";
     } else if (isCurrentModeCached) {
       ui.toggleBtn.textContent = "立即開唱";
+    } else if (gpuRestingForNewSong) {
+      ui.toggleBtn.textContent = "AI 休息中";
     } else {
       ui.toggleBtn.textContent = "開始唱K";
     }
@@ -1094,6 +1102,8 @@
     const health = await apiRequest("/api/health");
     if (health.ok && health.data && health.data.status === "ok") {
       state.backendOnline = true;
+      state.gpuOnline = health.data.gpu_online !== false;
+      state.gpuOfflineMsg = health.data.gpu_offline_message || "AI 伺服器休息中，現有歌庫仍可免費唱";
       state.deviceMode = health.data.device_mode || "gpu";
       state.gpuName = (health.data.gpu_name || "").replace("NVIDIA GeForce ", "");
     } else {
@@ -1118,6 +1128,8 @@
           setStatus(st.stage_text || "正在處理中...", false, st.progress || 10);
           // Automatically resume live progress polling even after F5 refresh!
           startPollingJob(state.videoId, state.mode, false);
+        } else if (!state.busy && !state.gpuOnline && !state.cachedModes.includes("pure")) {
+          setStatus(state.gpuOfflineMsg, false, null);
         } else if (!state.busy) {
           setStatus("", false, null);
         }

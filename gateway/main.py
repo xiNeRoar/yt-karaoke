@@ -1,0 +1,549 @@
+"""24/7 Lightweight NAS Gateway for YouTube AI Karaoke.
+
+Runs on NAS (Docker, ~140MB RAM, 0% GPU):
+- Streams all cached MP3 stems + lyrics.json directly from Google Drive 24/7 — even when GPU PC is powered OFF!
+- Probes the GPU PC node every 8s. When GPU PC is offline:
+  - Cached songs still play seamlessly 24/7.
+  - Uncached songs return HTTP 503 with: "AI 伺服器休息中，現有歌庫仍可免費唱".
+- Never exposes any /api/admin/* or DELETE endpoints to the public internet.
+"""
+
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Iterator, Literal, Optional
+
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+GPU_NODE_URL = os.environ.get("GPU_NODE_URL", "").rstrip("/")
+WORKER_SECRET = os.environ.get("WORKER_SECRET", "").strip()
+RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "ytkaraoke_gdrive").strip()
+RCLONE_FOLDER = os.environ.get("RCLONE_FOLDER", "YT-Karaoke-Cache").strip()
+RATE_LIMIT_PER_10MIN = int(os.environ.get("RATE_LIMIT_PER_10MIN", "5"))
+MAX_CLIENTS = int(os.environ.get("MAX_CLIENTS", "200"))
+ALLOWED_EXT_IDS = {
+    x.strip() for x in os.environ.get("ALLOWED_EXTENSION_IDS", "").split(",") if x.strip()
+}
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+INDEX_FILE = DATA_DIR / "gdrive_index.json"
+
+OFFLINE_MSG = "AI 伺服器休息中，現有歌庫仍可免費唱"
+
+
+def _is_allowed_origin(origin: Optional[str]) -> bool:
+    if not origin:
+        return True
+    if origin == "https://www.youtube.com":
+        return True
+    if origin.startswith("chrome-extension://"):
+        if not ALLOWED_EXT_IDS:
+            return True
+        ext_id = origin.replace("chrome-extension://", "").split("/")[0]
+        return ext_id in ALLOWED_EXT_IDS
+    return False
+
+
+class GatewayState:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._index: dict[str, dict] = {}
+        self._lyrics_ram: dict[str, dict] = {}
+        self._lyrics_missing: set[str] = set()
+        self._clients: dict[str, dict] = {}
+        self._rate_hist: dict[str, list[float]] = {}
+
+        self.gpu_online: bool = False
+        self.gpu_queue_count: int = 0
+        self.gpu_pause_new: bool = False
+        self.last_gpu_check: float = 0.0
+        self.last_index_sync: float = 0.0
+
+        self._load_index()
+        threading.Thread(target=self._bg_gpu_probe_loop, daemon=True, name="gpu-probe").start()
+        threading.Thread(target=self._bg_index_sync_loop, daemon=True, name="gdrive-sync").start()
+
+    def _load_index(self) -> None:
+        if INDEX_FILE.exists():
+            try:
+                self._index = json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                self._index = {}
+
+    def _save_index(self) -> None:
+        try:
+            INDEX_FILE.write_text(json.dumps(self._index, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _worker_headers(self) -> dict:
+        h = {}
+        if WORKER_SECRET:
+            h["X-Worker-Secret"] = WORKER_SECRET
+        return h
+
+    def _bg_gpu_probe_loop(self) -> None:
+        while True:
+            self.probe_gpu_once()
+            time.sleep(8)
+
+    def probe_gpu_once(self) -> bool:
+        if not GPU_NODE_URL:
+            self.gpu_online = False
+            return False
+        try:
+            r = httpx.get(f"{GPU_NODE_URL}/api/health", headers=self._worker_headers(), timeout=2.5)
+            if r.status_code == 200:
+                d = r.json()
+                self.gpu_online = d.get("status") == "ok"
+                self.gpu_queue_count = int(d.get("queue_count") or 0)
+                self.gpu_pause_new = bool(d.get("pause_new_jobs"))
+                self.last_gpu_check = time.time()
+                return self.gpu_online
+        except Exception:
+            pass
+        self.gpu_online = False
+        self.last_gpu_check = time.time()
+        return False
+
+    def _bg_index_sync_loop(self) -> None:
+        # Initial sync right after boot, then refresh every 3 minutes
+        self.sync_gdrive_index()
+        while True:
+            time.sleep(180)
+            self.sync_gdrive_index()
+
+    def sync_gdrive_index(self) -> int:
+        try:
+            out = subprocess.check_output(
+                ["rclone", "lsjson", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}", "-R", "--files-only"],
+                text=True,
+                timeout=35,
+            )
+            files = json.loads(out)
+        except Exception:
+            with self._lock:
+                return len(self._index)
+
+        grouped: dict[tuple[str, str], dict] = {}
+        for f in files:
+            parts = f.get("Path", "").replace("\\", "/").split("/")
+            if len(parts) != 3 or parts[0].startswith("_"):
+                continue
+            vid, mode, fname = parts
+            if mode != "pure":
+                continue
+            g = grouped.setdefault((vid, mode), {"files": set(), "bytes": 0})
+            g["files"].add(fname)
+            g["bytes"] += int(f.get("Size", 0))
+
+        with self._lock:
+            snap = dict(self._index)
+
+        new_idx: dict[str, dict] = {}
+        for (vid, mode), info in grouped.items():
+            if "instrumental.mp3" in info["files"] and "vocals.mp3" in info["files"]:
+                key = f"{vid}__{mode}"
+                ex = snap.get(key, {})
+                title = ex.get("title") or vid
+                duration = ex.get("duration") or 0
+                created_at = ex.get("created_at") or time.time()
+                has_lyrics = "lyrics.json" in info["files"]
+                if title == vid and "meta.json" in info["files"]:
+                    try:
+                        mraw = subprocess.check_output(
+                            ["rclone", "cat", f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{vid}/{mode}/meta.json"],
+                            text=True,
+                            encoding="utf-8",
+                            timeout=12,
+                        )
+                        m = json.loads(mraw)
+                        title = m.get("title", vid)
+                        duration = m.get("duration", 0)
+                        created_at = m.get("created_at", created_at)
+                    except Exception:
+                        pass
+                new_idx[key] = {
+                    "video_id": vid,
+                    "mode": mode,
+                    "title": title,
+                    "duration": duration,
+                    "size_mb": round(info["bytes"] / (1024 * 1024), 2),
+                    "created_at": created_at,
+                    "has_lyrics": has_lyrics,
+                    "storage": "gdrive",
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                }
+
+        with self._lock:
+            self._index = new_idx
+            self._lyrics_missing.clear()
+            self._save_index()
+            self.last_index_sync = time.time()
+            return len(self._index)
+
+    def has_song(self, video_id: str, mode: str = "pure") -> bool:
+        with self._lock:
+            return f"{video_id}__{mode}" in self._index
+
+    def get_song_meta(self, video_id: str, mode: str = "pure") -> dict:
+        with self._lock:
+            return dict(self._index.get(f"{video_id}__{mode}", {}))
+
+    def list_songs(self) -> list[dict]:
+        with self._lock:
+            items = list(self._index.values())
+        items.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        return items
+
+    def stream_gdrive_audio(self, video_id: str, mode: str, stem: str) -> Iterator[bytes]:
+        remote_file = f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{video_id}/{mode}/{stem}.mp3"
+        proc = subprocess.Popen(["rclone", "cat", remote_file], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+
+    def get_cached_lyrics(self, video_id: str, mode: str = "pure") -> Optional[dict]:
+        with self._lock:
+            if video_id in self._lyrics_ram:
+                return self._lyrics_ram[video_id]
+            if video_id in self._lyrics_missing:
+                return None
+
+        remote_file = f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{video_id}/{mode}/lyrics.json"
+        try:
+            raw = subprocess.check_output(["rclone", "cat", remote_file], text=True, encoding="utf-8", timeout=25)
+            data = json.loads(raw)
+            if data and data.get("lines"):
+                with self._lock:
+                    self._lyrics_ram[video_id] = data
+                return data
+        except Exception:
+            pass
+
+        with self._lock:
+            self._lyrics_missing.add(video_id)
+        return None
+
+    def touch_client(self, client_id: Optional[str], ip: str, video_id: Optional[str] = None, singing: Optional[bool] = None) -> bool:
+        if not client_id or not CLIENT_ID_RE.match(client_id):
+            return True
+        now = time.time()
+        with self._lock:
+            expired = [k for k, v in self._clients.items() if now - v.get("last_seen", 0) > 40.0]
+            for k in expired:
+                self._clients.pop(k, None)
+            if client_id not in self._clients and len(self._clients) >= MAX_CLIENTS:
+                return False
+            e = self._clients.get(client_id, {"ip": ip, "video_id": "", "singing": False})
+            e["ip"] = ip
+            e["last_seen"] = now
+            if video_id is not None:
+                e["video_id"] = video_id
+            if singing is not None:
+                e["singing"] = bool(singing)
+            self._clients[client_id] = e
+            return True
+
+    def remove_client(self, client_id: Optional[str]) -> None:
+        if not client_id:
+            return
+        with self._lock:
+            self._clients.pop(client_id, None)
+
+    def client_counts(self) -> dict:
+        now = time.time()
+        with self._lock:
+            expired = [k for k, v in self._clients.items() if now - v.get("last_seen", 0) > 40.0]
+            for k in expired:
+                self._clients.pop(k, None)
+            return {
+                "active_clients": len(self._clients),
+                "active_singing": sum(1 for v in self._clients.values() if v.get("singing")),
+            }
+
+    def check_rate_limit(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            hist = [t for t in self._rate_hist.get(ip, []) if now - t < 600.0]
+            if len(hist) >= RATE_LIMIT_PER_10MIN:
+                self._rate_hist[ip] = hist
+                return False
+            hist.append(now)
+            self._rate_hist[ip] = hist
+            return True
+
+
+gw = GatewayState()
+app = FastAPI(title="YouTube AI Karaoke 24/7 Gateway", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def cors_and_security(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin and not _is_allowed_origin(origin):
+        return Response(content='{"detail":"Origin not allowed"}', status_code=403, media_type="application/json")
+
+    if request.method == "OPTIONS":
+        resp = Response(status_code=204)
+    else:
+        resp = await call_next(request)
+
+    if origin and _is_allowed_origin(origin):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Karaoke-Client"
+        resp.headers["Access-Control-Allow-Private-Network"] = "true"
+
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    return resp
+
+
+class SeparateRequest(BaseModel):
+    video_id: str
+    mode: Literal["pure"] = "pure"
+
+
+class LyricsRequest(BaseModel):
+    video_id: str
+    mode: Literal["pure"] = "pure"
+    force_ai: bool = False
+
+
+class HeartbeatRequest(BaseModel):
+    client_id: str
+    video_id: Optional[str] = None
+    singing: bool = False
+    leaving: bool = False
+
+
+def _validate_vid(video_id: str) -> str:
+    if not VIDEO_ID_RE.match(video_id):
+        raise HTTPException(status_code=400, detail="Invalid video_id")
+    return video_id
+
+
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+
+@app.get("/api/health")
+def health(request: Request, x_karaoke_client: Optional[str] = Header(default=None)):
+    if x_karaoke_client:
+        gw.touch_client(x_karaoke_client, _client_ip(request))
+    songs = gw.list_songs()
+    ai_available = gw.gpu_online and not gw.gpu_pause_new
+    return {
+        "status": "ok",
+        "gateway_mode": True,
+        "gpu_online": ai_available,
+        "gpu_offline_message": "" if ai_available else OFFLINE_MSG,
+        "cache_count": len(songs),
+        "cache_size_mb": round(sum(s["size_mb"] for s in songs), 2),
+        "queue_count": gw.gpu_queue_count if gw.gpu_online else 0,
+        **gw.client_counts(),
+    }
+
+
+@app.post("/api/heartbeat")
+def heartbeat(req: HeartbeatRequest, request: Request):
+    ip = _client_ip(request)
+    if req.leaving:
+        gw.remove_client(req.client_id)
+    else:
+        vid = req.video_id if (req.video_id and VIDEO_ID_RE.match(req.video_id)) else None
+        if not gw.touch_client(req.client_id, ip, video_id=vid, singing=req.singing):
+            raise HTTPException(status_code=503, detail="目前已達最大在線人數上限，請稍後再試。")
+    ai_available = gw.gpu_online and not gw.gpu_pause_new
+    return {"status": "ok", "gpu_online": ai_available, **gw.client_counts()}
+
+
+@app.get("/api/cache")
+def list_cache():
+    items = gw.list_songs()
+    return {
+        "count": len(items),
+        "total_size_mb": round(sum(i["size_mb"] for i in items), 2),
+        "storage_mode": "gdrive",
+        "items": items,
+    }
+
+
+@app.get("/api/status/{video_id}")
+def get_status(video_id: str, mode: Literal["pure"] = "pure"):
+    _validate_vid(video_id)
+    if gw.has_song(video_id, mode):
+        meta = gw.get_song_meta(video_id, mode)
+        return {
+            "video_id": video_id,
+            "mode": mode,
+            "status": "ready",
+            "progress": 100,
+            "stage_text": "已就緒，隨時可以開唱",
+            "title": meta.get("title", ""),
+            "duration": meta.get("duration", 0),
+            "cached": True,
+            "cached_modes": [mode],
+        }
+
+    # Proxy live progress from GPU node when online
+    if gw.gpu_online and GPU_NODE_URL:
+        try:
+            r = httpx.get(
+                f"{GPU_NODE_URL}/api/status/{video_id}",
+                params={"mode": mode},
+                headers=gw._worker_headers(),
+                timeout=4.0,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("status") == "ready":
+                    # Refresh gateway index immediately so this song is now playable 24/7!
+                    threading.Thread(target=gw.sync_gdrive_index, daemon=True).start()
+                return data
+        except Exception:
+            gw.gpu_online = False
+
+    return {
+        "video_id": video_id,
+        "mode": mode,
+        "status": "idle",
+        "progress": 0,
+        "stage_text": OFFLINE_MSG if not gw.gpu_online else "未處理",
+        "cached": False,
+        "cached_modes": [],
+    }
+
+
+@app.post("/api/separate")
+def separate(req: SeparateRequest, request: Request):
+    _validate_vid(req.video_id)
+    # 1) Already in Google Drive -> serve 24/7 even when GPU PC is off!
+    if gw.has_song(req.video_id, req.mode):
+        return get_status(req.video_id, req.mode)
+
+    # 2) Need GPU PC to separate a new song
+    if not gw.gpu_online or gw.gpu_pause_new or not GPU_NODE_URL:
+        raise HTTPException(status_code=503, detail=OFFLINE_MSG)
+
+    if not gw.check_rate_limit(_client_ip(request)):
+        raise HTTPException(status_code=429, detail=f"請求過於頻繁（每 10 分鐘上限 {RATE_LIMIT_PER_10MIN} 首新歌），請稍後再試。")
+
+    try:
+        r = httpx.post(
+            f"{GPU_NODE_URL}/api/separate",
+            json={"video_id": req.video_id, "mode": req.mode},
+            headers=gw._worker_headers(),
+            timeout=8.0,
+        )
+        if r.status_code >= 400:
+            detail = r.json().get("detail") if r.headers.get("content-type", "").startswith("application/json") else r.text
+            raise HTTPException(status_code=r.status_code, detail=detail or OFFLINE_MSG)
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception:
+        gw.gpu_online = False
+        raise HTTPException(status_code=503, detail=OFFLINE_MSG)
+
+
+@app.get("/api/audio/{video_id}/{mode}/{stem}")
+def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental", "vocals"]):
+    _validate_vid(video_id)
+    if gw.has_song(video_id, mode):
+        return StreamingResponse(
+            gw.stream_gdrive_audio(video_id, mode, stem),
+            media_type="audio/mpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+    # Fallback proxy to GPU PC if just finished separating before index synced
+    if gw.gpu_online and GPU_NODE_URL:
+        def _proxy_stream():
+            with httpx.stream("GET", f"{GPU_NODE_URL}/api/audio/{video_id}/{mode}/{stem}", headers=gw._worker_headers(), timeout=120.0) as r:
+                if r.status_code != 200:
+                    return
+                for chunk in r.iter_bytes(65536):
+                    yield chunk
+        return StreamingResponse(_proxy_stream(), media_type="audio/mpeg", headers={"Cache-Control": "public, max-age=86400"})
+    raise HTTPException(status_code=404, detail="Audio stem not found")
+
+
+@app.get("/api/lyrics/{video_id}")
+def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
+    _validate_vid(video_id)
+    cached = gw.get_cached_lyrics(video_id, mode)
+    if cached:
+        return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
+
+    if gw.gpu_online and GPU_NODE_URL:
+        try:
+            r = httpx.get(
+                f"{GPU_NODE_URL}/api/lyrics/{video_id}",
+                params={"mode": mode},
+                headers=gw._worker_headers(),
+                timeout=8.0,
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("status") == "ready" and d.get("lines"):
+                    with gw._lock:
+                        gw._lyrics_ram[video_id] = d
+                        gw._lyrics_missing.discard(video_id)
+                return d
+        except Exception:
+            pass
+
+    return {"video_id": video_id, "status": "idle", "progress": 0, "stage_text": OFFLINE_MSG if not gw.gpu_online else "未生成歌詞", "lines": []}
+
+
+@app.post("/api/lyrics")
+def generate_lyrics(req: LyricsRequest):
+    _validate_vid(req.video_id)
+    if not req.force_ai:
+        cached = gw.get_cached_lyrics(req.video_id, req.mode)
+        if cached:
+            return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
+
+    if not gw.gpu_online or not GPU_NODE_URL:
+        raise HTTPException(status_code=503, detail=OFFLINE_MSG)
+
+    try:
+        r = httpx.post(
+            f"{GPU_NODE_URL}/api/lyrics",
+            json={"video_id": req.video_id, "mode": req.mode, "force_ai": req.force_ai},
+            headers=gw._worker_headers(),
+            timeout=10.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail=OFFLINE_MSG)

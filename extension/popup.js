@@ -25,8 +25,13 @@ async function refresh() {
     return;
   }
 
-  pill.textContent = "已就緒";
-  pill.className = "pill online";
+  if (health.data.gpu_online === false) {
+    pill.textContent = "AI 休息中 · 歌庫在線";
+    pill.className = "pill online";
+  } else {
+    pill.textContent = "已就緒";
+    pill.className = "pill online";
+  }
 
   const cacheRes = await apiRequest("/api/cache");
   songList.textContent = "";

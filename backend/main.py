@@ -1,3 +1,4 @@
+import os
 import re
 import secrets
 import threading
@@ -19,6 +20,9 @@ CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 TOKEN_FILE = BASE_DIR / ".admin_token"
 ADMIN_TOKEN = secrets.token_hex(32)
 TOKEN_FILE.write_text(ADMIN_TOKEN, encoding="utf-8")
+
+# Optional shared secret between NAS Gateway and PC GPU Node when bound to LAN/Tailscale
+WORKER_SECRET = os.environ.get("KARAOKE_WORKER_SECRET", "").strip()
 
 ALLOWED_ORIGINS = {"https://www.youtube.com"}
 EXTENSION_RELOAD_NONCE = 1
@@ -87,6 +91,15 @@ async def security_and_cors_middleware(request: Request, call_next):
     if origin and not _is_allowed_origin(origin):
         manager.log.warning("Security", f"Blocked untrusted Origin={origin} on {request.method} {request.url.path}")
         return Response(content='{"detail":"Origin not allowed"}', status_code=403, media_type="application/json")
+
+    # When KARAOKE_WORKER_SECRET is configured, all non-localhost requests (i.e. from NAS Gateway)
+    # must present the matching X-Worker-Secret header.
+    client_host = request.client.host if request.client else ""
+    if WORKER_SECRET and client_host not in ("127.0.0.1", "::1") and request.method != "OPTIONS":
+        provided = request.headers.get("x-worker-secret") or ""
+        if not secrets.compare_digest(provided, WORKER_SECRET):
+            manager.log.warning("Security", f"Rejected unauthorized remote worker call from {client_host}")
+            return Response(content='{"detail":"Unauthorized worker request"}', status_code=403, media_type="application/json")
 
     if request.method == "OPTIONS":
         resp = Response(status_code=204)
@@ -160,6 +173,8 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
     mig = manager.get_migration_state()
     return {
         "status": "ok",
+        "gpu_online": not manager.pause_new_jobs,
+        "gpu_offline_message": "AI 伺服器休息中，現有歌庫仍可免費唱" if manager.pause_new_jobs else "",
         "cuda_available": manager.cuda_available,
         "gpu_name": manager.gpu_name,
         "device_mode": manager.device_mode,
