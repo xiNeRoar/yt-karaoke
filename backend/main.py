@@ -22,7 +22,10 @@ ADMIN_TOKEN = secrets.token_hex(32)
 TOKEN_FILE.write_text(ADMIN_TOKEN, encoding="utf-8")
 
 # Optional shared secret between NAS Gateway and PC GPU Node when bound to LAN/Tailscale
+WORKER_SECRET_FILE = BASE_DIR / ".worker_secret"
 WORKER_SECRET = os.environ.get("KARAOKE_WORKER_SECRET", "").strip()
+if not WORKER_SECRET and WORKER_SECRET_FILE.exists():
+    WORKER_SECRET = WORKER_SECRET_FILE.read_text(encoding="utf-8").strip()
 
 ALLOWED_ORIGINS = {"https://www.youtube.com"}
 EXTENSION_RELOAD_NONCE = 1
@@ -400,6 +403,7 @@ if __name__ == "__main__":
     import os
     import uvicorn
 
-    bind_host = os.environ.get("KARAOKE_HOST", "127.0.0.1")
+    default_host = "0.0.0.0" if WORKER_SECRET else "127.0.0.1"
+    bind_host = os.environ.get("KARAOKE_HOST", default_host)
     bind_port = int(os.environ.get("KARAOKE_PORT", "18765"))
     uvicorn.run("main:app", host=bind_host, port=bind_port, reload=False)

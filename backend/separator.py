@@ -434,7 +434,7 @@ class KaraokeSeparatorManager:
                     meta = self.get_meta(video_id, mode)
                     try:
                         cur = self._read_job_status(video_id, mode) or {}
-                        cur.update({"status": "finalizing", "progress": 96, "stage_text": "正在同步伴奏到 Google Drive..."})
+                        cur.update({"status": "finalizing", "progress": 96, "stage_text": "最後整理中..."})
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
 
                         self.gdrive.upload_song(video_id, mode, local_song_dir, meta)
@@ -446,7 +446,7 @@ class KaraokeSeparatorManager:
                             except Exception:
                                 pass
 
-                        cur.update({"status": "ready", "progress": 100, "stage_text": "已存上 Google Drive，隨時開唱！"})
+                        cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
                         status_file.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
                         self.log.info("GDrive", f"Uploaded {video_id} ({mode}) & freed local disk")
                         self.log.trigger_sync_async()
@@ -730,7 +730,7 @@ class KaraokeSeparatorManager:
                 "video_id": video_id,
                 "status": "running",
                 "progress": 8,
-                "stage_text": "正在啟動智能歌詞對齊..." if force_ai else "正在搜尋字幕同對齊歌詞...",
+                "stage_text": "對齊歌詞中..." if force_ai else "載入歌詞中...",
                 "error": None,
                 "updated_at": time.time(),
             }

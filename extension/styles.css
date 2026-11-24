@@ -376,22 +376,23 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
   display: inline-flex;
 }
 
-/* Authentic HK KTV Staggered Dual-Line Sweeping Overlay (Large High-DPI K-Room Scale) */
+/* Eye-Ergonomic HK KTV Staggered Dual-Line Sweeping Overlay (ITU-R BT.2408 / Netflix CJK Comfort Spec) */
 #yt-ai-ktv-lyrics-overlay {
   position: absolute;
   left: 0;
   right: 0;
-  bottom: 58px;
+  bottom: 54px;
   z-index: 59;
   pointer-events: none;
   display: none;
   flex-direction: column;
-  gap: 6px;
-  padding: 0 4.5%;
+  gap: 8px;
+  padding: 0 5%;
   box-sizing: border-box;
   container-type: inline-size;
   font-family: "Noto Sans TC", "PingFang HK", "PingFang TC", "Microsoft JhengHei", "Heiti TC", sans-serif;
   user-select: none;
+  -webkit-font-smoothing: antialiased;
 }
 
 #yt-ai-ktv-lyrics-overlay.visible {
@@ -399,15 +400,15 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
 }
 
 .ytp-fullscreen #yt-ai-ktv-lyrics-overlay {
-  bottom: 84px;
+  bottom: 78px;
   gap: 12px;
-  padding: 0 5.5%;
+  padding: 0 6%;
 }
 
 .ktv-stage-row {
   display: flex;
   width: 100%;
-  min-height: clamp(48px, 6.8cqi, 102px);
+  min-height: clamp(46px, 6.4cqi, 96px);
   align-items: center;
 }
 
@@ -433,45 +434,45 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
 }
 
 .ktv-cd-dot {
-  width: clamp(10px, 1.1cqi, 16px);
-  height: clamp(10px, 1.1cqi, 16px);
+  width: clamp(10px, 1.05cqi, 15px);
+  height: clamp(10px, 1.05cqi, 15px);
   border-radius: 50%;
-  background: #1d5cff;
-  border: 2.5px solid #ffffff;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
+  background: #4da3ff;
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.75);
   opacity: 0.25;
   transform: scale(0.85);
-  transition: opacity 0.12s ease, transform 0.12s ease;
+  transition: opacity 0.14s ease, transform 0.14s ease;
 }
 
 .ktv-cd-dot.lit {
-  opacity: 1;
-  transform: scale(1.12);
+  opacity: 0.98;
+  transform: scale(1.1);
 }
 
 .ktv-sweep-wrap {
   position: relative;
   display: inline-block;
-  font-size: clamp(40px, 5.4cqi, 86px);
-  font-weight: 900;
-  line-height: 1.18;
-  letter-spacing: 2px;
+  font-size: clamp(38px, 5.2cqi, 82px);
+  font-weight: 500;
+  line-height: 1.22;
+  letter-spacing: 0.04em;
   white-space: nowrap;
   max-width: 100%;
 }
 
-/* Base layer: crisp white fill with thick dark outline (unsung state) */
+/* Base layer: large, sleek Medium-weight off-white (zero thick stroke bloat) */
 .ktv-layer-base {
   display: inline-block;
-  color: #ffffff;
-  -webkit-text-stroke: clamp(3px, 0.38cqi, 5.5px) rgba(0, 0, 0, 0.95);
+  color: rgba(240, 242, 246, 0.88);
+  -webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.75);
   paint-order: stroke fill;
   text-shadow:
-    0 3px 8px rgba(0, 0, 0, 0.95),
-    0 0 18px rgba(0, 0, 0, 0.65);
+    0 2px 8px rgba(0, 0, 0, 0.85),
+    0 4px 18px rgba(0, 0, 0, 0.5);
 }
 
-/* Sweep layer: iconic HK KTV Royal Blue fill with crisp thick white outline (sung state) */
+/* Sweep layer: clean, eye-friendly KTV Blue without glaring thick white border */
 .ktv-layer-fill {
   position: absolute;
   left: 0;
@@ -479,12 +480,12 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
   right: 0;
   bottom: 0;
   display: inline-block;
-  color: #1858ff;
-  -webkit-text-stroke: clamp(3.4px, 0.44cqi, 6.2px) #ffffff;
+  color: #4da3ff;
+  -webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.82);
   paint-order: stroke fill;
   text-shadow:
-    0 3px 10px rgba(0, 0, 0, 0.95),
-    0 0 16px rgba(24, 88, 255, 0.5);
+    0 2px 10px rgba(0, 0, 0, 0.9),
+    0 0 14px rgba(77, 163, 255, 0.3);
   clip-path: inset(0 100% 0 0);
   will-change: clip-path;
 }

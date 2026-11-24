@@ -8,6 +8,7 @@ Runs on NAS (Docker, ~140MB RAM, 0% GPU):
 - Never exposes any /api/admin/* or DELETE endpoints to the public internet.
 """
 
+import base64
 import json
 import os
 import re
@@ -38,6 +39,16 @@ ALLOWED_EXT_IDS = {
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_FILE = DATA_DIR / "gdrive_index.json"
+
+# Optional Portainer 1-paste convenience: decode base64 rclone.conf from env var if file not mounted
+_rclone_b64 = os.environ.get("RCLONE_CONF_B64", "").strip()
+_rclone_cfg_path = Path.home() / ".config" / "rclone" / "rclone.conf"
+if _rclone_b64 and not _rclone_cfg_path.exists():
+    try:
+        _rclone_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        _rclone_cfg_path.write_bytes(base64.b64decode(_rclone_b64))
+    except Exception as _exc:
+        print(f"[Gateway] Failed to decode RCLONE_CONF_B64: {_exc}", flush=True)
 
 OFFLINE_MSG = "AI 伺服器休息中，現有歌庫仍可免費唱"
 

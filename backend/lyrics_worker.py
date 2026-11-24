@@ -14,9 +14,11 @@ Priority:
 """
 
 import argparse
+from difflib import SequenceMatcher
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +48,24 @@ CREDIT_LINE_RE = re.compile(
     r"^\s*(作[詞词]|作曲|[編编]曲|[監监]製|製作人|混音|錄音|和音|母帶|出品|發行|原唱|翻唱|演唱|詞|曲|編|監|OP|SP|Lyricist|Composer|Arranger|Producer)\s*[:：]",
     re.IGNORECASE,
 )
+
+
+def ensure_ffmpeg_in_path() -> None:
+    """Ensure winget/local ffmpeg is on PATH for stable-ts / librosa audio loading."""
+    if shutil.which("ffmpeg"):
+        return
+    for root in (
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages",
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links",
+        Path("C:/ffmpeg/bin"),
+    ):
+        if not root.exists():
+            continue
+        for match in root.rglob("ffmpeg.exe"):
+            d = str(match.parent)
+            if d not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            return
 
 
 def add_nvidia_dll_dirs() -> None:
@@ -141,9 +161,10 @@ def parse_lrc(lrc_text: str) -> list[dict]:
     return lines
 
 
-def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, float, float]:
-    """Compute per-100ms RMS dBFS of isolated vocals.mp3 so we know exact silent vs singing regions."""
+def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Load 16kHz mono vocals + per-100ms RMS dBFS profile so we know exact silent vs singing regions."""
     try:
+        ensure_ffmpeg_in_path()
         import librosa
         y, sr = librosa.load(str(vocals_path), sr=16000, mono=True)
         hop = 1600  # 0.1s per frame
@@ -159,9 +180,9 @@ def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, float, f
             if db[i] > -38.0 and db[i + 1] > -38.0:
                 first_onset = max(0.0, i * 0.1 - 0.15)
                 break
-        return db, 0.1, first_onset
+        return y.astype(np.float32), db, 0.1, first_onset
     except Exception:
-        return np.array([]), 0.1, 0.0
+        return np.array([], dtype=np.float32), np.array([]), 0.1, 0.0
 
 
 def segment_has_vocal_energy(db_profile: np.ndarray, step_sec: float, start_s: float, end_s: float) -> bool:
@@ -324,13 +345,304 @@ def detect_lyrics_language(lines: list[str]) -> str:
     return "en"
 
 
+def _norm_lyrics_cmp(s: str) -> str:
+    return re.sub(r"[\s\W_]+", "", to_hk_traditional(s or "")).lower()
+
+
+def _lyric_similarity(a: str, b: str) -> float:
+    na, nb = _norm_lyrics_cmp(a), _norm_lyrics_cmp(b)
+    if not na or not nb:
+        return 0.0
+    sm = SequenceMatcher(None, na, nb).ratio()
+    sa, sb = set(na), set(nb)
+    jacc = len(sa & sb) / max(1, len(sa | sb))
+    cov = len(sa & sb) / max(1, min(len(sa), len(sb)))
+    return 0.55 * sm + 0.30 * jacc + 0.15 * cov
+
+
+def _alignment_needs_live_rematch(aligned, audio_dur: float, db_profile: np.ndarray, step_sec: float) -> tuple[bool, str]:
+    """Detect skipped verses, mid-song starts, swapped sections, or crushed lines in monotonic alignment."""
+    segs = [s for s in (aligned.segments or []) if (s.text or "").strip()]
+    if not segs:
+        return True, "empty"
+
+    crushed = 0
+    low_prob = 0
+    prev_start = -1.0
+    for seg in segs:
+        txt = (seg.text or "").strip()
+        n_chars = max(1, len(_norm_lyrics_cmp(txt)))
+        dur = float(seg.end) - float(seg.start)
+        if dur < max(0.45, 0.09 * n_chars) or (prev_start >= 0 and (float(seg.start) - prev_start) < 0.25):
+            crushed += 1
+        prev_start = float(seg.start)
+        probs = [w.probability for w in (seg.words or []) if w.probability is not None]
+        avg_p = (sum(probs) / len(probs)) if probs else 0.0
+        if avg_p < 0.28:
+            low_prob += 1
+
+    low_ratio = low_prob / max(1, len(segs))
+    if crushed >= 2:
+        return True, f"crushed={crushed}"
+    if low_ratio >= 0.24:
+        return True, f"low_prob={low_ratio:.2f}"
+
+    # Also check if there's >20s of active singing after the last aligned line (e.g. repeated encore)
+    if len(db_profile) > 0 and audio_dur > 0:
+        last_end = float(segs[-1].end)
+        tail_idx = int((last_end + 4.0) / step_sec)
+        if tail_idx < len(db_profile):
+            active_tail_sec = float(np.sum(db_profile[tail_idx:] > -35.0)) * step_sec
+            if active_tail_sec >= 18.0:
+                return True, f"unaligned_tail={active_tail_sec:.1f}s"
+
+    return False, "ok"
+
+
+def _even_words_for_line(text: str, start_s: float, end_s: float) -> list[dict]:
+    tokens = list(text.replace(" ", "")) if detect_lyrics_language([text]) in ("zh", "ja") else text.split()
+    if not tokens:
+        return []
+    dur = max(0.4, end_s - start_s)
+    step = dur / len(tokens)
+    out = []
+    for idx, tk in enumerate(tokens):
+        ws = round(start_s + idx * step, 2)
+        we = round(start_s + (idx + 1) * step, 2)
+        out.append({"start": ws, "end": max(ws + 0.04, we), "word": tk})
+    return out
+
+
+def _live_section_anchored_align(
+    model,
+    vocals_path: Path,
+    audio_16k: np.ndarray,
+    db_profile: np.ndarray,
+    step_sec: float,
+    official_lines: list[str],
+    lang: str,
+    first_onset: float,
+) -> list[dict]:
+    """Live/Concert/Medley-aware alignment:
+    1. Transcribes active vocal regions to discover WHICH official lines were actually sung & WHEN
+       (handles mid-song starts, skipped verses, swapped verses, repeated encore choruses, and MC talking!).
+    2. Groups matched lines into contiguous singing blocks and force-aligns each block on its own
+       sliced audio window so skipped sections can NEVER cause drift or crushed timestamps.
+    """
+    audio_input = audio_16k if len(audio_16k) > 0 else str(vocals_path)
+    res = model.transcribe(
+        audio_input,
+        language=lang,
+        beam_size=3,
+        vad=False,
+        suppress_silence=False,
+        condition_on_previous_text=False,
+        verbose=False,
+    )
+
+    asr_segs = []
+    for s in (res.segments or []):
+        raw_t = (s.text or "").strip()
+        txt = to_hk_traditional(raw_t) if lang == "zh" else raw_t
+        if not txt or HALLUCINATION_RE.search(txt) or GARBAGE_CHARS_RE.search(txt):
+            continue
+        if not segment_has_vocal_energy(db_profile, step_sec, float(s.start), float(s.end)):
+            continue
+        asr_segs.append({"start": float(s.start), "end": float(s.end), "text": txt})
+
+    if not asr_segs:
+        return []
+
+    unique_off = list(dict.fromkeys(official_lines))
+    next_map: dict[str, set[str]] = {}
+    for idx in range(len(official_lines) - 1):
+        next_map.setdefault(official_lines[idx], set()).add(official_lines[idx + 1])
+
+    def _best_single(text: str, prev_l: Optional[str]) -> Optional[tuple[float, str, float, bool]]:
+        c_len = len(_norm_lyrics_cmp(text))
+        if c_len < 2:
+            return None
+        best = None
+        for off in unique_off:
+            o_len = len(_norm_lyrics_cmp(off))
+            if o_len == 0 or c_len > o_len * 2.1 or o_len > c_len * 2.6:
+                continue
+            sim = _lyric_similarity(text, off)
+            is_next = bool(prev_l and off in next_map.get(prev_l, set()))
+            bonus = 0.22 if (is_next and sim >= 0.22) else (0.12 if is_next else 0.0)
+            score = sim + bonus
+            if best is None or score > best[0]:
+                best = (score, off, sim, is_next)
+        return best
+
+    matched = []
+    unmatched_gaps = []
+    i = 0
+    prev_line: Optional[str] = None
+    while i < len(asr_segs):
+        b1 = _best_single(asr_segs[i]["text"], prev_line)
+        chosen_span = 1
+        chosen = b1
+
+        # Only merge 2 adjacent segments if merging STRICTLY improves similarity over matching either half alone!
+        if i + 1 < len(asr_segs) and (asr_segs[i + 1]["start"] - asr_segs[i]["end"]) <= 1.8:
+            comb = f"{asr_segs[i]['text']} {asr_segs[i + 1]['text']}"
+            b2 = _best_single(comb, prev_line)
+            b_next = _best_single(asr_segs[i + 1]["text"], b1[1] if b1 else prev_line)
+            s1_raw = b1[2] if b1 else 0.0
+            s_next_raw = b_next[2] if b_next else 0.0
+            if b2 and b2[2] > max(s1_raw, s_next_raw) + 0.06:
+                chosen_span = 2
+                chosen = b2
+
+        if chosen and (chosen[2] >= 0.30 or (chosen[3] and chosen[2] >= 0.20)):
+            _, off, raw_sim, _ = chosen
+            ts = asr_segs[i]["start"]
+            te = asr_segs[i + chosen_span - 1]["end"]
+            if not (matched and matched[-1]["text"] == off and (ts - matched[-1]["end"]) < 2.5):
+                matched.append({"start": ts, "end": te, "text": off, "sim": raw_sim})
+                prev_line = off
+            i += chosen_span
+        else:
+            unmatched_gaps.append(asr_segs[i])
+            i += 1
+
+    if not matched:
+        return []
+
+    # Parody / Rewritten-lyrics detection: if < 35% of active singing segments match official lyrics
+    # (e.g. singer rewrote/adapted the lyrics), show what the singer ACTUALLY sang instead of forcing wrong lyrics!
+    matched_asr_count = len(asr_segs) - len(unmatched_gaps)
+    if len(asr_segs) >= 6 and (matched_asr_count / len(asr_segs)) < 0.35:
+        print(
+            f"[Lyrics] Low official-lyrics match ({matched_asr_count}/{len(asr_segs)}); "
+            "treating as rewritten/adapted lyrics and using actual sung transcript.",
+            flush=True,
+        )
+        direct_lines: list[dict] = []
+        for s in (res.segments or []):
+            raw_t = (s.text or "").strip()
+            txt = to_hk_traditional(raw_t) if lang == "zh" else raw_t
+            if not txt or HALLUCINATION_RE.search(txt) or GARBAGE_CHARS_RE.search(txt):
+                continue
+            s_start, s_end = float(s.start), float(s.end)
+            if s_end < first_onset or not segment_has_vocal_energy(db_profile, step_sec, s_start, s_end):
+                continue
+            words_out = []
+            for w in (s.words or []):
+                wt = (w.word or "").strip()
+                if not wt or GARBAGE_CHARS_RE.search(wt):
+                    continue
+                words_out.append({
+                    "start": round(max(first_onset, float(w.start)), 2),
+                    "end": round(max(first_onset + 0.05, float(w.end)), 2),
+                    "word": to_hk_traditional(wt) if lang == "zh" else wt,
+                })
+            s_clamped = round(max(first_onset, s_start), 2)
+            e_clamped = round(max(s_clamped + 0.4, s_end), 2)
+            direct_lines.append({
+                "start": s_clamped,
+                "end": e_clamped,
+                "text": txt,
+                "words": words_out or _even_words_for_line(txt, s_clamped, e_clamped),
+            })
+        return direct_lines
+
+    # Gap-fill single missing bridge line when A -> B -> C exists in official lyrics and vocal audio sits in between
+    filled = []
+    for k, cur in enumerate(matched):
+        filled.append(cur)
+        if k + 1 < len(matched):
+            nxt = matched[k + 1]
+            between = [g for g in unmatched_gaps if g["start"] >= cur["end"] - 0.6 and g["end"] <= nxt["start"] + 0.6]
+            if between and (nxt["start"] - cur["end"]) >= 1.6:
+                bridge = None
+                for idx in range(len(official_lines) - 2):
+                    if official_lines[idx] == cur["text"] and official_lines[idx + 2] == nxt["text"]:
+                        bridge = official_lines[idx + 1]
+                        break
+                if bridge:
+                    filled.append({"start": between[0]["start"], "end": between[-1]["end"], "text": bridge, "sim": 0.0})
+    matched = filled
+
+    # Group into contiguous singing blocks (split on gaps > 4.5s) and align each block on its own audio slice!
+    blocks: list[list[dict]] = []
+    for item in matched:
+        if not blocks or (item["start"] - blocks[-1][-1]["end"]) > 4.5:
+            blocks.append([item])
+        else:
+            blocks[-1].append(item)
+
+    total_sec = len(audio_16k) / 16000.0 if len(audio_16k) > 0 else 0.0
+    final_lines: list[dict] = []
+    for blk in blocks:
+        b_start = max(first_onset, blk[0]["start"] - 1.0)
+        b_end = min(total_sec, blk[-1]["end"] + 1.0) if total_sec > 0 else (blk[-1]["end"] + 1.0)
+        if len(audio_16k) > 0 and b_end > b_start + 0.5:
+            chunk = audio_16k[int(b_start * 16000) : int(b_end * 16000)]
+            blk_text = "\n".join(x["text"] for x in blk)
+            try:
+                al = model.align(chunk, blk_text, language=lang, original_split=True, verbose=False)
+                al_segs = list(al.segments or [])
+            except Exception:
+                al_segs = []
+        else:
+            al_segs = []
+
+        if len(al_segs) == len(blk):
+            for seg, ref in zip(al_segs, blk):
+                s_abs = round(max(first_onset, b_start + float(seg.start)), 2)
+                e_abs = round(max(s_abs + 0.4, b_start + float(seg.end)), 2)
+                n_chars = max(1, len(_norm_lyrics_cmp(ref["text"])))
+                # Guard against any single crushed/drifted line inside a block
+                if (e_abs - s_abs) < max(0.4, 0.08 * n_chars) or abs(s_abs - ref["start"]) > 5.5:
+                    s_abs = round(max(first_onset, ref["start"]), 2)
+                    e_abs = round(max(s_abs + 0.6, ref["end"]), 2)
+                    words_out = _even_words_for_line(ref["text"], s_abs, e_abs)
+                else:
+                    words_out = []
+                    for w in (seg.words or []):
+                        wt = (w.word or "").strip()
+                        if not wt:
+                            continue
+                        ws = round(max(s_abs, b_start + float(w.start)), 2)
+                        we = round(max(ws + 0.05, b_start + float(w.end)), 2)
+                        words_out.append({"start": ws, "end": we, "word": wt})
+                final_lines.append({"start": s_abs, "end": e_abs, "text": ref["text"], "words": words_out})
+        else:
+            for ref in blk:
+                s_abs = round(max(first_onset, ref["start"]), 2)
+                e_abs = round(max(s_abs + 0.6, ref["end"]), 2)
+                final_lines.append({
+                    "start": s_abs,
+                    "end": e_abs,
+                    "text": ref["text"],
+                    "words": _even_words_for_line(ref["text"], s_abs, e_abs),
+                })
+
+    # Ensure strictly monotonic non-overlapping starts
+    for idx in range(1, len(final_lines)):
+        if final_lines[idx]["start"] < final_lines[idx - 1]["start"] + 0.2:
+            final_lines[idx]["start"] = round(final_lines[idx - 1]["end"], 2)
+            final_lines[idx]["end"] = round(max(final_lines[idx]["start"] + 0.5, final_lines[idx]["end"]), 2)
+
+    return final_lines
+
+
 def align_official_lyrics_with_stable_ts(
     vocals_path: Path,
+    audio_16k: np.ndarray,
+    db_profile: np.ndarray,
+    step_sec: float,
     official_lines: list[str],
     device_mode: str,
     first_onset: float,
-) -> tuple[list[dict], str]:
-    """Force-align 100% REAL official lyrics text directly onto isolated vocals.mp3!"""
+) -> tuple[list[dict], str, bool]:
+    """Force-align 100% REAL official lyrics text directly onto isolated vocals.mp3.
+    Automatically detects mid-song starts, skipped/swapped concert verses, or encores and
+    engages Section-Anchored Live Alignment on the same loaded model!
+    """
+    ensure_ffmpeg_in_path()
     add_nvidia_dll_dirs()
     import stable_whisper
 
@@ -338,25 +650,48 @@ def align_official_lyrics_with_stable_ts(
     use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
     lang = detect_lyrics_language(official_lines)
     text_block = "\n".join(official_lines)
+    audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
 
-    def _run(dev: str):
+    def _load(dev: str):
         ctype = "float16" if dev == "cuda" else "int8"
         kw = {"device": dev, "compute_type": ctype, "download_root": str(MODEL_DIR)}
         if dev == "cpu":
             kw["cpu_threads"] = max(4, min(8, os.cpu_count() or 4))
-        m = stable_whisper.load_faster_whisper("large-v3-turbo", **kw)
-        return m.align(str(vocals_path), text_block, language=lang, original_split=True, verbose=False)
+        return stable_whisper.load_faster_whisper("large-v3-turbo", **kw)
 
     used_dev = "cuda" if use_cuda else "cpu"
     try:
-        aligned = _run(used_dev)
+        model = _load(used_dev)
+        aligned = model.align(
+            audio_16k if len(audio_16k) > 0 else str(vocals_path),
+            text_block,
+            language=lang,
+            original_split=True,
+            verbose=False,
+        )
     except Exception as e:
         if used_dev == "cuda":
             print(f"[Lyrics] Forced-align CUDA fallback to CPU: {e}", file=sys.stderr, flush=True)
             used_dev = "cpu"
-            aligned = _run("cpu")
+            model = _load("cpu")
+            aligned = model.align(
+                audio_16k if len(audio_16k) > 0 else str(vocals_path),
+                text_block,
+                language=lang,
+                original_split=True,
+                verbose=False,
+            )
         else:
             raise
+
+    needs_live, reason = _alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec)
+    if needs_live:
+        print(f"[Lyrics] Detected non-standard live/abridged structure ({reason}); engaging section-anchored live alignment...", flush=True)
+        live_lines = _live_section_anchored_align(
+            model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset
+        )
+        if len(live_lines) >= 4:
+            return live_lines, used_dev, True
 
     lines = []
     for seg in aligned.segments:
@@ -377,7 +712,7 @@ def align_official_lyrics_with_stable_ts(
 
         lines.append({"start": start_s, "end": end_s, "text": txt, "words": words_out})
 
-    return lines, used_dev
+    return lines, used_dev, False
 
 
 def fallback_free_transcribe(
@@ -484,7 +819,7 @@ def main() -> int:
         })
 
     try:
-        update("running", 10, "正在搜尋原片字幕同官方歌詞...")
+        update("running", 10, "載入歌詞中...")
         yt_lines, yt_lang, title, duration, yt_desc = fetch_youtube_human_subtitles(args.video_id)
 
         # Layer 1: Human YouTube subtitles (unless user explicitly requested AI re-alignment)
@@ -493,17 +828,17 @@ def main() -> int:
                 "video_id": args.video_id,
                 "title": title,
                 "source": "youtube_sub",
-                "source_label": f"YouTube 字幕 ({yt_lang})",
+                "source_label": "同步字幕",
                 "lines": yt_lines,
                 "created_at": time.time(),
             }
             out_file.parent.mkdir(parents=True, exist_ok=True)
             out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            update("ready", 100, f"已載入 YouTube 字幕 ({yt_lang})")
+            update("ready", 100, "歌詞已就緒")
             return 0
 
         # Layer 2: Multi-source official lyrics lookup (LRCLIB + NetEase)
-        update("running", 25, "正在從歌詞庫取得官方原版歌詞...")
+        update("running", 25, "搜尋歌詞中...")
         lrc_synced, official_lines, lrc_src = fetch_official_lyrics(title, duration, yt_desc)
 
         if lrc_synced and not force_ai:
@@ -511,39 +846,40 @@ def main() -> int:
                 "video_id": args.video_id,
                 "title": title,
                 "source": "lrclib_exact",
-                "source_label": "官方同步歌詞",
+                "source_label": "同步歌詞",
                 "lines": lrc_synced,
                 "created_at": time.time(),
             }
             out_file.parent.mkdir(parents=True, exist_ok=True)
             out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            update("ready", 100, "已載入官方同步歌詞")
+            update("ready", 100, "歌詞已就緒")
             return 0
 
         if not vocals_path.exists():
-            raise RuntimeError("搵唔到純人聲檔 vocals.mp3，請先開始唱K 拆軌。")
+            raise RuntimeError("請先開啟唱 K 伴奏")
 
-        db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
+        audio_16k, db_profile, step_sec, first_onset = detect_vocal_energy_profile(vocals_path)
 
         # Layer 3A (BEST): Forced Alignment of 100% REAL official lyrics onto vocals.mp3!
+        # Automatically detects skipped/swapped concert sections or mid-song starts & re-anchors!
         if official_lines:
-            update("running", 50, f"AI 正在將官方歌詞逐字強制對齊人聲軌（來源：{lrc_src}）...")
-            ai_lines, used_dev = align_official_lyrics_with_stable_ts(
-                vocals_path, official_lines, args.device_mode, first_onset
+            update("running", 50, "對齊歌詞中...")
+            ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
+                vocals_path, audio_16k, db_profile, step_sec, official_lines, args.device_mode, first_onset
             )
-            src = "forced_align"
-            label = f"官方歌詞 AI 強制對齊 ({used_dev.upper()})"
+            src = "live_anchored_align" if used_live else "forced_align"
+            label = "同步歌詞"
         else:
             # Layer 3B: Free transcription with strict RMS silence gate
-            update("running", 50, "未搵到官方詞庫，AI 正在由純人聲軌辨識歌詞...")
+            update("running", 50, "辨識歌詞中...")
             ai_lines, used_dev = fallback_free_transcribe(
                 vocals_path, args.device_mode, db_profile, step_sec, first_onset
             )
             src = "whisper_ai"
-            label = f"AI 純人聲辨識 ({used_dev.upper()})"
+            label = "同步歌詞"
 
         if not ai_lines:
-            raise RuntimeError("未能對齊到歌詞。")
+            raise RuntimeError("暫未能對齊歌詞")
 
         result = {
             "video_id": args.video_id,
@@ -555,10 +891,10 @@ def main() -> int:
         }
         out_file.parent.mkdir(parents=True, exist_ok=True)
         out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        update("ready", 100, f"歌詞對齊完成（耗時 {round(time.time() - started, 1)} 秒）")
+        update("ready", 100, "歌詞已就緒")
         return 0
     except Exception as exc:
-        update("error", 0, f"歌詞生成失敗：{exc}", error=str(exc))
+        update("error", 0, "暫未能載入歌詞", error=str(exc))
         print(f"[LyricsWorker Error] {exc}", file=sys.stderr, flush=True)
         return 1
 

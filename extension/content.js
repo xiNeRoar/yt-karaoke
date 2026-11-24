@@ -315,19 +315,19 @@
     }
 
     async loadTracks(videoId, mode, onProgress) {
-      if (onProgress) onProgress("正在初始化音訊引擎...", 94);
+      if (onProgress) onProgress("載入伴奏中...", 94);
       await this.ensureContext();
       const key = `${videoId}_${mode}`;
       if (this.loadedKey === key && this.instBuffer && this.vocBuffer) {
         return;
       }
 
-      if (onProgress) onProgress("正在讀取伴奏軌...", 95);
+      if (onProgress) onProgress("載入伴奏中...", 95);
       const instRaw = await fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`);
-      if (onProgress) onProgress("正在讀取導唱人聲軌...", 97);
+      if (onProgress) onProgress("載入伴奏中...", 97);
       const vocRaw = await fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`);
 
-      if (onProgress) onProgress("正在解碼雙軌音訊...", 99);
+      if (onProgress) onProgress("載入伴奏中...", 99);
       const [instBuf, vocBuf] = await Promise.all([
         this.ctx.decodeAudioData(instRaw.slice(0)),
         this.ctx.decodeAudioData(vocRaw.slice(0)),
@@ -914,7 +914,7 @@
     const ov = ensureLyricsOverlay();
     if (ov) {
       ov.root.classList.add("visible");
-      ov.statusEl.textContent = forceAi ? "AI 正在對準純人聲逐字對齊歌詞..." : "正在載入同步歌詞...";
+      ov.statusEl.textContent = forceAi ? "對齊歌詞中..." : "載入歌詞中...";
       setSlotContent(ov.topSlot, "", 0);
       setSlotContent(ov.bottomSlot, "", 0);
       ov.countdownEl.classList.remove("active");
@@ -928,7 +928,7 @@
 
     if (!res.ok) {
       state.lyricsLoading = false;
-      if (ov) ov.statusEl.textContent = `歌詞載入失敗：${res.error || "未知錯誤"}`;
+      if (ov) ov.statusEl.textContent = "暫未能載入歌詞";
       updateUI();
       return;
     }
@@ -964,7 +964,7 @@
           if (ov) ov.statusEl.textContent = d.stage_text || d.error || "無法生成歌詞";
           updateUI();
         } else if (ov) {
-          ov.statusEl.textContent = d.stage_text || "正在生成歌詞...";
+          ov.statusEl.textContent = d.stage_text || "載入歌詞中...";
         }
       } finally {
         inFlight = false;
@@ -1079,7 +1079,7 @@
       });
 
       if (!res.ok) {
-        throw new Error(res.error || (res.data && res.data.detail) || "未能連接本機 Backend");
+        throw new Error(res.error || (res.data && res.data.detail) || "未能連線伺服器");
       }
 
       const job = res.data;
@@ -1300,7 +1300,7 @@
     const lyricsToggleBtn = el("button", {
       className: "ktv-mini-btn pill-standalone",
       type: "button",
-      title: "段片無字幕先需要開（自動抽字幕或用 AI 對準純人聲逐字生成）",
+      title: "開關同步歌詞",
       textContent: "關",
       onClick: () => toggleLyrics(),
     });
@@ -1323,7 +1323,7 @@
     const lyricsAiBtn = el("button", {
       className: "ktv-mini-btn pill-standalone",
       type: "button",
-      title: "強制用本地 AI 針對呢條片嘅純人聲重新逐字對齊（適合 Live 版）",
+      title: "重新對齊歌詞（適合 Live 或翻唱版）",
       textContent: "AI 對齊",
       onClick: () => requestLyrics(true),
     });

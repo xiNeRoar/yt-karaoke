@@ -81,7 +81,7 @@ def main() -> int:
         "mode": args.mode,
         "status": "downloading",
         "progress": 6,
-        "stage_text": "正在從 YouTube 下載音訊...",
+        "stage_text": "準備音訊中...",
         "error": None,
         "title": "",
         "duration": 0.0,
@@ -117,7 +117,7 @@ def main() -> int:
                 if total > 0:
                     ratio = min(1.0, downloaded / total)
                     pct = int(8 + ratio * 18)
-                    update(progress=pct, stage_text=f"正在下載歌曲音訊... {int(ratio * 100)}%")
+                    update(progress=pct, stage_text=f"下載音訊中... {int(ratio * 100)}%")
 
         ydl_opts = {
             "format": "bestaudio/best",
@@ -155,7 +155,7 @@ def main() -> int:
                 raise RuntimeError("下載音訊失敗，搵唔到音訊檔案。")
             wav_path = candidates[0]
 
-        update(title=title, duration=duration, status="separating", progress=28, stage_text="正在載入 AI 去人聲模型...")
+        update(title=title, duration=duration, status="separating", progress=28, stage_text="準備去人聲中...")
 
         # Step 2: Setup PyTorch & audio-separator
         if device_mode == "cpu":
@@ -202,7 +202,7 @@ def main() -> int:
                     self._last_report = now
                     frac = min(1.0, self.n / self.total)
                     pct = int(42 + frac * 48)  # 42% -> 90%
-                    update(progress=pct, stage_text=f"AI 正在精準去除人聲... {int(frac * 100)}%")
+                    update(progress=pct, stage_text=f"去人聲中... {int(frac * 100)}%")
 
             def set_description(self, *a, **kw):
                 pass
@@ -227,7 +227,7 @@ def main() -> int:
             model_file_dir=str(MODEL_DIR),
             output_dir=str(out_dir),
             output_format="MP3",
-            output_bitrate="256k",
+            output_bitrate="320k",
             normalization_threshold=0.9,
             use_autocast=cuda_ok,
             use_soundfile=False,
@@ -235,7 +235,7 @@ def main() -> int:
                 "segment_size": 256,
                 "override_model_segment_size": False,
                 "batch_size": 1,
-                "overlap": 2,  # 4x faster than overlap=8 while keeping ~12.8dB SDR
+                "overlap": 4,  # Cleaner highs & smoother live concert separation with ~13dB SDR
                 "pitch_shift": 0,
             },
         )
@@ -243,7 +243,7 @@ def main() -> int:
             separator.torch_device = torch.device("cpu")
             separator.onnx_execution_provider = ["CPUExecutionProvider"]
 
-        update(progress=34, stage_text="正在準備 AI 去人聲引擎...")
+        update(progress=34, stage_text="準備去人聲中...")
         separator.load_model(model_filename=model_filename)
 
         # Install Real-Time Dynamic GPU <-> CPU Scheduler onto the loaded RoFormer instance!
@@ -324,10 +324,10 @@ def main() -> int:
             mi._run_roformer_model = dynamic_run_roformer_model
             state["device_used"] = f"Dynamic ({gpu_name} / CPU)"
 
-        update(progress=42, stage_text="AI 正在精準去除人聲... 0%")
+        update(progress=42, stage_text="去人聲中... 0%")
         output_files = separator.separate(str(wav_path))
 
-        update(status="finalizing", progress=93, stage_text="正在整理伴奏與人聲軌...")
+        update(status="finalizing", progress=93, stage_text="最後整理中...")
 
         inst_path = None
         voc_path = None
@@ -367,7 +367,7 @@ def main() -> int:
             status="ready",
             progress=100,
             elapsed_sec=elapsed,
-            stage_text=f"伴奏準備完成！（耗時 {elapsed} 秒）",
+            stage_text="伴奏已就緒",
         )
         return 0
     except Exception as exc:

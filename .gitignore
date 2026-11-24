@@ -5,11 +5,14 @@ backend/.venv/
 
 # Local secrets & machine-specific config (NEVER commit!)
 backend/.admin_token
+backend/.worker_secret
 backend/config.json
 backend/gdrive_index.json
 gateway/.env
 gateway/rclone.conf
 gateway/data/
+nas-deploy/
+*.local.yml
 *.env
 .env*
 
