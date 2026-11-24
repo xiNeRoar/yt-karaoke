@@ -1292,48 +1292,54 @@ QWEN3_LANG_MAP = {
 }
 
 
-def align_official_lyrics_with_qwen3(
-    vocals_path: Path,
+def refine_lines_with_qwen3(
+    lines: list[dict],
     audio_16k: np.ndarray,
     db_profile: np.ndarray,
     step_sec: float,
-    official_lines: list[str],
     device_mode: str,
     first_onset: float,
-) -> tuple[Optional[list[dict]], str, str]:
-    """Primary GPU Forced Aligner using Qwen/Qwen3-ForcedAligner-0.6B.
+) -> tuple[list[dict], bool]:
+    """Windowed batched Cantonese/multilingual word-level timestamp refinement using Qwen3-ForcedAligner-0.6B.
 
-    Natively trained on Cantonese/Mandarin/English/Japanese/Korean + singing voice.
-    Aligns a full silence-collapsed song (~500 chars) in ~2-3s on RTX GPU.
-    Returns (lines_or_None, used_dev, fallback_reason).
+    Takes globally scaffolded lines (from stable-ts, which already resolves repeated choruses & live cuts),
+    groups them into clean ~50s windows (no repeated chorus inside a window), and runs Qwen3-ForcedAligner
+    across each window to produce ultra-accurate per-character KTV sweep timestamps (~2-3s total on GPU).
+    Falls back gracefully per-window or globally to original lines on low VRAM / CPU / any error.
     """
-    if device_mode == "cpu":
-        return None, "cpu", "cpu_mode"
+    if not lines or len(lines) < 2 or device_mode == "cpu" or len(audio_16k) == 0:
+        return lines, False
 
     free_mb = query_free_vram_mb()
     if device_mode != "gpu" and free_mb < 2200:
-        return None, "cpu", f"low_vram({free_mb:.0f}MB)"
+        return lines, False
 
-    lang = detect_lyrics_language(official_lines)
+    lang = detect_lyrics_language([ln.get("text", "") for ln in lines])
     qwen_lang = QWEN3_LANG_MAP.get(lang)
     if not qwen_lang:
-        return None, "cpu", f"unsupported_lang({lang})"
+        return lines, False
 
-    audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
-    if len(audio_16k) == 0 or len(db_profile) == 0:
-        return None, "cpu", "no_audio_profile"
+    audio_dur = len(audio_16k) / 16000.0
 
-    # Pillar 1: Collapse silent instrumental interludes (>1.6s) so even 5-6 min songs fit inside Qwen3's 300s window!
-    comp_audio, time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
-    comp_dur = len(comp_audio) / 16000.0
-    if comp_dur <= 1.0 or comp_dur > 285.0:
-        return None, "cpu", f"comp_dur_out_of_range({comp_dur:.1f}s)"
+    # Group lines into ~45-60s windows so no repeated chorus appears in the same window
+    windows: list[list[int]] = []
+    cur_win: list[int] = []
+    win_start = float(lines[0]["start"])
+    for idx, ln in enumerate(lines):
+        if cur_win and (float(ln["end"]) - win_start > 55.0 or len(cur_win) >= 14):
+            windows.append(cur_win)
+            cur_win = [idx]
+            win_start = float(ln["start"])
+        else:
+            cur_win.append(idx)
+    if cur_win:
+        windows.append(cur_win)
 
     try:
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         import torch
         if not torch.cuda.is_available():
-            return None, "cpu", "no_cuda"
+            return lines, False
         from qwen_asr import Qwen3ForcedAligner
 
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -1342,69 +1348,96 @@ def align_official_lyrics_with_qwen3(
             dtype=dtype,
             device_map="cuda:0",
         )
-        # Pre-count tokens per official line using Qwen3's exact tokenizer so we map 1:1 back to lines!
-        line_token_counts: list[int] = []
-        valid_lines: list[str] = []
-        for line in official_lines:
-            wlist, _ = aligner.aligner_processor.encode_timestamp(line, qwen_lang)
-            if wlist:
-                valid_lines.append(line)
-                line_token_counts.append(len(wlist))
-        if len(valid_lines) < 4:
-            return None, "cuda", "too_few_lines"
 
-        full_text = "\n".join(valid_lines)
-        res = aligner.align(audio=(comp_audio, 16000), text=full_text, language=qwen_lang)
-        items = list(res[0].items) if (res and len(res) > 0) else []
-        expected_total = sum(line_token_counts)
-        if not items or len(items) != expected_total:
-            return None, "cuda", f"token_count_mismatch({len(items)}!={expected_total})"
+        refined = [dict(ln) for ln in lines]
+        refined_windows = 0
 
-        lines: list[dict] = []
-        cursor = 0
-        squished = 0
-        for line_txt, n_tok in zip(valid_lines, line_token_counts):
-            tok_slice = items[cursor: cursor + n_tok]
-            cursor += n_tok
-            if not tok_slice:
+        for wi, idx_list in enumerate(windows):
+            prev_end = float(lines[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
+            next_start = float(lines[idx_list[-1] + 1]["start"]) if (idx_list[-1] + 1) < len(lines) else audio_dur
+            # Pad window boundaries safely without crossing into neighboring sung lines
+            pad_left = min(1.5, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * 0.45))
+            pad_right = min(1.5, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * 0.45))
+            w_t0 = max(0.0, float(lines[idx_list[0]]["start"]) - pad_left)
+            w_t1 = min(audio_dur, float(lines[idx_list[-1]]["end"]) + pad_right)
+            if w_t1 - w_t0 < 1.0 or w_t1 - w_t0 > 120.0:
                 continue
-            raw_s = _map_comp_to_real(float(tok_slice[0].start_time), time_map)
-            raw_e = _map_comp_to_real(float(tok_slice[-1].end_time), time_map)
-            if (float(tok_slice[-1].end_time) - float(tok_slice[0].start_time)) <= 0.25 and n_tok >= 4:
-                squished += 1
-            start_s = round(max(first_onset, raw_s), 2)
-            end_s = round(max(start_s + 0.4, raw_e), 2)
 
-            words_out = []
-            for it in tok_slice:
-                wt = (it.text or "").strip()
-                if not wt:
+            s0 = int(round(w_t0 * 16000))
+            s1 = int(round(w_t1 * 16000))
+            chunk_audio = audio_16k[s0:s1]
+            if len(chunk_audio) < 8000:
+                continue
+
+            valid_pairs: list[tuple[int, str, int]] = []
+            for idx in idx_list:
+                txt = (lines[idx].get("text") or "").strip()
+                wlist, _ = aligner.aligner_processor.encode_timestamp(txt, qwen_lang)
+                if wlist:
+                    valid_pairs.append((idx, txt, len(wlist)))
+            if not valid_pairs:
+                continue
+
+            win_text = "\n".join(p[1] for p in valid_pairs)
+            res = aligner.align(audio=(chunk_audio, 16000), text=win_text, language=qwen_lang)
+            items = list(res[0].items) if (res and len(res) > 0) else []
+            expected_n = sum(p[2] for p in valid_pairs)
+            if not items or len(items) != expected_n:
+                continue
+
+            # Build candidate refined lines for this window and sanity-check before committing
+            cand_updates: list[tuple[int, dict]] = []
+            cursor = 0
+            squished = 0
+            for idx, txt, n_tok in valid_pairs:
+                tok_slice = items[cursor: cursor + n_tok]
+                cursor += n_tok
+                if not tok_slice:
                     continue
-                ws = round(max(start_s, _map_comp_to_real(float(it.start_time), time_map)), 2)
-                we = round(max(ws + 0.05, _map_comp_to_real(float(it.end_time), time_map)), 2)
-                words_out.append({"start": ws, "end": we, "word": wt})
+                local_s = float(tok_slice[0].start_time)
+                local_e = float(tok_slice[-1].end_time)
+                if (local_e - local_s) <= 0.22 and n_tok >= 4:
+                    squished += 1
+                abs_s = round(max(first_onset, w_t0 + local_s), 2)
+                abs_e = round(max(abs_s + 0.35, w_t0 + local_e), 2)
+                words_out = []
+                for it in tok_slice:
+                    wt = (it.text or "").strip()
+                    if not wt:
+                        continue
+                    ws = round(max(abs_s, w_t0 + float(it.start_time)), 2)
+                    we = round(max(ws + 0.05, w_t0 + float(it.end_time)), 2)
+                    words_out.append({"start": ws, "end": we, "word": wt})
+                cand_updates.append((idx, {"start": abs_s, "end": abs_e, "text": txt, "words": words_out}))
 
-            lines.append({"start": start_s, "end": end_s, "text": line_txt, "words": words_out})
+            if cand_updates and (squished / len(cand_updates)) <= 0.25:
+                for idx, upd in cand_updates:
+                    refined[idx] = upd
+                refined_windows += 1
 
-        # Clean up VRAM immediately after alignment
         del aligner
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
 
-        # Structural sanity check: if >35% of lines collapsed into <=0.25s (abridged live / skipped verses),
-        # hand off to section-anchored live alignment!
-        if len(lines) < 4:
-            return None, "cuda", "too_few_aligned_lines"
-        if squished / len(lines) > 0.35:
-            return None, "cuda", f"abridged_structure({squished}/{len(lines)}_squished)"
+        if refined_windows == 0:
+            return lines, False
 
-        lines = refine_alignment_with_acoustics(lines, db_profile, step_sec, audio_dur, first_onset)
-        return lines, "cuda", ""
+        # Ensure strict monotonic non-overlapping line boundaries across window edges
+        for i in range(1, len(refined)):
+            if refined[i]["start"] < refined[i - 1]["end"]:
+                mid = round((refined[i - 1]["end"] + refined[i]["start"]) / 2.0, 2)
+                refined[i - 1]["end"] = max(refined[i - 1]["start"] + 0.3, mid)
+                refined[i]["start"] = max(refined[i - 1]["end"], refined[i]["start"])
+                refined[i]["end"] = max(refined[i]["start"] + 0.35, refined[i]["end"])
+
+        refined = refine_alignment_with_acoustics(refined, db_profile, step_sec, audio_dur, first_onset)
+        print(f"[Lyrics] Qwen3-ForcedAligner refined {refined_windows}/{len(windows)} windows ({len(refined)} lines)", file=sys.stderr, flush=True)
+        return refined, True
     except Exception as exc:
-        print(f"[Lyrics] Qwen3-ForcedAligner fallback to stable-ts: {exc}", file=sys.stderr, flush=True)
-        return None, "cpu", f"exception:{exc}"
+        print(f"[Lyrics] Qwen3-ForcedAligner refinement skipped: {exc}", file=sys.stderr, flush=True)
+        return lines, False
 
 
 def align_official_lyrics_with_stable_ts(
@@ -1719,37 +1752,29 @@ def main() -> int:
             if shz_lines:
                 official_lines = shz_lines
 
-        # Layer 3A (BEST): Silence-Collapsed Forced Alignment of 100% REAL official lyrics!
-        # Priority 1: Qwen3-ForcedAligner-0.6B on GPU (~2-3s, native Cantonese/CJK/EN/JP/KR singing voice!)
-        # Priority 2: stable-ts (faster-whisper large-v3-turbo) on low-VRAM CPU or abridged/mashup live cuts!
+        # Layer 3A (BEST): 2-Stage Forced Alignment of 100% REAL official lyrics!
+        # Stage 1: stable-ts global scaffold (handles repeated choruses, live skipped verses, mashups).
+        # Stage 2: Qwen3-ForcedAligner-0.6B windowed refinement (~2-3s GPU, native Cantonese/CJK/EN/JP/KR precision!).
         if official_lines:
             update("running", 50, "對齊歌詞中...")
             is_multi_song_mashup = is_mashup_title or len(shazam_tracks) >= 2
-            ai_lines = []
-            used_dev = "cpu"
-            used_live = False
-            src = "forced_align"
-
-            if not is_multi_song_mashup:
-                q_lines, q_dev, q_reason = align_official_lyrics_with_qwen3(
-                    vocals_path, audio_16k, db_profile, step_sec, official_lines,
-                    args.device_mode, first_onset,
+            ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
+                vocals_path, audio_16k, db_profile, step_sec, official_lines,
+                args.device_mode, first_onset, prefer_live=is_multi_song_mashup,
+                inst_path=inst_path, shazam_already_tried=shazam_tried,
+            )
+            qwen_ok = False
+            if ai_lines:
+                update("running", 82, "精修歌詞時間軸...")
+                ai_lines, qwen_ok = refine_lines_with_qwen3(
+                    ai_lines, audio_16k, db_profile, step_sec, args.device_mode, first_onset
                 )
-                if q_lines and len(q_lines) >= 4:
-                    ai_lines = q_lines
-                    used_dev = q_dev
-                    src = "qwen3_forced_align"
-                elif q_reason:
-                    print(f"[Lyrics] Qwen3 skipped ({q_reason}), falling back to stable-ts", file=sys.stderr, flush=True)
-
-            if not ai_lines:
-                prefer_live = is_multi_song_mashup
-                ai_lines, used_dev, used_live = align_official_lyrics_with_stable_ts(
-                    vocals_path, audio_16k, db_profile, step_sec, official_lines,
-                    args.device_mode, first_onset, prefer_live=prefer_live,
-                    inst_path=inst_path, shazam_already_tried=shazam_tried,
-                )
-                src = "mashup_shazam_align" if len(shazam_tracks) >= 2 else ("live_anchored_align" if used_live else "forced_align")
+            if len(shazam_tracks) >= 2:
+                src = "mashup_qwen3_align" if qwen_ok else "mashup_shazam_align"
+            elif used_live:
+                src = "live_qwen3_align" if qwen_ok else "live_anchored_align"
+            else:
+                src = "qwen3_forced_align" if qwen_ok else "forced_align"
             label = "同步歌詞"
         else:
             # Layer 3B: Free transcription + automatic Lyric-Phrase Rescue (identifies acoustic/live covers with no title!)
@@ -1760,20 +1785,18 @@ def main() -> int:
             rescued_lines = search_official_lyrics_by_sung_phrases(ai_lines) if len(ai_lines) >= 4 else []
             if rescued_lines:
                 update("running", 75, "對齊歌詞中...")
-                q_lines, q_dev, _ = align_official_lyrics_with_qwen3(
+                ai_lines, used_dev, _ = align_official_lyrics_with_stable_ts(
                     vocals_path, audio_16k, db_profile, step_sec, rescued_lines,
-                    args.device_mode, first_onset,
+                    args.device_mode, first_onset, prefer_live=True,
+                    inst_path=inst_path, shazam_already_tried=True,
                 )
-                if q_lines and len(q_lines) >= 4:
-                    ai_lines, used_dev = q_lines, q_dev
-                    src = "qwen3_phrase_rescue_align"
-                else:
-                    ai_lines, used_dev, _ = align_official_lyrics_with_stable_ts(
-                        vocals_path, audio_16k, db_profile, step_sec, rescued_lines,
-                        args.device_mode, first_onset, prefer_live=True,
-                        inst_path=inst_path, shazam_already_tried=True,
+                qwen_ok = False
+                if ai_lines:
+                    update("running", 88, "精修歌詞時間軸...")
+                    ai_lines, qwen_ok = refine_lines_with_qwen3(
+                        ai_lines, audio_16k, db_profile, step_sec, args.device_mode, first_onset
                     )
-                    src = "phrase_rescue_align"
+                src = "qwen3_phrase_rescue_align" if qwen_ok else "phrase_rescue_align"
             else:
                 src = "whisper_ai"
             label = "同步歌詞"
