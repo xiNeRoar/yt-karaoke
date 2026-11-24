@@ -315,22 +315,37 @@ def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str)
     return score
 
 
+CONCERT_NOISE_PART_RE = re.compile(
+    r"^(世界)?巡[迴回]?(演唱|音樂)[會会]$|^(演唱|音樂)[會会]$|^特別版$|^完整版$|^高清版?$|^純享版?$|^現場版?$|^第[一二三四五六七八九十百0-9]+場$|^[\u4e00-\u9fff]{2,4}站$",
+)
+
+
 def fetch_official_lyrics(title: str, duration: float, yt_desc: str = "") -> tuple[Optional[list[dict]], list[str], str]:
     """Search LRCLIB + NetEase Cloud Music for 100% official lyrics text (even for live covers!).
     Strictly validates that the returned trackName matches the YouTube video title so artist-name queries
     NEVER pull the wrong song (e.g. '斷點' for '張敬軒 - 春秋').
     """
     cleaned = clean_search_title(title)
-    queries = []
-    # 1) Always try full cleaned title FIRST ("張敬軒 春秋") so artist + song stay together!
-    if cleaned:
+    queries: list[str] = []
+
+    # 1) Highest priority: song titles explicitly wrapped in 《...》 / 「...」 / 『...』 (e.g. concert ENCORE titles!)
+    for m in re.finditer(r"[《「『〈]([^》」』〉]{2,40})[》」』〉]", title or ""):
+        quoted = clean_search_title(m.group(1)).strip()
+        if quoted and quoted not in queries:
+            queries.append(quoted)
+
+    # 2) Full cleaned title ("張敬軒 春秋") so artist + song stay together for studio/MV titles
+    if cleaned and cleaned not in queries:
         queries.append(cleaned)
-    # 2) Then try individual CJK segments (both shorter and longer, e.g. "春秋" AND "戀愛腦之死")
+
+    # 3) Meaningful CJK segments (skipping tour/city/venue filler like '世界巡迴演唱會', '武漢站', '第六場')
     cjk_parts = re.findall(r"[\u4e00-\u9fff]{2,}", cleaned)
     for p in cjk_parts:
+        if CONCERT_NOISE_PART_RE.match(p):
+            continue
         if p not in queries:
             queries.append(p)
-    if title not in queries:
+    if title and title not in queries:
         queries.append(title)
 
     is_live_or_alt = bool(LIVE_KEYWORDS_RE.search(title)) or bool(LIVE_KEYWORDS_RE.search(yt_desc[:200]))
