@@ -115,6 +115,21 @@ def query_free_vram_mb() -> float:
         return 0.0
 
 
+def _whisper_align_lang(lang: str) -> str:
+    """Normalize Cantonese 'yue' -> 'zh' for Whisper/stable-ts so split_words_by_space stays False."""
+    return "zh" if lang == "yue" else lang
+
+
+def _whisper_load_kwargs(dev: str) -> dict:
+    """Shared faster-whisper/stable-ts model kwargs with multi-core CPU thread scaling."""
+    ctype = "float16" if dev == "cuda" else "int8"
+    kw: dict = {"device": dev, "compute_type": ctype, "download_root": str(MODEL_DIR)}
+    if dev == "cpu":
+        cores = os.cpu_count() or 4
+        kw["cpu_threads"] = max(4, min(16, (cores // 2) if cores >= 12 else cores))
+    return kw
+
+
 def _is_non_chinese_cjk(text: str) -> bool:
     """True when text contains Japanese Kana or Korean Hangul (must NEVER be passed through Chinese OpenCC!)."""
     return bool(re.search(r"[\u3040-\u30ff\uac00-\ud7af]", text or ""))
@@ -1650,13 +1665,15 @@ def _alignment_needs_live_rematch(
     max_tight_run = 0
     low_prob = 0
     prev_start = -1.0
+    prev_was_zero = False
     for seg in segs:
         txt = (seg.text or "").strip()
         n_syl = estimate_syllable_units(txt)
         rs = _map_comp_to_real(float(seg.start), time_map, is_end=False) if time_map else float(seg.start)
         re_ = _map_comp_to_real(float(seg.end), time_map, is_end=True) if time_map else float(seg.end)
         dur = re_ - rs
-        if dur < max(0.45, 0.09 * n_syl) or (prev_start >= 0 and (rs - prev_start) < 0.25):
+        is_zero = dur <= 0.02
+        if dur < max(0.45, 0.09 * n_syl) or (prev_start >= 0 and not prev_was_zero and (rs - prev_start) < 0.25):
             crushed += 1
         if n_syl >= 4.0 and dur < 0.55:
             tight_run += 1
@@ -1664,13 +1681,15 @@ def _alignment_needs_live_rematch(
         else:
             tight_run = 0
         prev_start = rs
+        prev_was_zero = is_zero
         probs = [w.probability for w in (seg.words or []) if w.probability is not None]
         avg_p = (sum(probs) / len(probs)) if probs else 0.0
         if avg_p < 0.28:
             low_prob += 1
 
     low_ratio = low_prob / max(1, len(segs))
-    if crushed >= 2 or max_tight_run >= 3:
+    min_crushed = max(3, int(round(len(segs) * 0.08)))
+    if crushed >= min_crushed or max_tight_run >= 3:
         return True, f"crushed={crushed},tight_run={max_tight_run}"
     if low_ratio >= 0.24:
         return True, f"low_prob={low_ratio:.2f}"
@@ -1826,7 +1845,8 @@ def _live_section_anchored_align(
     # Run on silence-collapsed audio with vad_filter=False & word_timestamps=True so falsetto/reverberant singing
     # is NEVER dropped by speech-trained Silero VAD, and multi-song mashups auto-detect mixed languages!
     is_multi_pool_in = bool(initial_song_pools and len(initial_song_pools) >= 2)
-    transcribe_lang = None if is_multi_pool_in else ("zh" if lang == "yue" else lang)
+    whisper_lang = _whisper_align_lang(lang)
+    transcribe_lang = None if is_multi_pool_in else whisper_lang
     if len(audio_16k) > 0 and len(db_profile) > 0:
         comp_audio, comp_time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
         if len(comp_audio) == 0 or not comp_time_map:
@@ -1857,7 +1877,7 @@ def _live_section_anchored_align(
         res = model.transcribe(
             comp_audio,
             language=transcribe_lang,
-            beam_size=2,
+            beam_size=2 if use_cuda else 1,
             vad=False,
             suppress_silence=False,
             condition_on_previous_text=False,
@@ -2319,7 +2339,14 @@ def _live_section_anchored_align(
                         chunk, db_profile[di0:di1], step_sec, thr_db=blk_thr_db
                     )
             try:
-                al = model.align(align_chunk, blk_text, language=lang, original_split=True, verbose=False)
+                al = model.align(
+                    align_chunk,
+                    blk_text,
+                    language=_whisper_align_lang(lang),
+                    original_split=True,
+                    fast_mode=(not use_cuda),
+                    verbose=False,
+                )
                 al_segs = list(al.segments or [])
             except Exception:
                 al_segs = []
@@ -2420,8 +2447,7 @@ def _detect_cantonese_vs_mandarin_audio(
             if len(clip) >= 16000 * 5:
                 free_mb = query_free_vram_mb()
                 dev = "cuda" if free_mb >= 2000 else "cpu"
-                ctype = "float16" if dev == "cuda" else "int8"
-                m = WhisperModel("large-v3-turbo", device=dev, compute_type=ctype, download_root=str(MODEL_DIR))
+                m = WhisperModel("large-v3-turbo", **_whisper_load_kwargs(dev))
                 _, info = m.transcribe(clip, beam_size=1, vad_filter=False, condition_on_previous_text=False)
                 det = (getattr(info, "language", "") or "").lower()
                 del m
@@ -2632,15 +2658,12 @@ def align_official_lyrics_with_stable_ts(
     free_mb = query_free_vram_mb()
     use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
     lang = detect_lyrics_language(official_lines)
+    whisper_lang = _whisper_align_lang(lang)
     text_block = "\n".join(official_lines)
     audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
 
     def _load(dev: str):
-        ctype = "float16" if dev == "cuda" else "int8"
-        kw = {"device": dev, "compute_type": ctype, "download_root": str(MODEL_DIR)}
-        if dev == "cpu":
-            kw["cpu_threads"] = max(4, min(8, os.cpu_count() or 4))
-        return stable_whisper.load_faster_whisper("large-v3-turbo", **kw)
+        return stable_whisper.load_faster_whisper("large-v3-turbo", **_whisper_load_kwargs(dev))
 
     used_dev = "cuda" if use_cuda else "cpu"
     try:
@@ -2691,8 +2714,9 @@ def align_official_lyrics_with_stable_ts(
         aligned = model.align(
             align_audio,
             text_block,
-            language=lang,
+            language=whisper_lang,
             original_split=True,
+            fast_mode=(used_dev == "cpu"),
             verbose=False,
         )
     except Exception as e:
@@ -2703,8 +2727,9 @@ def align_official_lyrics_with_stable_ts(
             aligned = model.align(
                 align_audio,
                 text_block,
-                language=lang,
+                language=whisper_lang,
                 original_split=True,
+                fast_mode=True,
                 verbose=False,
             )
         else:
@@ -2774,14 +2799,10 @@ def fast_probe_transcribe_for_rescue(
     prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_zh_title else None
 
     def _run(dev: str):
-        ctype = "float16" if dev == "cuda" else "int8"
-        kw = {"device": dev, "compute_type": ctype, "download_root": str(MODEL_DIR)}
-        if dev == "cpu":
-            kw["cpu_threads"] = max(4, min(8, os.cpu_count() or 4))
-        m = WhisperModel("large-v3-turbo", **kw)
+        m = WhisperModel("large-v3-turbo", **_whisper_load_kwargs(dev))
         segs, inf = m.transcribe(
             clip,
-            beam_size=2,
+            beam_size=1 if dev == "cpu" else 2,
             word_timestamps=False,
             vad_filter=True,
             initial_prompt=prompt,
@@ -2823,14 +2844,10 @@ def fallback_free_transcribe(
     prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_zh_title else None
 
     def _run(dev: str):
-        ctype = "float16" if dev == "cuda" else "int8"
-        kw = {"device": dev, "compute_type": ctype, "download_root": str(MODEL_DIR)}
-        if dev == "cpu":
-            kw["cpu_threads"] = max(4, min(8, os.cpu_count() or 4))
-        m = WhisperModel("large-v3-turbo", **kw)
+        m = WhisperModel("large-v3-turbo", **_whisper_load_kwargs(dev))
         segs, inf = m.transcribe(
             str(vocals_path),
-            beam_size=5,
+            beam_size=2 if dev == "cpu" else 5,
             word_timestamps=True,
             vad_filter=False,
             initial_prompt=prompt,

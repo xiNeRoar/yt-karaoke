@@ -149,6 +149,12 @@ def test_worker_and_separator_invariants() -> None:
     assert "if lrc_synced and not force_ai and not vocals_path.exists():" in lw_src, "Layer 2 LRC must require word alignment when vocals exist"
     assert "require_all_windows=True" in lw_src, "0-word scaffolds must require 100% window coverage from Qwen3"
     assert "if lrc_synced and not force_ai and len(lrc_synced)" in lw_src, "force_ai=True must bypass LRC scaffold shortcut"
+    assert "beam_size=2 if use_cuda else 1" in lw_src, "CPU fallback live transcribe must use greedy beam_size=1"
+    import re
+    assert re.search(r"_acquire_lock_with_heartbeat\(\s*self\._lyrics_lock", sep_src), "_run_lyrics_worker must refresh heartbeat while waiting for _lyrics_lock"
+    assert re.search(r"_acquire_lock_with_heartbeat\(\s*self\._worker_lock", sep_src), "_run_worker_subprocess must refresh heartbeat while waiting for _worker_lock"
+    assert "free_mb_ly >= 2200" in sep_src, "HQUpgrade must skip force_ai lyrics when GPU VRAM is below Qwen3 threshold"
+    assert "is_cpu_lyrics" in sep_src, "_run_lyrics_worker must scale timeout when running on CPU fallback"
     assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
@@ -516,7 +522,64 @@ def test_multilingual_p0_and_p1_invariants() -> None:
     ]
     runs_mid = lw._select_monotonic_run_anchors(mid_rep, pool)
     assert len(runs_mid) == 2, f"Mid-song live chorus repeat was dropped: {runs_mid}"
+
+    # 9) stable-ts alignment language normalization (Cantonese 'yue' -> 'zh' so split_words_by_space stays False)
+    #    and _alignment_needs_live_rematch zero-duration double-count guard!
+    assert lw._whisper_align_lang("yue") == "zh" and lw._whisper_align_lang("ja") == "ja"
+    from types import SimpleNamespace
+    healthy_segs = [
+        SimpleNamespace(
+            start=float(i * 3.0),
+            end=float(i * 3.0 + 2.4),
+            text="其實世界似大戲",
+            words=[SimpleNamespace(probability=0.8)],
+        )
+        for i in range(40)
+    ]
+    # Single collapsed 0.00s segment at index 10 sharing start time with index 11 must NOT double-count into live rematch!
+    healthy_segs[10] = SimpleNamespace(start=33.0, end=33.0, text="其實世界似大戲", words=[SimpleNamespace(probability=0.5)])
+    needs_1, reason_1 = lw._alignment_needs_live_rematch(SimpleNamespace(segments=healthy_segs), 125.0, np.array([]), 0.1)
+    assert not needs_1, f"Single collapsed segment falsely triggered live rematch: {reason_1}"
+    for k in (11, 12):
+        healthy_segs[k] = SimpleNamespace(start=33.1 + k * 0.1, end=33.2 + k * 0.1, text="其實世界似大戲", words=[SimpleNamespace(probability=0.5)])
+    needs_3, _ = lw._alignment_needs_live_rematch(SimpleNamespace(segments=healthy_segs), 125.0, np.array([]), 0.1)
+    assert needs_3, "3-line tight crushed run failed to trigger live rematch!"
     print("[PASS] Multilingual P0/P1 invariants (subs, Kanji, 【title】/1874/1-char, EN syllables, solo snap, hog CDF, mid-song repeat)")
+
+
+def test_lock_heartbeat_during_queue_wait() -> None:
+    """Contended worker/lyrics lock waits must refresh status_file.updated_at so monitors never false-alarm."""
+    from atomic_io import acquire_lock_with_heartbeat, write_json_atomic
+
+    with tempfile.TemporaryDirectory() as td:
+        sf = Path(td) / "lyrics__queue_test.json"
+        t0 = time.time() - 10.0
+        write_json_atomic(sf, {"video_id": "queue_test", "status": "running", "progress": 8, "stage_text": "對齊歌詞中..."}, stamp_updated_at=False)
+        d0 = json.loads(sf.read_text(encoding="utf-8"))
+        d0["updated_at"] = t0
+        sf.write_text(json.dumps(d0, ensure_ascii=False), encoding="utf-8")
+
+        lk = threading.Lock()
+        lk.acquire()
+        acquired = threading.Event()
+
+        def _waiter():
+            acquire_lock_with_heartbeat(lk, sf, heartbeat_interval=0.12, queued_stage_text="排隊對齊歌詞中...")
+            try:
+                acquired.set()
+            finally:
+                lk.release()
+
+        wt = threading.Thread(target=_waiter, daemon=True)
+        wt.start()
+        time.sleep(0.38)
+        snap = json.loads(sf.read_text(encoding="utf-8"))
+        assert snap["updated_at"] > t0 + 5.0, f"Lock wait did not refresh updated_at: {snap}"
+        assert snap["stage_text"] == "排隊對齊歌詞中...", f"Queued stage text not updated: {snap}"
+        assert not acquired.is_set(), "Waiter should still be blocked until lock release"
+        lk.release()
+        assert acquired.wait(timeout=2.0), "Waiter did not acquire lock after release"
+    print("[PASS] Lock-wait heartbeat refreshes updated_at during contended queue waits")
 
 
 def test_sidecar_watcher_cp1252_safety() -> None:
@@ -561,6 +624,7 @@ def main() -> int:
     test_monotonic_anchor_consensus_and_contiguous_span()
     test_lrc_multi_timestamp_and_asr_splitting_and_invariants()
     test_multilingual_p0_and_p1_invariants()
+    test_lock_heartbeat_during_queue_wait()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()
     print("\nALL REGRESSION TESTS PASSED!")

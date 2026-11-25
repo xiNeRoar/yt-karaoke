@@ -36,3 +36,22 @@ def write_json_atomic(path: Path, payload: dict, stamp_updated_at: bool = True) 
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
+
+
+def acquire_lock_with_heartbeat(
+    lock: threading.Lock,
+    status_file: Path,
+    heartbeat_interval: float = 25.0,
+    queued_stage_text: str | None = None,
+) -> None:
+    """Acquire a worker lock while refreshing status_file.updated_at so monitors never false-alarm on normal queue waits."""
+    while not lock.acquire(timeout=heartbeat_interval):
+        try:
+            if status_file.exists():
+                cur = json.loads(status_file.read_text(encoding="utf-8"))
+                if cur.get("status") in ("queued", "running", "downloading", "separating", "finalizing"):
+                    if queued_stage_text:
+                        cur["stage_text"] = queued_stage_text
+                    write_json_atomic(status_file, cur)
+        except Exception:
+            pass

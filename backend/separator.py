@@ -9,6 +9,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Optional
 
+from atomic_io import acquire_lock_with_heartbeat as _acquire_lock_with_heartbeat
 from atomic_io import write_json_atomic as _write_json_atomic
 from logger import CloudSyncedLogger
 from storage import GoogleDriveStorage, find_rclone_exe
@@ -142,10 +143,17 @@ class KaraokeSeparatorManager:
             f"Backend ready | gpu={self.gpu_name} device_mode={self.device_mode} storage={self.storage_mode} gdrive={self.gdrive.is_configured()}",
         )
 
-        # Clean stale temp jobs from prior session
+        # Clean stale temp jobs & orphaned stem/meta files from prior session (never touch karaoke_live.log*)
         for p in TEMP_DIR.iterdir():
             if p.name != "jobs" and p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
+            elif p.is_file() and p.name.startswith((
+                "voc_", "inst_", "pre_voc_", "pre_inst_", "hq_voc_", "hq_inst_", "meta_", "hq_upgrade_"
+            )):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
         for p in JOBS_DIR.glob("*.json"):
             try:
                 p.unlink()
@@ -371,22 +379,31 @@ class KaraokeSeparatorManager:
                             pass
 
         # Run optional Qwen3 lyrics upgrade AFTER releasing _worker_lock so user separation jobs are NEVER blocked!
+        # Re-check idle state AND live free VRAM (>= 2200MB required for Qwen3): never pile onto an active lyrics queue or burn CPU!
         try:
-            cur_ly = self.get_lyrics(vid, mode)
-            cur_src = str(cur_ly.get("source") or "")
-            keep_sources = {
-                "youtube_sub_qwen3", "lrclib_qwen3_align",
-                "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align",
-                "qwen3_phrase_rescue_align", "whisper_qwen3_ai",
-            }
-            if cur_src not in keep_sources:
-                self.start_lyrics_generation(
-                    vid, mode, force_ai=True,
-                    local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
-                    meta_hint=upgraded_meta,
+            with self._lock:
+                idle_for_lyrics = (
+                    not self.pause_new_jobs
+                    and not self._queued_keys
+                    and not self._lyrics_in_progress
                 )
-                pre_voc_hint = None
-                pre_inst_hint = None
+            has_gpu_ly, _, free_mb_ly, _ = query_nvidia_gpu()
+            if idle_for_lyrics and self.device_mode != "cpu" and has_gpu_ly and free_mb_ly >= 2200:
+                cur_ly = self.get_lyrics(vid, mode)
+                cur_src = str(cur_ly.get("source") or "")
+                keep_sources = {
+                    "youtube_sub_qwen3", "lrclib_qwen3_align",
+                    "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align",
+                    "qwen3_phrase_rescue_align", "whisper_qwen3_ai",
+                }
+                if cur_src not in keep_sources:
+                    self.start_lyrics_generation(
+                        vid, mode, force_ai=True,
+                        local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                        meta_hint=upgraded_meta,
+                    )
+                    pre_voc_hint = None
+                    pre_inst_hint = None
         except Exception:
             pass
         finally:
@@ -678,7 +695,8 @@ class KaraokeSeparatorManager:
     def _run_worker_subprocess(self, video_id: str, mode: str, target_url: str, status_file: Path) -> None:
         key = self._job_key(video_id, mode)
         try:
-            with self._worker_lock:
+            _acquire_lock_with_heartbeat(self._worker_lock, status_file)
+            try:
                 has_gpu, gpu_name, free_mb, _ = query_nvidia_gpu()
                 effective_mode = self.device_mode if has_gpu else "cpu"
                 self.log.info(
@@ -823,6 +841,8 @@ class KaraokeSeparatorManager:
                                 _p.unlink()
                             except Exception:
                                 pass
+            finally:
+                self._worker_lock.release()
         except Exception as exc:
             self.log.error("Separate", f"Exception ({video_id}, {mode}): {exc}")
             cur = self._read_job_status(video_id, mode) or {}
@@ -1178,7 +1198,12 @@ class KaraokeSeparatorManager:
         temp_inst: Optional[Path] = local_inst_hint
         temp_meta_file: Optional[Path] = None
         try:
-            with self._lyrics_lock:
+            _acquire_lock_with_heartbeat(
+                self._lyrics_lock,
+                status_file,
+                queued_stage_text="排隊對齊歌詞中...",
+            )
+            try:
                 if local_vocals_hint and local_vocals_hint.exists():
                     vocals_path = local_vocals_hint
                 else:
@@ -1208,8 +1233,13 @@ class KaraokeSeparatorManager:
                     else:
                         inst_path = local_inst
                 out_file = self._lyrics_file(video_id)
-                has_gpu, _, _, _ = query_nvidia_gpu()
-                eff_mode = self.device_mode if has_gpu else "cpu"
+                has_gpu, _, free_mb, _ = query_nvidia_gpu()
+                if self.device_mode == "cpu" or not has_gpu:
+                    eff_mode = "cpu"
+                elif self.device_mode == "gpu":
+                    eff_mode = "gpu"
+                else:
+                    eff_mode = "auto" if free_mb >= 2000 else "cpu"
                 meta = meta_hint if (meta_hint and meta_hint.get("yt_meta_present")) else self.get_meta(video_id, mode)
                 if meta:
                     try:
@@ -1254,7 +1284,11 @@ class KaraokeSeparatorManager:
                     self._active_procs[key] = proc
 
                 dur_sec = float(meta.get("duration") or 0.0)
-                lyrics_timeout = max(480, min(1200, int(dur_sec * 2.2))) if dur_sec > 0 else 600
+                is_cpu_lyrics = (eff_mode == "cpu") or (not has_gpu) or (free_mb < 2000)
+                if is_cpu_lyrics:
+                    lyrics_timeout = max(480, min(1800, int(dur_sec * 3.0) + 120)) if dur_sec > 0 else 720
+                else:
+                    lyrics_timeout = max(240, min(900, int(dur_sec * 1.5) + 60)) if dur_sec > 0 else 480
                 try:
                     stderr_text, _ = proc.communicate(timeout=lyrics_timeout)
                 except subprocess.TimeoutExpired:
@@ -1317,6 +1351,8 @@ class KaraokeSeparatorManager:
                             cur_status = ""
                     if cur_status != "error":
                         raise RuntimeError("暫未能對齊歌詞")
+            finally:
+                self._lyrics_lock.release()
         except Exception as exc:
             self.log.error("Lyrics", f"Exception ({video_id}): {exc}")
             try:
