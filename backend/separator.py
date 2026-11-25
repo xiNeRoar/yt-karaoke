@@ -91,11 +91,13 @@ class KaraokeSeparatorManager:
         self._active_procs: Dict[str, subprocess.Popen] = {}
         self._queued_keys: set[str] = set()
         self._rate_history: Dict[str, list[float]] = {}
+        self._lyrics_rate_history: Dict[str, list[float]] = {}
         self._lyrics_mem_cache: "OrderedDict[str, dict]" = OrderedDict()
         self._lyrics_mem_max = 500
         self._lyrics_gdrive_missing: "OrderedDict[str, float]" = OrderedDict()
         self._lyrics_missing_max = 2000
         self._lyrics_in_progress: set[str] = set()
+        self._lyrics_upload_gen: Dict[str, int] = {}
         self._hq_upgrade_backoff: Dict[str, float] = {}
         self._hq_upgrade_min_vram_mb = int(os.environ.get("KARAOKE_HQ_UPGRADE_VRAM_MB", "3500"))
 
@@ -148,7 +150,7 @@ class KaraokeSeparatorManager:
             if p.name != "jobs" and p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
             elif p.is_file() and p.name.startswith((
-                "voc_", "inst_", "pre_voc_", "pre_inst_", "hq_voc_", "hq_inst_", "meta_", "hq_upgrade_"
+                "voc_", "inst_", "pre_voc_", "pre_inst_", "hq_voc_", "hq_inst_", "meta_", "hq_upgrade_", "ul_lyrics_"
             )):
                 try:
                     p.unlink(missing_ok=True)
@@ -602,6 +604,26 @@ class KaraokeSeparatorManager:
             self._rate_history[client_ip] = hist
             return True
 
+    def check_lyrics_rate_limit(self, client_ip: str) -> bool:
+        """Dedicated lyrics rate-limit bucket (separate from /api/separate so opening lyrics never eats new-song quota!)."""
+        now = time.time()
+        window = 600.0
+        cap = max(15, self.rate_limit_per_10min * 3)
+        with self._lock:
+            if len(self._lyrics_rate_history) > 500:
+                self._lyrics_rate_history = {
+                    k: [t for t in v if now - t < window]
+                    for k, v in self._lyrics_rate_history.items()
+                    if any(now - t < window for t in v)
+                }
+            hist = [t for t in self._lyrics_rate_history.get(client_ip, []) if now - t < window]
+            if len(hist) >= cap:
+                self._lyrics_rate_history[client_ip] = hist
+                return False
+            hist.append(now)
+            self._lyrics_rate_history[client_ip] = hist
+            return True
+
     def get_status(self, video_id: str, mode: str) -> dict:
         cached_modes = self.get_cached_modes(video_id)
         if self.is_cached(video_id, mode):
@@ -770,20 +792,23 @@ class KaraokeSeparatorManager:
                     )
                     return
 
-                # If Google Drive storage is active, upload immediately and delete local MP3s (0 MB local disk!)
+                # If Google Drive storage is active, start lyrics generation IN PARALLEL with synchronous
+                # Drive upload (saves 10-20s perceived lyrics wait while keeping audio 'ready' atomic for NAS Gateway!)
                 pre_voc_hint: Optional[Path] = None
                 pre_inst_hint: Optional[Path] = None
                 pre_meta_hint: Optional[dict] = None
+                lyrics_started_early = False
                 if self.storage_mode == "gdrive" and self.gdrive.is_configured():
                     local_song_dir = self.get_cache_dir(video_id, mode)
                     meta = self.get_meta(video_id, mode)
                     pre_meta_hint = meta
+                    upload_done_event = threading.Event()
                     try:
                         cur = self._read_job_status(video_id, mode) or {}
                         cur.update({"status": "finalizing", "progress": 96, "stage_text": "最後整理中..."})
                         _write_json_atomic(status_file, cur)
 
-                        # Keep tiny temporary copies of vocals & instrumental so background lyrics & Shazam run at 0s download!
+                        # Snapshot vocals & instrumental into private temp files so lyrics & Shazam start immediately!
                         local_voc = local_song_dir / "vocals.mp3"
                         local_inst = local_song_dir / "instrumental.mp3"
                         if local_voc.exists():
@@ -798,6 +823,20 @@ class KaraokeSeparatorManager:
                                 shutil.copy2(local_inst, pre_inst_hint)
                             except Exception:
                                 pre_inst_hint = None
+
+                        # Overlap lyrics alignment with Google Drive stem upload!
+                        if pre_voc_hint and pre_voc_hint.exists():
+                            try:
+                                self.start_lyrics_generation(
+                                    video_id, mode, force_ai=False,
+                                    local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                                    meta_hint=pre_meta_hint, upload_done_event=upload_done_event,
+                                )
+                                lyrics_started_early = True
+                                pre_voc_hint = None
+                                pre_inst_hint = None
+                            except Exception:
+                                lyrics_started_early = False
 
                         self.gdrive.upload_song(video_id, mode, local_song_dir, meta)
                         shutil.rmtree(local_song_dir, ignore_errors=True)
@@ -818,6 +857,8 @@ class KaraokeSeparatorManager:
                         cur = self._read_job_status(video_id, mode) or {}
                         cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
                         _write_json_atomic(status_file, cur)
+                    finally:
+                        upload_done_event.set()
                 else:
                     pre_meta_hint = self.get_meta(video_id, mode)
                     self.enforce_cache_limit()
@@ -827,20 +868,21 @@ class KaraokeSeparatorManager:
                     self.log.info("Separate", f"Done {video_id} ({mode}) — 100% VRAM reclaimed")
                     self.log.trigger_sync_async()
 
-                # Auto pre-generate lyrics in background while stems & YouTube metadata are hot -> 0 extra yt-dlp calls!
-                try:
-                    self.start_lyrics_generation(
-                        video_id, mode, force_ai=False,
-                        local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
-                        meta_hint=pre_meta_hint,
-                    )
-                except Exception:
-                    for _p in (pre_voc_hint, pre_inst_hint):
-                        if _p and _p.exists():
-                            try:
-                                _p.unlink()
-                            except Exception:
-                                pass
+                # Auto pre-generate lyrics in background if not already overlapped with GDrive upload
+                if not lyrics_started_early:
+                    try:
+                        self.start_lyrics_generation(
+                            video_id, mode, force_ai=False,
+                            local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                            meta_hint=pre_meta_hint,
+                        )
+                    except Exception:
+                        for _p in (pre_voc_hint, pre_inst_hint):
+                            if _p and _p.exists():
+                                try:
+                                    _p.unlink()
+                                except Exception:
+                                    pass
             finally:
                 self._worker_lock.release()
         except Exception as exc:
@@ -1134,6 +1176,7 @@ class KaraokeSeparatorManager:
         local_vocals_hint: Optional[Path] = None,
         local_inst_hint: Optional[Path] = None,
         meta_hint: Optional[dict] = None,
+        upload_done_event: Optional[threading.Event] = None,
     ) -> dict:
         def _cleanup_hints():
             for _p in (local_vocals_hint, local_inst_hint):
@@ -1148,19 +1191,19 @@ class KaraokeSeparatorManager:
             if existing.get("status") == "ready":
                 _cleanup_hints()
                 return existing
-        else:
-            with self._lock:
-                self._lyrics_mem_cache.pop(video_id, None)
-                self._lyrics_gdrive_missing.pop(video_id, None)
-            try:
-                self._lyrics_file(video_id).unlink(missing_ok=True)
-            except Exception:
-                pass
 
         with self._lock:
+            # Check in-progress BEFORE evicting RAM cache / unlinking disk lyrics (prevents double-click race!)
             if video_id in self._lyrics_in_progress:
                 _cleanup_hints()
                 return self.get_lyrics(video_id, mode)
+            if force_ai:
+                self._lyrics_mem_cache.pop(video_id, None)
+                self._lyrics_gdrive_missing.pop(video_id, None)
+                try:
+                    self._lyrics_file(video_id).unlink(missing_ok=True)
+                except Exception:
+                    pass
             self._lyrics_in_progress.add(video_id)
 
             sf = self._lyrics_status_file(video_id)
@@ -1176,7 +1219,7 @@ class KaraokeSeparatorManager:
 
         t = threading.Thread(
             target=self._run_lyrics_worker,
-            args=(video_id, mode, force_ai, sf, local_vocals_hint, local_inst_hint, meta_hint),
+            args=(video_id, mode, force_ai, sf, local_vocals_hint, local_inst_hint, meta_hint, upload_done_event),
             daemon=True,
             name=f"lyrics-{video_id}",
         )
@@ -1192,6 +1235,7 @@ class KaraokeSeparatorManager:
         local_vocals_hint: Optional[Path] = None,
         local_inst_hint: Optional[Path] = None,
         meta_hint: Optional[dict] = None,
+        upload_done_event: Optional[threading.Event] = None,
     ) -> None:
         key = f"lyrics__{video_id}"
         temp_vocals: Optional[Path] = local_vocals_hint
@@ -1241,6 +1285,15 @@ class KaraokeSeparatorManager:
                 else:
                     eff_mode = "auto" if free_mb >= 2000 else "cpu"
                 meta = meta_hint if (meta_hint and meta_hint.get("yt_meta_present")) else self.get_meta(video_id, mode)
+                # For Drive-cached songs (e.g. Force AI re-align), restore full YouTube track/artist/desc/subs from Drive meta.json!
+                if (
+                    not (meta and meta.get("yt_meta_present"))
+                    and self.gdrive.is_configured()
+                    and self.gdrive.has_song(video_id, mode)
+                ):
+                    remote_meta = self.gdrive.read_json(video_id, mode, "meta.json")
+                    if isinstance(remote_meta, dict) and remote_meta:
+                        meta = {**(meta or {}), **remote_meta}
                 if meta:
                     try:
                         temp_meta_file = TEMP_DIR / f"meta_{video_id}_{int(time.time())}.json"
@@ -1320,18 +1373,58 @@ class KaraokeSeparatorManager:
                         {"video_id": video_id, "status": "ready", "progress": 100, "stage_text": "歌詞已就緒", "error": None},
                     )
 
-                    # Sync tiny lyrics.json (~4KB) to Google Drive in background and remove local copy (0 MB disk!)
-                    if self.storage_mode == "gdrive" and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):
-                        def _bg_upload_lyrics(vid=video_id, m=mode, path=out_file):
-                            if self.gdrive.upload_single_file(vid, m, path):
+                    # Sync tiny lyrics.json (~4KB) to Google Drive in background using an immutable snapshot +
+                    # monotonic generation token (prevents race with parallel stem upload or immediate Force AI!)
+                    if (
+                        self.storage_mode == "gdrive"
+                        and self.gdrive.is_configured()
+                        and (upload_done_event is not None or self.gdrive.has_song(video_id, mode))
+                    ):
+                        snap_file = TEMP_DIR / f"ul_lyrics_{video_id}_{time.monotonic_ns()}.json"
+                        try:
+                            shutil.copy2(out_file, snap_file)
+                            orig_mtime_ns = out_file.stat().st_mtime_ns
+                        except Exception:
+                            snap_file = None
+                            orig_mtime_ns = 0
+                        if snap_file is not None:
+                            with self._lock:
+                                my_gen = self._lyrics_upload_gen.get(video_id, 0) + 1
+                                self._lyrics_upload_gen[video_id] = my_gen
+
+                            def _bg_upload_lyrics(
+                                vid=video_id,
+                                m=mode,
+                                path=out_file,
+                                snap=snap_file,
+                                mtime_ns=orig_mtime_ns,
+                                gen=my_gen,
+                                ev=upload_done_event,
+                            ):
                                 try:
-                                    path.unlink()
-                                    parent = self.cache_dir / vid
-                                    if parent.exists() and not any(parent.iterdir()):
-                                        parent.rmdir()
-                                except Exception:
-                                    pass
-                        threading.Thread(target=_bg_upload_lyrics, daemon=True, name=f"ul-lyrics-{video_id}").start()
+                                    if ev is not None:
+                                        ev.wait(timeout=180.0)
+                                    with self._lock:
+                                        if self._lyrics_upload_gen.get(vid) != gen:
+                                            return
+                                    if not self.gdrive.has_song(vid, m):
+                                        return
+                                    if self.gdrive.upload_single_file(vid, m, snap, remote_name="lyrics.json"):
+                                        try:
+                                            if path.exists() and path.stat().st_mtime_ns == mtime_ns:
+                                                path.unlink()
+                                                parent = self.cache_dir / vid
+                                                if parent.exists() and not any(parent.iterdir()):
+                                                    parent.rmdir()
+                                        except Exception:
+                                            pass
+                                finally:
+                                    try:
+                                        snap.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+
+                            threading.Thread(target=_bg_upload_lyrics, daemon=True, name=f"ul-lyrics-{video_id}").start()
                     self.log.info("Lyrics", f"Ready for {video_id} (force_ai={force_ai})")
                     self.log.trigger_sync_async()
                 else:

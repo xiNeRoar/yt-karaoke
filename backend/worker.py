@@ -219,44 +219,27 @@ def main() -> int:
             yt_artist = (info.get("artist") or info.get("creator") or "").strip()
             yt_channel = (info.get("channel") or info.get("uploader") or "").strip()
             yt_desc = (info.get("description") or "")[:4000]
+            yt_video_lang = (info.get("language") or "").strip()
             yt_sub_lang = ""
             yt_sub_url = ""
+            yt_sub_lines: list[dict] = []
             _subs = info.get("subtitles") or {}
             if isinstance(_subs, dict) and _subs:
-                import re as _re
-                _vlang = (info.get("language") or "").strip().lower()
-                _has_kana = bool(_re.search(r"[\u3040-\u30ff]", title))
-                _has_hangul = bool(_re.search(r"[\uac00-\ud7af]", title))
-                _has_cjk = bool(_re.search(r"[\u4e00-\u9fff]", title))
-                if _vlang.startswith("yue") or (_vlang.startswith("zh") and "hk" in _vlang):
-                    _pref = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh"]
-                elif _vlang.startswith("zh"):
-                    _pref = ["zh-Hant", "zh-TW", "zh-HK", "zh-Hans", "zh-CN", "zh", "yue"]
-                elif _vlang.startswith("ja") or _has_kana:
-                    _pref = ["ja", "ja-JP"]
-                elif _vlang.startswith("ko") or _has_hangul:
-                    _pref = ["ko", "ko-KR"]
-                elif _vlang.startswith("en") or (not _has_cjk and _re.search(r"[A-Za-z]{3,}", title)):
-                    _pref = ["en", "en-US", "en-GB"]
-                elif _has_cjk:
-                    _pref = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh"]
-                else:
-                    _pref = ["en", "yue-HK", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko"]
-                _keys = list(_subs.keys())
-                _chosen = ""
-                for _p in _pref:
-                    _pl = _p.lower()
-                    _hit = next((k for k in _keys if k.lower() == _pl), None) or next(
-                        (k for k in _keys if k.lower().startswith(_pl + "-") or k.lower().startswith(_pl + "_")), None
+                try:
+                    from lyrics_worker import _pick_youtube_subtitle_lang, _download_json3_subtitles
+                    _chosen = _pick_youtube_subtitle_lang(
+                        _subs, title=title, video_lang=yt_video_lang, description=yt_desc
                     )
-                    if _hit:
-                        _chosen = _hit
-                        break
-                _fmts = _subs.get(_chosen) or [] if _chosen else []
-                _j3 = next((f.get("url") for f in _fmts if f.get("ext") == "json3" and f.get("url")), "")
-                if _j3:
-                    yt_sub_lang = _chosen
-                    yt_sub_url = _j3
+                    if _chosen:
+                        _fmts = _subs.get(_chosen) or []
+                        _j3 = next((f.get("url") for f in _fmts if f.get("ext") == "json3" and f.get("url")), "")
+                        if _j3:
+                            yt_sub_lang = _chosen
+                            yt_sub_url = _j3
+                            # Download & cache json3 lines immediately while YouTube's signed URL is fresh!
+                            yt_sub_lines = _download_json3_subtitles(_j3, _chosen) or []
+                except Exception:
+                    pass
 
         wav_path = work_dir / "source.wav"
         if not wav_path.exists():
@@ -542,8 +525,10 @@ def main() -> int:
             "artist": yt_artist,
             "channel": yt_channel,
             "description": yt_desc,
+            "language": yt_video_lang,
             "subtitles_lang": yt_sub_lang,
             "subtitles_url": yt_sub_url,
+            "yt_sub_lines": yt_sub_lines,
             "yt_meta_present": True,
             "device_used": state["device_used"],
             "elapsed_sec": elapsed,

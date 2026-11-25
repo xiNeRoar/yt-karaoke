@@ -158,7 +158,7 @@ def test_worker_and_separator_invariants() -> None:
     assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
-    assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map)" in lw_src, "Must pass real db_profile + time_map to detect unaligned Song #2 / encores!"
+    assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map, lang=lang)" in lw_src, "Must pass real db_profile + time_map + lang to detect unaligned Song #2 / encores!"
     assert "if (is_mashup_title and len(multi_song_pools) < 2) or not official_lines:" in lw_src, "Must never overwrite resolved multi_song_pools with split-brain Shazam strings!"
     assert "prev_gap >= 4.0" in lw_src, "Qwen3 windows must split at instrumental interludes (>=4s) to prevent stretched ghost lines!"
     assert "lrc_covers_audio" in lw_src, "LRC fast-path must verify full vocal coverage so single-song LRC never hijacks multi-song videos!"
@@ -169,15 +169,20 @@ def test_worker_and_separator_invariants() -> None:
     assert "engine.getCurrentPosition()" in ct_src and "state.active && engine.isPlaying" in ct_src, "Lyrics clock must lock to WebAudio playback position!"
     assert "state.lyricsLines = [];" in ct_src, "Deactivating karaoke must clear cached lyricsLines so reopening fetches fresh server lyrics!"
     assert "lyricsReqSeq" in ct_src, "requestLyrics must guard against out-of-order async responses!"
+    assert "_wordSegmenters" in ct_src, "Frontend KTV line splitter must support zh/ja/ko Intl.Segmenter!"
     pw_src = (EXTENSION / "pitch-worklet.js").read_text(encoding="utf-8")
     assert 'ev.data.type === "reset"' in pw_src, "pitch-worklet must support buffer reset on song switch/seek!"
-    # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
+    # 6) 24/7 bounded memory, stream-safety & rate-limit isolation invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
+    assert "check_lyrics_rate_limit" in sep_src and "upload_done_event" in sep_src, "Backend must isolate lyrics rate limit & overlap lyrics with GDrive upload"
     assert "OrderedDict" in gw_src and "_lyrics_ram_max" in gw_src, "Gateway lyrics cache must be bounded LRU"
-    assert "_lyrics_refresh_ttl" in gw_src, "Gateway _lyrics_refreshing must have TTL auto-expiry"
+    assert "_lyrics_refresh_ttl" in gw_src and "_lyrics_missing_ttl" in gw_src, "Gateway refreshing & missing caches must have TTL auto-expiry"
+    assert "check_lyrics_rate_limit" in gw_src and "X-Forwarded-For" in gw_src, "Gateway must isolate lyrics rate limit & forward end-user IP"
     assert "open_gdrive_audio_stream" in gw_src, "Gateway must pre-read first chunk before returning 200 OK"
+    bm_src = (BACKEND / "main.py").read_text(encoding="utf-8")
+    assert "_effective_client_ip" in bm_src and "check_lyrics_rate_limit" in bm_src, "Backend main.py must verify X-Worker-Secret for X-Forwarded-For & use dedicated lyrics bucket"
     st_src = (BACKEND / "storage.py").read_text(encoding="utf-8")
-    assert "open_audio_stream" in st_src, "Backend storage must pre-read first chunk before returning 200 OK"
+    assert "open_audio_stream" in st_src and "allow_empty" in st_src and "remote_name" in st_src, "Backend storage must pre-read stream, support allow_empty catalog push & remote_name"
     print("[PASS] Structural lifecycle, 24/7 memory bounds & ALL-6-exit-path invariants")
 
 
@@ -611,6 +616,124 @@ def test_live_endpoints_if_running() -> None:
         print("[SKIP] Local PC backend not running during offline test")
 
 
+def test_bilingual_title_matching_and_artist_isolation() -> None:
+    import lyrics_worker as lw
+
+    # 1) MC 張天賦 - 抽 Inhale (Official Music Video): real 1-char Cantonese song MUST decisively beat Dreariness - Inhale!
+    mc_title = "MC 張天賦 - 抽 Inhale (Official Music Video)"
+    s_real = lw._track_matches_title("抽", "MC 张天赋", mc_title, cand_dur=235.0, yt_dur=236.0)
+    s_fake = lw._track_matches_title("Inhale", "Dreariness", mc_title, cand_dur=345.0, yt_dur=236.0)
+    assert s_real >= 1.8 and s_real > s_fake + 0.8, f"MC 抽 failed to decisively beat Dreariness Inhale: real={s_real}, fake={s_fake}"
+    c_mc = lw._extract_query_candidates(mc_title)
+    assert any("抽" in q and "張天賦" in q for q in c_mc), f"Bilingual split missed artist+抽: {c_mc}"
+    assert any("Inhale" in q and "張天賦" in q for q in c_mc), f"Bilingual split missed artist+Inhale: {c_mc}"
+
+    # 2) Numeric year song titles (2002 / 1989) MUST be preserved while concert dates (2024.05.18) are stripped!
+    assert "2002" in lw.clean_search_title("Anne-Marie - 2002 [Official Video]")
+    assert "1989" in lw.clean_search_title("Taylor Swift - 1989 (Official Audio)")
+    assert "2024" not in lw.clean_search_title("陳奕迅 富士山下 2024.05.18 現場版")
+
+    # 3) K-Pop / J-Pop MV tags & quotes cleaned cleanly
+    assert "M V" not in lw.clean_search_title('TWICE "FANCY" M/V')
+    c_kp = lw._extract_query_candidates("NewJeans (뉴진스) 'Hype Boy' Official MV")
+    assert any("Hype Boy" in q for q in c_kp), f"Missing Hype Boy: {c_kp}"
+    c_jp = lw._extract_query_candidates("YOASOBI「アイドル」［Official Music Video］")
+    assert any("アイドル" in q for q in c_jp), f"Missing アイドル: {c_jp}"
+
+    # 4) Artist isolation: Jay Chou MUST NOT match Jay Park; short Latin IU/AI/LANY must use word boundaries!
+    assert lw._artist_match_level("Jay Park", "周杰倫 Jay Chou - 晴天") == 0.0
+    assert lw._artist_match_level("Jay Chou", "周杰倫 Jay Chou - 晴天") == 1.0
+    assert lw._artist_match_level("IU", "IU (아이유) - Blueming") == 1.0
+    assert lw._artist_match_level("AI", "Taylor Swift - Rainy Day") == 0.0
+    assert lw._artist_match_level("LANY", "Melany - Midnight Song") == 0.0
+    assert lw._artist_match_level("LANY", "LANY - Malibu Nights") == 1.0
+    assert lw._artist_match_level("MC", "MC 張天賦 - 抽") == 1.0
+    assert lw._artist_match_level("Eason Chan / 陳奕迅", "陳奕迅 - 富士山下") == 0.55
+    if lw.to_simplified("陳") == "陈":
+        assert lw._artist_match_level("Eason Chan / 陈奕迅", "陳奕迅 - 富士山下") == 0.55
+
+    # 5) Version mismatch penalty: Live/Remix penalized against studio title
+    s_studio = lw._track_matches_title("晴天", "周杰倫", "周杰倫 Jay Chou【晴天】Official MV")
+    s_live = lw._track_matches_title("晴天 (Live)", "周杰倫", "周杰倫 Jay Chou【晴天】Official MV")
+    assert s_studio > s_live, f"Live track was not penalized vs studio: studio={s_studio}, live={s_live}"
+    print("[PASS] Bilingual 1-char scoring (MC 抽), year titles, K-Pop/J-Pop cleaning, artist isolation & version penalty")
+
+
+def test_multilingual_cleaning_similarity_and_splitting() -> None:
+    import lyrics_worker as lw
+
+    # 1) Simplified NetEase credits & section headers stripped + same-timestamp bilingual LRC deduped!
+    lrc = (
+        "[00:00.00]作词：林夕\n"
+        "[00:01.00]作曲：泽日生\n"
+        "[00:02.00]编曲：陈珀\n"
+        "[00:03.00]混音：周天澈\n"
+        "[00:05.00][Chorus]\n"
+        "[00:10.00]Never gonna give you up\n"
+        "[00:10.00]永遠不會放棄你\n"
+        "[00:14.00]Never gonna let you down\n"
+        "[00:14.00]永遠不會讓你失望\n"
+    )
+    parsed = lw.parse_lrc(lrc)
+    assert len(parsed) == 2, f"Credits/headers or bilingual LRC translations not stripped: {parsed}"
+    assert parsed[0]["text"] == "Never gonna give you up"
+
+    # 2) Whole-song Japanese Kanji preservation: pure-Kanji line inside a Japanese song MUST NOT be converted by OpenCC!
+    jp_raw = ["君の声が聞こえる", "永遠", "愛してるよ", "桜が散る"]
+    jp_clean = lw.clean_lyric_lines(jp_raw)
+    assert "永遠" in jp_clean and "桜が散る" in jp_clean, f"Japanese Kanji corrupted: {jp_clean}"
+
+    # 3) Cantonese colloquial marker false-positive fix: Mandarin '呢' MUST stay 'zh', while '喺/緊' -> 'yue'
+    assert lw.detect_lyrics_language(["你在哪裡呢", "今天天氣真好呢"]) == "zh"
+    assert lw.detect_lyrics_language(["我喺度等緊你", "唔好再走"]) == "yue"
+
+    # 4) English word-level similarity: matching words beat unrelated letter-soup
+    sim_close = lw._lyric_similarity("never gonna give you up", "never gonna give up")
+    sim_diff = lw._lyric_similarity("never gonna give you up", "every good evening plan")
+    assert sim_close > 0.70 and sim_close > sim_diff + 0.4, f"EN word similarity off: close={sim_close}, diff={sim_diff}"
+
+    # 5) _even_words_for_line supports 'yue' + mixed CJK/EN tokens cleanly
+    ew = lw._even_words_for_line("其實 I love you 太難", 10.0, 14.0)
+    words_txt = [w["word"] for w in ew]
+    assert "其" in words_txt and "I" in words_txt and "love" in words_txt and "難" in words_txt, f"Unexpected mixed tokens: {words_txt}"
+    assert ew[0]["start"] == 10.0 and abs(ew[-1]["end"] - 14.0) < 0.02
+
+    # 6) _split_long_asr_segment wraps English run-on segments cleanly on word boundaries
+    en_blob = " ".join(["walking down the empty street tonight under the bright neon lights"] * 2)
+    en_chunks = lw._split_long_asr_segment(10.0, 22.0, en_blob, [], "en")
+    assert len(en_chunks) >= 2 and all("  " not in c["text"] for c in en_chunks), f"EN split failed: {en_chunks}"
+    print("[PASS] Simplified credits, bilingual LRC dedup, JP Kanji safety, Cantonese '呢' fix, EN word similarity & splitting")
+
+
+def test_storage_and_gateway_resilience() -> None:
+    import importlib.util
+    from storage import GoogleDriveStorage
+
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        # 1) Storage allow_empty protection: push_catalog() refuses empty index unless allow_empty=True
+        st = GoogleDriveStorage(tdir / "idx.json")
+        st._index = {}
+        st.is_configured = lambda force_refresh=False: True
+        st.refresh_binary = lambda: "rclone_dummy"
+        assert st.push_catalog(allow_empty=False) is False
+
+        # 2) Gateway _lyrics_missing TTL & isolated check_lyrics_rate_limit bucket
+        os.environ["DATA_DIR"] = str(tdir / "gw_res")
+        os.environ["REQUIRE_AUTH"] = "0"
+        spec = importlib.util.spec_from_file_location("gw_res_mod", str(GATEWAY / "main.py"))
+        gw_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gw_mod)
+        gw = gw_mod.gw
+        assert gw._lyrics_missing_ttl == 60.0
+        # Exhausting separate rate limit must NOT block lyrics rate limit!
+        for _ in range(gw_mod.RATE_LIMIT_PER_10MIN):
+            assert gw.check_rate_limit("203.0.113.5") is True
+        assert gw.check_rate_limit("203.0.113.5") is False
+        assert gw.check_lyrics_rate_limit("203.0.113.5") is True
+    print("[PASS] Storage empty-catalog protection + Gateway missing TTL & isolated lyrics rate-limit bucket")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -619,11 +742,14 @@ def main() -> int:
     test_store_builder_parity()
     test_invite_code_device_binding_and_revocation()
     test_generic_title_decomposition()
+    test_bilingual_title_matching_and_artist_isolation()
+    test_multilingual_cleaning_similarity_and_splitting()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()
     test_lrc_multi_timestamp_and_asr_splitting_and_invariants()
     test_multilingual_p0_and_p1_invariants()
+    test_storage_and_gateway_resilience()
     test_lock_heartbeat_during_queue_wait()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()

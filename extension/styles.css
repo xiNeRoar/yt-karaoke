@@ -434,7 +434,7 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
   padding: 0 5%;
   box-sizing: border-box;
   container-type: inline-size;
-  font-family: "Noto Sans TC", "PingFang HK", "PingFang TC", "Microsoft JhengHei", "Heiti TC", sans-serif;
+  font-family: "Noto Sans TC", "PingFang HK", "PingFang TC", "Microsoft JhengHei", "Heiti TC", "Noto Sans JP", "Hiragino Sans", "Yu Gothic", "Meiryo", "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
   user-select: none;
   -webkit-font-smoothing: antialiased;
 }

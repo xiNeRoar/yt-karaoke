@@ -864,11 +864,15 @@
   }
 
   // Real HK KTV line-breaking standard (NO font shrinking ever!):
-  // Uses Chromium's native Intl.Segmenter("zh-Hant", { granularity: "word" }) + singer breath pauses
-  // so Chinese words/idioms (e.g. 傷春悲秋) are NEVER torn in half and every line keeps 100% uniform KTV font size!
-  const _zhWordSegmenter =
+  // Uses Chromium's native Intl.Segmenter (zh-Hant / ja / ko) + singer breath pauses
+  // so CJK/Japanese/Korean words are NEVER torn in half and every line keeps 100% uniform KTV font size!
+  const _wordSegmenters =
     typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
-      ? new Intl.Segmenter("zh-Hant", { granularity: "word" })
+      ? {
+          zh: new Intl.Segmenter("zh-Hant", { granularity: "word" }),
+          ja: new Intl.Segmenter("ja", { granularity: "word" }),
+          ko: new Intl.Segmenter("ko", { granularity: "word" }),
+        }
       : null;
 
   function normalizeKtvLines(rawLines, maxCjkUnits = 10.5) {
@@ -905,8 +909,11 @@
 
     function getValidCjkWordCuts(piece) {
       const cuts = new Set();
-      if (_zhWordSegmenter) {
-        for (const seg of _zhWordSegmenter.segment(piece)) {
+      if (_wordSegmenters) {
+        let segInst = _wordSegmenters.zh;
+        if (/[\u3040-\u30ff]/.test(piece)) segInst = _wordSegmenters.ja;
+        else if (/[\uac00-\ud7af]/.test(piece)) segInst = _wordSegmenters.ko;
+        for (const seg of segInst.segment(piece)) {
           const endIdx = seg.index + seg.segment.length;
           if (endIdx > 0 && endIdx < piece.length) cuts.add(endIdx);
         }
@@ -1026,6 +1033,7 @@
       const totalChars = Math.max(1, subTexts.reduce((acc, s) => acc + Math.max(1, contentLen(s) || nonSpaceLen(s)), 0));
       let wordIdx = 0;
       let elapsedChars = 0;
+      let prevSubEnd = start;
 
       for (let si = 0; si < subTexts.length; si++) {
         const stxt = subTexts[si];
@@ -1037,7 +1045,7 @@
           while (wordIdx < words.length && (si === subTexts.length - 1 || collected < need)) {
             const w = words[wordIdx];
             const wlen = Math.max(1, contentLen(w.word || "") || nonSpaceLen(w.word || ""));
-            if (si < subTexts.length - 1 && subWords.length > 0 && collected + wlen > need + 1) {
+            if (si < subTexts.length - 1 && subWords.length > 0 && collected + wlen > need) {
               break;
             }
             subWords.push(w);
@@ -1055,10 +1063,15 @@
           subStart = start + ((end - start) * elapsedChars) / totalChars;
           subEnd = start + ((end - start) * (elapsedChars + need)) / totalChars;
         }
+        if (si > 0 && subStart < prevSubEnd) {
+          subStart = prevSubEnd;
+        }
+        subEnd = Math.max(subStart + 0.25, subEnd);
+        prevSubEnd = subEnd;
         elapsedChars += need;
         out.push({
           start: Math.round(subStart * 100) / 100,
-          end: Math.round(Math.max(subStart + 0.25, subEnd) * 100) / 100,
+          end: Math.round(subEnd * 100) / 100,
           text: stxt,
           words: subWords,
         });
@@ -1098,7 +1111,7 @@
     if (now <= line.start) return 0;
     if (now >= line.end) return 1;
 
-    // Smooth visual-width-weighted sweep when word-level timestamps exist (accurate for mixed CJK + English!)
+    // Smooth visual-width-weighted sweep when word-level timestamps exist (space-aware for EN/KO & mixed CJK+EN!)
     if (line.words && line.words.length > 0) {
       const wordVisualWidth = (s) => {
         let u = 0;
@@ -1109,12 +1122,28 @@
         }
         return Math.max(0.4, u);
       };
+      const hasSpacesInText = /\s/.test(line.text || "");
+      const needsInterWordSpace = (prevW, nextW) => {
+        if (!hasSpacesInText) return false;
+        const a = (prevW || "").trim();
+        const b = (nextW || "").trim();
+        if (!a || !b) return false;
+        const aTail = a[a.length - 1];
+        const bHead = b[0];
+        // English/Korean/mixed-script tokens separated by space in rendered line.text occupy ~0.35 visual units
+        const aCjk = /[\u4e00-\u9fff\u3040-\u30ff]/.test(aTail);
+        const bCjk = /[\u4e00-\u9fff\u3040-\u30ff]/.test(bHead);
+        return !(aCjk && bCjk);
+      };
       let totalWeight = 0;
       const weights = [];
-      for (const w of line.words) {
-        const wt = wordVisualWidth(w.word || "");
+      const gapsAfter = [];
+      for (let i = 0; i < line.words.length; i++) {
+        const wt = wordVisualWidth(line.words[i].word || "");
+        const gapW = i + 1 < line.words.length && needsInterWordSpace(line.words[i].word, line.words[i + 1].word) ? 0.35 : 0;
         weights.push(wt);
-        totalWeight += wt;
+        gapsAfter.push(gapW);
+        totalWeight += wt + gapW;
       }
       let acc = 0;
       for (let i = 0; i < line.words.length; i++) {
@@ -1128,7 +1157,7 @@
           const frac = Math.max(0, Math.min(1, (now - w.start) / wDur));
           return (acc + wt * frac) / totalWeight;
         }
-        acc += wt;
+        acc += wt + gapsAfter[i];
       }
       return 1;
     }
@@ -1177,7 +1206,11 @@
 
     const lines = state.lyricsLines;
     if (!lines || lines.length === 0) {
-      ov.root.classList.remove("visible");
+      if (ov.statusEl.textContent) {
+        ov.root.classList.add("visible");
+      } else {
+        ov.root.classList.remove("visible");
+      }
       return;
     }
 
@@ -1290,6 +1323,7 @@
     const targetVideoId = state.videoId;
     const targetMode = state.mode;
 
+    stopLyricsRenderLoop();
     state.lyricsEnabled = true;
     state.lyricsLoading = true;
     state.lastLyricLineIdx = -999;

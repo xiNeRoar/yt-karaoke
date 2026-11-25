@@ -55,6 +55,7 @@ class GoogleDriveStorage:
         self._catalog_push_lock = threading.Lock()
         self._catalog_push_pending = False
         self._catalog_push_running = False
+        self._catalog_push_allow_empty = False
         self._load_index()
 
     def refresh_binary(self) -> Optional[str]:
@@ -159,13 +160,13 @@ class GoogleDriveStorage:
             self._save_index()
         self.push_catalog_async()
 
-    def push_catalog(self) -> bool:
+    def push_catalog(self, allow_empty: bool = False) -> bool:
         """Upload a single compact _catalog.json manifest so NAS Gateways sync 10,000+ songs in 1 API call."""
         exe = self.refresh_binary()
         if not exe or not self.is_configured():
             return False
         with self._lock:
-            if not self._index:
+            if not self._index and not allow_empty:
                 return False
             payload = {
                 "version": 1,
@@ -198,10 +199,12 @@ class GoogleDriveStorage:
             except Exception:
                 pass
 
-    def push_catalog_async(self) -> None:
+    def push_catalog_async(self, allow_empty: bool = False) -> None:
         """Coalesced background upload of _catalog.json (never blocks callers or spams Drive)."""
         with self._catalog_push_lock:
             self._catalog_push_pending = True
+            if allow_empty:
+                self._catalog_push_allow_empty = True
             if self._catalog_push_running:
                 return
             self._catalog_push_running = True
@@ -215,7 +218,9 @@ class GoogleDriveStorage:
                             self._catalog_push_running = False
                             return
                         self._catalog_push_pending = False
-                    self.push_catalog()
+                        cur_allow_empty = self._catalog_push_allow_empty
+                        self._catalog_push_allow_empty = False
+                    self.push_catalog(allow_empty=cur_allow_empty)
             except Exception:
                 with self._catalog_push_lock:
                     self._catalog_push_running = False
@@ -236,11 +241,11 @@ class GoogleDriveStorage:
         )
         return res.returncode == 0 and dest.exists()
 
-    def upload_single_file(self, video_id: str, mode: str, local_file: Path) -> bool:
+    def upload_single_file(self, video_id: str, mode: str, local_file: Path, remote_name: Optional[str] = None) -> bool:
         exe = self.refresh_binary()
         if not exe or not local_file.exists():
             return False
-        remote_file = f"{self._remote_base(video_id, mode)}/{local_file.name}"
+        remote_file = f"{self._remote_base(video_id, mode)}/{remote_name or local_file.name}"
         res = subprocess.run(
             [
                 exe, "copyto", str(local_file), remote_file,
@@ -459,7 +464,7 @@ class GoogleDriveStorage:
                 removed += 1
             self._save_index()
         if removed:
-            self.push_catalog_async()
+            self.push_catalog_async(allow_empty=True)
         return removed
 
     def purge_all(self) -> int:
@@ -476,4 +481,5 @@ class GoogleDriveStorage:
             n = len(self._index)
             self._index = {}
             self._save_index()
+        self.push_catalog_async(allow_empty=True)
         return n

@@ -86,10 +86,12 @@ class GatewayState:
         self._lyrics_ram_ttl = 600.0  # 10 min soft TTL so updated Drive lyrics propagate automatically
         self._lyrics_missing: "OrderedDict[str, float]" = OrderedDict()
         self._lyrics_missing_max = 2000
+        self._lyrics_missing_ttl = 60.0
         self._lyrics_refreshing: dict[str, float] = {}
         self._lyrics_refresh_ttl = 1200.0
         self._clients: dict[str, dict] = {}
         self._rate_hist: dict[str, list[float]] = {}
+        self._lyrics_rate_hist: dict[str, list[float]] = {}
         self._activate_rate_hist: dict[str, list[float]] = {}
         self._access_codes: dict[str, dict] = {}
         self._device_bindings: dict[str, dict] = {}
@@ -712,8 +714,11 @@ class GatewayState:
                     self._lyrics_ram.move_to_end(video_id)
                     return data
                 self._lyrics_ram.pop(video_id, None)
-            if video_id in self._lyrics_missing:
-                return None
+            miss_ts = self._lyrics_missing.get(video_id)
+            if miss_ts is not None:
+                if now - miss_ts < self._lyrics_missing_ttl:
+                    return None
+                self._lyrics_missing.pop(video_id, None)
 
         remote_file = f"{RCLONE_REMOTE}:{RCLONE_FOLDER}/{video_id}/{mode}/lyrics.json"
         try:
@@ -780,6 +785,25 @@ class GatewayState:
                 return False
             hist.append(now)
             self._rate_hist[ip] = hist
+            return True
+
+    def check_lyrics_rate_limit(self, ip: str) -> bool:
+        """Dedicated lyrics rate-limit bucket (separate from /api/separate)."""
+        now = time.time()
+        cap = max(15, RATE_LIMIT_PER_10MIN * 3)
+        with self._lock:
+            if len(self._lyrics_rate_hist) > 2000:
+                self._lyrics_rate_hist = {
+                    k: [t for t in v if now - t < 600.0]
+                    for k, v in self._lyrics_rate_hist.items()
+                    if any(now - t < 600.0 for t in v)
+                }
+            hist = [t for t in self._lyrics_rate_hist.get(ip, []) if now - t < 600.0]
+            if len(hist) >= cap:
+                self._lyrics_rate_hist[ip] = hist
+                return False
+            hist.append(now)
+            self._lyrics_rate_hist[ip] = hist
             return True
 
 
@@ -1027,14 +1051,15 @@ def separate(req: SeparateRequest, request: Request):
     if not gw.gpu_online or gw.gpu_pause_new or not GPU_NODE_URL:
         raise HTTPException(status_code=503, detail=OFFLINE_MSG)
 
-    if not gw.check_rate_limit(_client_ip(request)):
+    client_ip = _client_ip(request)
+    if not gw.check_rate_limit(client_ip):
         raise HTTPException(status_code=429, detail=f"請求過於頻繁（每 10 分鐘上限 {RATE_LIMIT_PER_10MIN} 首新歌），請稍後再試。")
 
     try:
         r = gw._http.post(
             f"{GPU_NODE_URL}/api/separate",
             json={"video_id": req.video_id, "mode": req.mode},
-            headers=gw._worker_headers(),
+            headers={**gw._worker_headers(), "X-Forwarded-For": client_ip},
             timeout=8.0,
         )
         if r.status_code >= 400:
@@ -1131,8 +1156,12 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
                         gw._lyrics_refreshing.pop(video_id, None)
                 return d
         except Exception:
-            with gw._lock:
-                gw._lyrics_refreshing.pop(video_id, None)
+            # Keep _lyrics_refreshing intact across transient network blips (TTL auto-expires if GPU truly died!)
+            if is_refreshing:
+                return {"video_id": video_id, "status": "running", "progress": 50, "stage_text": "對齊歌詞中...", "lines": []}
+
+    if is_refreshing:
+        return {"video_id": video_id, "status": "running", "progress": 50, "stage_text": "對齊歌詞中...", "lines": []}
 
     return {"video_id": video_id, "status": "idle", "progress": 0, "stage_text": OFFLINE_MSG if not gw.gpu_online else "未生成歌詞", "lines": []}
 
@@ -1140,7 +1169,7 @@ def get_lyrics(video_id: str, mode: Literal["pure"] = "pure"):
 @app.post("/api/lyrics")
 def generate_lyrics(req: LyricsRequest, request: Request):
     _validate_vid(req.video_id)
-    if not req.force_ai:
+    if not req.force_ai and not gw._is_lyrics_refreshing(req.video_id):
         cached = gw.get_cached_lyrics(req.video_id, req.mode)
         if cached:
             return {"status": "ready", "progress": 100, "stage_text": cached.get("source_label", "歌詞已就緒"), **cached}
@@ -1148,8 +1177,9 @@ def generate_lyrics(req: LyricsRequest, request: Request):
     if not gw.gpu_online or gw.gpu_pause_new or not GPU_NODE_URL:
         raise HTTPException(status_code=503, detail=OFFLINE_MSG)
 
-    if not gw.check_rate_limit(_client_ip(request)):
-        raise HTTPException(status_code=429, detail=f"請求過於頻繁（每 10 分鐘上限 {RATE_LIMIT_PER_10MIN} 次），請稍後再試。")
+    client_ip = _client_ip(request)
+    if not gw.check_lyrics_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="歌詞請求過於頻繁，請稍後再試。")
 
     if req.force_ai:
         with gw._lock:
@@ -1161,7 +1191,7 @@ def generate_lyrics(req: LyricsRequest, request: Request):
         r = gw._http.post(
             f"{GPU_NODE_URL}/api/lyrics",
             json={"video_id": req.video_id, "mode": req.mode, "force_ai": req.force_ai},
-            headers=gw._worker_headers(),
+            headers={**gw._worker_headers(), "X-Forwarded-For": client_ip},
             timeout=10.0,
         )
         if r.status_code >= 400:

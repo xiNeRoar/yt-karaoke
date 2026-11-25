@@ -174,6 +174,18 @@ def _require_admin(x_admin_token: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Admin token required")
 
 
+def _effective_client_ip(request: Request) -> str:
+    """Trust X-Forwarded-For ONLY when the request is authenticated by our NAS Gateway via X-Worker-Secret."""
+    host = request.client.host if request.client else "127.0.0.1"
+    if WORKER_SECRET:
+        provided = request.headers.get("x-worker-secret") or ""
+        if provided and secrets.compare_digest(provided, WORKER_SECRET):
+            xff = (request.headers.get("x-forwarded-for") or "").strip()
+            if xff:
+                return xff.split(",")[0].strip() or host
+    return host
+
+
 def _catalog_version(items: list[dict]) -> str:
     if not items:
         return "0:0:0"
@@ -393,7 +405,7 @@ def separate(
     x_karaoke_client: Optional[str] = Header(default=None),
 ):
     _validate_video_id(req.video_id)
-    ip = request.client.host if request.client else "127.0.0.1"
+    ip = _effective_client_ip(request)
     if x_karaoke_client:
         clients.touch(x_karaoke_client, ip, video_id=req.video_id)
     try:
@@ -453,11 +465,11 @@ def generate_lyrics(req: LyricsRequest, request: Request):
             return existing
     if manager.pause_new_jobs:
         raise HTTPException(status_code=503, detail="AI 伺服器休息中，現有歌庫仍可免費唱")
-    ip = request.client.host if request.client else "127.0.0.1"
-    if ip not in ("127.0.0.1", "::1") and not manager.check_rate_limit(ip):
+    ip = _effective_client_ip(request)
+    if ip not in ("127.0.0.1", "::1") and not manager.check_lyrics_rate_limit(ip):
         raise HTTPException(
             status_code=429,
-            detail=f"請求過於頻繁（每 10 分鐘上限 {manager.rate_limit_per_10min} 次），請稍後再試。",
+            detail="歌詞請求過於頻繁，請稍後再試。",
         )
     return manager.start_lyrics_generation(req.video_id, req.mode, force_ai=req.force_ai)
 
