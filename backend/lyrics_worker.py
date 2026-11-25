@@ -1826,17 +1826,20 @@ def refine_alignment_with_acoustics(
     step_sec: float,
     audio_dur: float,
     first_onset: float,
+    conservative: bool = False,
 ) -> list[dict]:
     """Fundamental acoustic refinement for singing voices:
     1. Onset Snap: if line.start sits in silence before singing begins, snap forward to real vocal onset.
     2. Tail Extension: extend line.end through held final singing vowels until actual vocal offset.
     3. Word Smoothing: eliminate 0.00s collapsed BPE word glitches so 60fps KTV sweep never jerks.
+    When `conservative=True` (after Qwen3-ForcedAligner word-level refinement), preserve Qwen3's ~30ms
+    precision on soft breathy verses and live crowd reverb instead of aggressively snapping ±2.5s!
     """
     if not lines or len(db_profile) == 0:
         return lines
 
     n_db = len(db_profile)
-    thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=-1.0)
+    thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=(-3.0 if conservative else -1.0))
     for i, ln in enumerate(lines):
         s = max(first_onset, float(ln["start"]))
         e = max(s + 0.35, float(ln["end"]))
@@ -1847,7 +1850,7 @@ def refine_alignment_with_acoustics(
         # Filter isolated 1-frame (0.1s) cymbal/breath blips so a stray click never holds a 20s silent span open.
         i0_ln = max(0, int(s / step_sec))
         i1_ln = min(n_db, int(e / step_sec))
-        if (e - s) > 3.5 and i1_ln > i0_ln:
+        if (e - s) > (5.0 if conservative else 3.5) and i1_ln > i0_ln:
             seg_slice = db_profile[i0_ln:i1_ln]
             # For anomalously stretched lines (> 8.0s), use a local dynamic floor (max of global thr and line_p90 - 16 dB)
             # so faint reverb / crowd cheer / backing bleed during an interlude can NEVER hold a line open for 15-36s!
@@ -1890,25 +1893,27 @@ def refine_alignment_with_acoustics(
                 else:
                     v_first = (i0_ln + int(act_frames[0])) * step_sec
                     v_last = (i0_ln + int(act_frames[-1]) + 1) * step_sec
-                if (v_first - s) > 1.5 and (e - v_first) >= 0.45:
+                dead_margin = 2.0 if conservative else 1.5
+                if (v_first - s) > dead_margin and (e - v_first) >= 0.45:
                     s = round(max(first_onset, v_first - 0.15), 2)
-                if (e - v_last) > 1.5 and (v_last - s) >= 0.45:
+                if (e - v_last) > dead_margin and (v_last - s) >= 0.45:
                     e = round(max(s + 0.5, min(e, v_last + 0.30)), 2)
 
-        max_snap = min(e - 0.5, s + 2.5)
-        t_cur = s
-        while t_cur < max_snap:
-            idx = int(t_cur / step_sec)
-            if idx < n_db and db_profile[idx] > thr_db:
-                break
-            t_cur += step_sec
-        if t_cur > s + 0.12 and t_cur < max_snap:
-            s = round(max(first_onset, t_cur - 0.08), 2)
+        if not conservative:
+            max_snap = min(e - 0.5, s + 2.5)
+            t_cur = s
+            while t_cur < max_snap:
+                idx = int(t_cur / step_sec)
+                if idx < n_db and db_profile[idx] > thr_db:
+                    break
+                t_cur += step_sec
+            if t_cur > s + 0.12 and t_cur < max_snap:
+                s = round(max(first_onset, t_cur - 0.08), 2)
 
         # 2) Acoustic Vocal-Tail Extension: follow held final vowel until 0.2s genuine silence
-        # Use margin_db=+1.0 so genuine held singing vowels extend cleanly while faint live crowd/guitar bleed does not!
-        tail_thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=1.0)
-        limit_e = min(nxt_s - 0.12, e + 2.2)
+        # In conservative mode (post-Qwen3), cap extension to <=0.35s so live crowd/reverb bleed never drags final words!
+        tail_thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=(2.5 if conservative else 1.0))
+        limit_e = min(nxt_s - 0.12, e + (0.35 if conservative else 2.2))
         if limit_e > e:
             t_e = e
             quiet_run = 0
@@ -2136,42 +2141,53 @@ def _alignment_needs_live_rematch(
     if not segs:
         return True, "empty"
 
-    # Mandarin Whisper produces naturally lower token probabilities on Cantonese singing — avoid false live-rematch kicks!
+    # Mandarin/Cantonese Whisper produces naturally lower token probabilities on singing (and on embedded English rap/choruses
+    # inside CJK songs!) — score prob strictly on native-script lines & exclude simultaneous parenthetical backing vocals!
     prob_floor = 0.18 if lang == "yue" else 0.28
-    low_ratio_limit = 0.40 if lang == "yue" else 0.24
+    low_ratio_limit = 0.42 if lang == "yue" else 0.26
+    is_cjk_main = lang in ("zh", "yue", "ja", "ko")
+    backing_paren_re = re.compile(r"^[\(（][^()（）]{1,28}[\)）]$")
 
     crushed = 0
     tight_run = 0
     max_tight_run = 0
     low_prob = 0
+    prob_checked = 0
     prev_start = -1.0
     prev_was_zero = False
     for seg in segs:
         txt = (seg.text or "").strip()
         n_syl = estimate_syllable_units(txt)
+        is_backing = bool(backing_paren_re.match(txt))
+        is_foreign_latin = is_cjk_main and bool(re.search(r"[A-Za-z]", txt)) and not bool(
+            re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", txt)
+        )
         rs = _map_comp_to_real(float(seg.start), time_map, is_end=False) if time_map else float(seg.start)
         re_ = _map_comp_to_real(float(seg.end), time_map, is_end=True) if time_map else float(seg.end)
         dur = re_ - rs
         is_zero = dur <= 0.02
-        if dur < max(0.45, 0.09 * n_syl) or (prev_start >= 0 and not prev_was_zero and (rs - prev_start) < 0.25):
-            crushed += 1
-        if n_syl >= 4.0 and dur < 0.55:
-            tight_run += 1
-            max_tight_run = max(max_tight_run, tight_run)
-        else:
-            tight_run = 0
+        if not is_backing:
+            if dur < max(0.38, 0.08 * n_syl) or (prev_start >= 0 and not prev_was_zero and (rs - prev_start) < 0.22):
+                crushed += 1
+            if n_syl >= 4.0 and dur < 0.48:
+                tight_run += 1
+                max_tight_run = max(max_tight_run, tight_run)
+            else:
+                tight_run = 0
         prev_start = rs
         prev_was_zero = is_zero
-        probs = [w.probability for w in (seg.words or []) if w.probability is not None]
-        avg_p = (sum(probs) / len(probs)) if probs else 0.0
-        if avg_p < prob_floor:
-            low_prob += 1
+        if not is_foreign_latin and not is_backing:
+            prob_checked += 1
+            probs = [w.probability for w in (seg.words or []) if w.probability is not None]
+            avg_p = (sum(probs) / len(probs)) if probs else 0.0
+            if avg_p < prob_floor:
+                low_prob += 1
 
-    low_ratio = low_prob / max(1, len(segs))
-    min_crushed = max(3, int(round(len(segs) * 0.08)))
-    if crushed >= min_crushed or max_tight_run >= 3:
+    low_ratio = low_prob / max(1, prob_checked)
+    min_crushed = max(4, int(round(len(segs) * 0.10)))
+    if crushed >= min_crushed or max_tight_run >= 4:
         return True, f"crushed={crushed},tight_run={max_tight_run}"
-    if low_ratio >= low_ratio_limit:
+    if prob_checked >= 6 and low_ratio >= low_ratio_limit:
         return True, f"low_prob={low_ratio:.2f}"
 
     # Check BOTH uncovered head AND uncovered tail against REAL vocal energy (mapped back from compressed time!)
@@ -2339,6 +2355,164 @@ def _even_words_for_line(text: str, start_s: float, end_s: float) -> list[dict]:
         acc += wt
         we = round(start_s + dur * (acc / total_w), 2)
         out.append({"start": ws, "end": max(ws + 0.04, we), "word": tk})
+    return out
+
+
+def _recover_missing_lines_between_anchors(
+    cur: dict,
+    nxt: dict,
+    pl: list[str],
+    cur_idx: int,
+    nxt_idx: int,
+    gap_act_fn,
+) -> tuple[list[dict], Optional[float], Optional[float]]:
+    """Syllable-rate-aware gap recovery between two consecutive monotonic anchors `cur` and `nxt`.
+
+    Prevents fast rock/rap/cantopop choruses from silently dropping 1-3 sung lines when Whisper's loose
+    segment boundaries bleed slightly across line edges (small `nxt.start - cur.end` even though the full
+    span `[cur.start, nxt.end]` has ample active vocal duration for all `missing_n + 2` lines!), while STILL
+    skipping genuine live verse cuts (e.g. 12 skipped lines in 4 seconds).
+
+    Returns:
+      (recovered_mid_lines, optional_updated_cur_end, optional_updated_nxt_start)
+    """
+    missing_n = (nxt_idx - cur_idx - 1) if (0 <= cur_idx < nxt_idx <= cur_idx + 31) else 0
+    if missing_n <= 0:
+        return [], None, None
+
+    gap_s, gap_e = float(cur["end"]), float(nxt["start"])
+    mid_lines = [pl[cur_idx + 1 + m_i] for m_i in range(missing_n)]
+    mid_weights = [max(1.0, estimate_syllable_units(t)) for t in mid_lines]
+    mid_syl = sum(mid_weights)
+
+    # Case 1: Clean distinct gap between cur.end and nxt.start -> preserve anchor timestamps & fill inside gap
+    if (gap_e - gap_s) >= max(0.75, 0.55 * missing_n):
+        act_sec, v_first, v_last = gap_act_fn(gap_s, gap_e)
+        if act_sec >= max(0.45, min(0.45 * missing_n, 0.09 * mid_syl)):
+            span_s = max(gap_s, v_first)
+            span_e = min(gap_e, max(span_s + 0.4, v_last))
+            out: list[dict] = []
+            acc = 0.0
+            for txt, wt in zip(mid_lines, mid_weights):
+                s_i = span_s + (span_e - span_s) * (acc / mid_syl)
+                acc += wt
+                e_i = span_s + (span_e - span_s) * (acc / mid_syl)
+                out.append({"start": round(s_i, 2), "end": round(max(s_i + 0.25, e_i), 2), "text": txt, "sim": 0.0})
+            return out, None, None
+
+    # Case 2: Touching/bleeding Whisper boundaries (small dead gap) -> test TOTAL span [cur.start, nxt.end]
+    # for all (missing_n + 2) lines using syllable-rate physics (>=0.12s/syl total & >=0.10s/syl active vocal)!
+    if missing_n <= 6:
+        span_s_all = float(cur["start"])
+        span_e_all = float(nxt["end"])
+        all_lines = [pl[j] for j in range(cur_idx, nxt_idx + 1)]
+        all_weights = [max(1.0, estimate_syllable_units(t)) for t in all_lines]
+        total_syl = sum(all_weights)
+        total_span = span_e_all - span_s_all
+        if total_span >= max(1.2, 0.12 * total_syl):
+            act_all, v_first_all, v_last_all = gap_act_fn(span_s_all, span_e_all)
+            if act_all >= max(0.8, 0.10 * total_syl):
+                eff_s = max(span_s_all, v_first_all) if (v_first_all - span_s_all) > 1.0 else span_s_all
+                eff_e = min(span_e_all, v_last_all) if (span_e_all - v_last_all) > 1.0 else span_e_all
+                if eff_e > eff_s + 0.8:
+                    bounds: list[tuple[float, float]] = []
+                    acc = 0.0
+                    for wt in all_weights:
+                        b0 = eff_s + (eff_e - eff_s) * (acc / total_syl)
+                        acc += wt
+                        b1 = eff_s + (eff_e - eff_s) * (acc / total_syl)
+                        bounds.append((round(b0, 2), round(max(b0 + 0.25, b1), 2)))
+                    new_cur_end = bounds[0][1]
+                    new_nxt_start = bounds[-1][0]
+                    mid_out = [
+                        {"start": bounds[1 + m_i][0], "end": bounds[1 + m_i][1], "text": mid_lines[m_i], "sim": 0.0}
+                        for m_i in range(missing_n)
+                    ]
+                    return mid_out, new_cur_end, new_nxt_start
+
+    return [], None, None
+
+
+def _build_qwen3_windows(
+    lines: list[dict],
+    target_sec: float = 24.0,
+    max_sec: float = 38.0,
+    max_lines: int = 12,
+    interlude_gap: float = 3.5,
+    pause_cut_gap: float = 0.65,
+) -> list[tuple[list[int], list[int]]]:
+    """Partition lines into compact, VRAM-safe Qwen3 refinement windows with 1-line halo context anchors!
+
+    1. Cuts cleanly at instrumental interludes (>= interlude_gap) or natural phrase pauses (>= pause_cut_gap
+       once window >= target_sec or >= 6 lines), and at sustained script switches (e.g. EN rap <-> CJK verse).
+    2. When a boundary falls across continuous singing (< interlude_gap), attaches 1 halo anchor line on that
+       side so Qwen3 ALWAYS receives full vocal context and NEVER chops boundary lines when Stage-1 drifted!
+
+    Returns list of (core_idx_list, halo_expanded_idx_list).
+    """
+    if not lines:
+        return []
+
+    def _line_is_en_only(txt: str) -> bool:
+        return bool(re.search(r"[A-Za-z]{2,}", txt or "")) and not bool(
+            re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", txt or "")
+        )
+
+    raw_windows: list[list[int]] = []
+    cur_win: list[int] = []
+    win_start = float(lines[0]["start"])
+    for idx, ln in enumerate(lines):
+        if not cur_win:
+            cur_win = [idx]
+            win_start = float(ln["start"])
+            continue
+        prev_gap = float(ln["start"]) - float(lines[cur_win[-1]]["end"])
+        cur_span = float(ln["end"]) - win_start
+        # Split cleanly at sustained script transitions (>=3 EN lines <-> >=3 CJK lines) so each gets its native language!
+        script_switch = False
+        if len(cur_win) >= 3:
+            prev_en = _line_is_en_only(lines[cur_win[-1]].get("text", ""))
+            cur_en = _line_is_en_only(ln.get("text", ""))
+            if prev_en != cur_en:
+                prev_run_same = all(_line_is_en_only(lines[j].get("text", "")) == prev_en for j in cur_win[-3:])
+                nxt_run_same = idx + 2 < len(lines) and all(
+                    _line_is_en_only(lines[j].get("text", "")) == cur_en for j in range(idx, idx + 3)
+                )
+                if prev_run_same and nxt_run_same:
+                    script_switch = True
+
+        must_cut = (prev_gap >= interlude_gap) or (cur_span > max_sec) or (len(cur_win) >= max_lines) or script_switch
+        prefer_cut = (prev_gap >= pause_cut_gap) and (cur_span >= target_sec or len(cur_win) >= 6)
+        if must_cut or prefer_cut:
+            raw_windows.append(cur_win)
+            cur_win = [idx]
+            win_start = float(ln["start"])
+        else:
+            cur_win.append(idx)
+    if cur_win:
+        raw_windows.append(cur_win)
+
+    # Merge tiny trailing 1-line window into prior window when no interlude separates them
+    if len(raw_windows) >= 2 and len(raw_windows[-1]) == 1:
+        gap_last = float(lines[raw_windows[-1][0]]["start"]) - float(lines[raw_windows[-2][-1]]["end"])
+        span_merged = float(lines[raw_windows[-1][-1]]["end"]) - float(lines[raw_windows[-2][0]]["start"])
+        if gap_last < interlude_gap and span_merged <= max_sec + 6.0:
+            raw_windows[-2].extend(raw_windows.pop())
+
+    out: list[tuple[list[int], list[int]]] = []
+    n_total = len(lines)
+    for core in raw_windows:
+        ext = list(core)
+        first_i, last_i = core[0], core[-1]
+        if first_i > 0:
+            g_left = float(lines[first_i]["start"]) - float(lines[first_i - 1]["end"])
+            if g_left < interlude_gap:
+                ext.insert(0, first_i - 1)
+        if last_i + 1 < n_total:
+            g_right = float(lines[last_i + 1]["start"]) - float(lines[last_i]["end"])
+            if g_right < interlude_gap:
+                ext.append(last_i + 1)
+        out.append((core, ext))
     return out
 
 
@@ -2988,68 +3162,76 @@ def _live_section_anchored_align(
         # 1) Leading lines recovery (0 .. first_idx - 1) walking BACKWARD across contiguous singing
         first_item = run[0]
         first_idx = first_item["_idx"]
-        if first_idx > 0 and first_item["start"] - prev_bound >= 1.5:
+        if first_idx > 0 and first_item["start"] - prev_bound >= 1.2:
             lead_n = first_idx
+            lead_weights = [max(1.0, estimate_syllable_units(pl[m_i])) for m_i in range(lead_n)]
+            lead_syl = sum(lead_weights)
             max_lead_window = min(first_item["start"] - prev_bound, max(12.0, lead_n * 5.2))
             win_s = max(prev_bound, first_item["start"] - max_lead_window)
             act_sec, v_first, _ = _contiguous_vocal_span(
                 db_profile, step_sec, gap_thr, win_s, first_item["start"], direction="backward", max_silent_gap=8.0
             )
-            if act_sec >= max(0.8, 0.55 * lead_n):
+            if act_sec >= max(0.7, min(0.55 * lead_n, 0.10 * lead_syl)):
                 span_s = max(prev_bound, v_first)
                 span_e = first_item["start"]
                 if span_e > span_s + 0.5:
-                    step_t = (span_e - span_s) / lead_n
-                    for m_i in range(lead_n):
+                    acc = 0.0
+                    for m_i, wt in enumerate(lead_weights):
+                        s_m = span_s + (span_e - span_s) * (acc / lead_syl)
+                        acc += wt
+                        e_m = span_s + (span_e - span_s) * (acc / lead_syl)
                         filled.append({
-                            "start": round(span_s + m_i * step_t, 2),
-                            "end": round(span_s + (m_i + 1) * step_t, 2),
+                            "start": round(s_m, 2),
+                            "end": round(max(s_m + 0.25, e_m), 2),
                             "text": pl[m_i],
                             "sim": 0.0,
                         })
 
-        # 2) Anchors + internal gap recovery (up to 30 missing lines within the same song!)
-        # Lowered floor (0.65s/line, 0.45s vocal/line) so fast rock/rap lines are NEVER dropped before alignment!
-        for k, cur in enumerate(run):
-            filled.append({k2: v2 for k2, v2 in cur.items() if not k2.startswith("_")})
-            if k + 1 < len(run):
-                nxt = run[k + 1]
+        # 2) Anchors + syllable-rate-aware internal gap recovery (handles both clean gaps AND touching Whisper edges!)
+        run_work = [dict(it) for it in run]
+        for k, cur in enumerate(run_work):
+            cur_entry = {k2: v2 for k2, v2 in cur.items() if not k2.startswith("_")}
+            filled.append(cur_entry)
+            if k + 1 < len(run_work):
+                nxt = run_work[k + 1]
                 cur_idx, nxt_idx = cur["_idx"], nxt["_idx"]
-                missing_n = (nxt_idx - cur_idx - 1) if (0 <= cur_idx < nxt_idx <= cur_idx + 31) else 0
-                gap_s, gap_e = cur["end"], nxt["start"]
-                if 1 <= missing_n <= 30 and (gap_e - gap_s) >= max(0.75, 0.65 * missing_n):
-                    act_sec, v_first, v_last = _active_vocal_span(gap_s, gap_e)
-                    if act_sec >= max(0.50, 0.45 * missing_n):
-                        span_s = max(gap_s, v_first)
-                        span_e = min(gap_e, max(span_s + 0.4, v_last))
-                        step_t = (span_e - span_s) / missing_n
-                        for m_i in range(missing_n):
-                            filled.append({
-                                "start": round(span_s + m_i * step_t, 2),
-                                "end": round(span_s + (m_i + 1) * step_t, 2),
-                                "text": pl[cur_idx + 1 + m_i],
-                                "sim": 0.0,
-                            })
+                mid_rec, new_cur_end, new_nxt_start = _recover_missing_lines_between_anchors(
+                    cur, nxt, pl, cur_idx, nxt_idx, _active_vocal_span
+                )
+                if mid_rec:
+                    if new_cur_end is not None:
+                        cur_entry["end"] = new_cur_end
+                        # Mark redistributed anchor boundary soft so block aligner can freely refine its exact edge
+                        cur_entry["sim"] = 0.0
+                    if new_nxt_start is not None:
+                        nxt["start"] = new_nxt_start
+                        nxt["sim"] = 0.0
+                    filled.extend(mid_rec)
 
         # 3) Trailing lines recovery (last_idx + 1 .. len(pl) - 1) walking FORWARD across contiguous singing
-        last_item = run[-1]
+        last_item = run_work[-1]
         last_idx = last_item["_idx"]
-        if 0 <= last_idx < len(pl) - 1 and next_bound - last_item["end"] >= 1.5:
+        if 0 <= last_idx < len(pl) - 1 and next_bound - last_item["end"] >= 1.2:
             trail_n = len(pl) - 1 - last_idx
+            trail_weights = [max(1.0, estimate_syllable_units(pl[last_idx + 1 + m_i])) for m_i in range(trail_n)]
+            trail_syl = sum(trail_weights)
             max_trail_window = min(next_bound - last_item["end"], max(12.0, trail_n * 5.2))
             win_e = min(next_bound, last_item["end"] + max_trail_window)
             act_sec, _, v_last = _contiguous_vocal_span(
                 db_profile, step_sec, gap_thr, last_item["end"], win_e, direction="forward", max_silent_gap=8.0
             )
-            if act_sec >= max(0.8, 0.55 * trail_n):
+            if act_sec >= max(0.7, min(0.55 * trail_n, 0.10 * trail_syl)):
                 span_s = last_item["end"]
                 span_e = min(next_bound, v_last)
                 if span_e > span_s + 0.5:
-                    step_t = (span_e - span_s) / trail_n
-                    for m_i in range(trail_n):
+                    acc = 0.0
+                    for m_i, wt in enumerate(trail_weights):
+                        s_m = span_s + (span_e - span_s) * (acc / trail_syl)
+                        acc += wt
+                        e_m = span_s + (span_e - span_s) * (acc / trail_syl)
                         filled.append({
-                            "start": round(span_s + m_i * step_t, 2),
-                            "end": round(span_s + (m_i + 1) * step_t, 2),
+                            "start": round(s_m, 2),
+                            "end": round(max(s_m + 0.25, e_m), 2),
                             "text": pl[last_idx + 1 + m_i],
                             "sim": 0.0,
                         })
@@ -3089,6 +3271,9 @@ def _live_section_anchored_align(
         if len(audio_16k) > 0 and b_end > b_start + 0.5:
             chunk = audio_16k[int(b_start * 16000) : int(b_end * 16000)]
             blk_text = "\n".join(x["text"] for x in blk)
+            blk_lang = detect_lyrics_language([x["text"] for x in blk])
+            if blk_lang == "zh" and lang == "yue":
+                blk_lang = "yue"
             blk_time_map: list[tuple[float, float, float, float]] = []
             align_chunk = chunk
             if (b_end - b_start) >= 20.0 and len(db_profile) > 0:
@@ -3102,7 +3287,7 @@ def _live_section_anchored_align(
                 al = model.align(
                     align_chunk,
                     blk_text,
-                    language=_whisper_align_lang(lang),
+                    language=_whisper_align_lang(blk_lang),
                     original_split=True,
                     fast_mode=(not use_cuda),
                     verbose=False,
@@ -3301,27 +3486,9 @@ def refine_lines_with_qwen3(
 
     audio_dur = len(audio_16k) / 16000.0
 
-    # Group lines into compact <=35s / <=10-line windows AND split at instrumental interludes (>= 4.0s gap)
-    # so Qwen3-ForcedAligner NEVER sees giant 80-120s chunks that spill into Windows Shared GPU RAM!
-    windows: list[list[int]] = []
-    cur_win: list[int] = []
-    win_start = float(lines[0]["start"])
-    for idx, ln in enumerate(lines):
-        prev_gap = (float(ln["start"]) - float(lines[cur_win[-1]]["end"])) if cur_win else 0.0
-        if cur_win and (prev_gap >= 4.0 or float(ln["end"]) - win_start > 35.0 or len(cur_win) >= 10):
-            windows.append(cur_win)
-            cur_win = [idx]
-            win_start = float(ln["start"])
-        else:
-            cur_win.append(idx)
-    if cur_win:
-        windows.append(cur_win)
-    # Merge tiny trailing 1-line window into prior window when no interlude separates them (prevents <1s skip aborts!)
-    if len(windows) >= 2 and len(windows[-1]) == 1:
-        gap_last = float(lines[windows[-1][0]]["start"]) - float(lines[windows[-2][-1]]["end"])
-        span_merged = float(lines[windows[-1][-1]]["end"]) - float(lines[windows[-2][0]]["start"])
-        if gap_last < 4.0 and span_merged <= 42.0:
-            windows[-2].extend(windows.pop())
+    # Pause-aware, script-aware compact windows (<=38s / <=12 lines) with 1-line halo anchors on continuous edges
+    # so Qwen3 NEVER chops boundary audio when Stage-1 drifted, AND never spills into Windows Shared GPU RAM!
+    windows = _build_qwen3_windows(lines)
 
     qwen_t0 = time.monotonic()
     aligner = None
@@ -3352,7 +3519,7 @@ def refine_lines_with_qwen3(
         refined = [dict(ln) for ln in lines]
         refined_windows = 0
 
-        for wi, idx_list in enumerate(windows):
+        for wi, (core_idxs, ext_idxs) in enumerate(windows):
             if (time.monotonic() - qwen_t0) > max_total_sec:
                 print(
                     f"[Lyrics] Qwen3-ForcedAligner hit {max_total_sec:.0f}s budget at window {wi}/{len(windows)}; keeping {refined_windows} refined windows.",
@@ -3365,20 +3532,31 @@ def refine_lines_with_qwen3(
                     progress_cb(wi + 1, len(windows))
                 except Exception:
                     pass
-            # Use ALREADY-REFINED previous window end so adjacent windows NEVER expand into the same vocal region!
-            prev_end = float(refined[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
-            next_start = float(lines[idx_list[-1] + 1]["start"]) if (idx_list[-1] + 1) < len(lines) else audio_dur
-            # Structural drift rescue using SYLLABLE UNITS (0.07s/syl protects fast rap while still catching crushed lines!)
+            # Compute generous audio bounds around the halo-expanded window so edge lines NEVER lose their vocals!
+            has_left_halo = ext_idxs[0] < core_idxs[0]
+            has_right_halo = ext_idxs[-1] > core_idxs[-1]
+            left_anchor_s = float(refined[ext_idxs[0]]["start"]) if has_left_halo else float(lines[ext_idxs[0]]["start"])
+            right_anchor_e = float(lines[ext_idxs[-1]]["end"])
+            prev_outer_end = float(refined[ext_idxs[0] - 1]["end"]) if ext_idxs[0] > 0 else 0.0
+            next_outer_start = float(lines[ext_idxs[-1] + 1]["start"]) if (ext_idxs[-1] + 1) < len(lines) else audio_dur
             has_compressed = any(
                 (float(lines[i]["end"]) - float(lines[i]["start"])) / estimate_syllable_units(lines[i].get("text", "")) < 0.07
-                for i in idx_list
+                for i in core_idxs
             )
-            eff_pad = min(5.0, max(max_pad_sec, 4.5)) if has_compressed else max_pad_sec
-            pad_left = min(eff_pad, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * (0.75 if has_compressed else 0.45)))
-            pad_right = min(eff_pad, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * (0.75 if has_compressed else 0.45)))
-            w_t0 = max(prev_end, float(lines[idx_list[0]]["start"]) - pad_left)
-            w_t1 = min(audio_dur, float(lines[idx_list[-1]]["end"]) + pad_right)
-            if w_t1 - w_t0 < 0.35 or w_t1 - w_t0 > 50.0:
+            eff_pad = min(5.0, max(max_pad_sec, 4.0)) if has_compressed else max(max_pad_sec, 2.0)
+            if has_left_halo:
+                w_t0 = max(prev_outer_end, left_anchor_s - 0.35)
+            else:
+                pad_left = min(eff_pad, max(0.5, (left_anchor_s - prev_outer_end) * 0.65))
+                w_t0 = max(prev_outer_end if ext_idxs[0] > 0 else 0.0, left_anchor_s - pad_left)
+            pad_right = min(eff_pad, max(0.5, (next_outer_start - right_anchor_e) * 0.65))
+            w_t1 = min(audio_dur, right_anchor_e + pad_right)
+            if (w_t1 - w_t0) > 65.0 and (has_left_halo or has_right_halo):
+                # Fall back to core-only bounds rather than dropping the entire window
+                ext_idxs = list(core_idxs)
+                w_t0 = max(0.0, float(lines[core_idxs[0]]["start"]) - min(2.0, eff_pad))
+                w_t1 = min(audio_dur, float(lines[core_idxs[-1]]["end"]) + min(2.0, eff_pad))
+            if w_t1 - w_t0 < 0.35 or w_t1 - w_t0 > 70.0:
                 continue
 
             s0 = int(round(w_t0 * 16000))
@@ -3387,15 +3565,16 @@ def refine_lines_with_qwen3(
             if len(chunk_audio) < 8000:
                 continue
 
-            # Per-window language override for bilingual songs / multi-language medleys (e.g., EN chorus in CJK song)
-            win_texts = [(lines[i].get("text") or "").strip() for i in idx_list]
-            win_lang = detect_lyrics_language(win_texts)
+            # Per-window language override for bilingual songs / multi-language medleys (based on CORE lines!)
+            core_texts = [(lines[i].get("text") or "").strip() for i in core_idxs]
+            win_lang = detect_lyrics_language(core_texts)
             if win_lang == "zh" and lang == "yue":
                 win_lang = "yue"
             win_qwen_lang = QWEN3_LANG_MAP.get(win_lang, qwen_lang)
 
+            core_set = set(core_idxs)
             valid_pairs: list[tuple[int, str, int]] = []
-            for idx in idx_list:
+            for idx in ext_idxs:
                 txt = (lines[idx].get("text") or "").strip()
                 wlist, _ = aligner.aligner_processor.encode_timestamp(txt, win_qwen_lang)
                 if wlist:
@@ -3418,23 +3597,25 @@ def refine_lines_with_qwen3(
             if not items or len(items) != expected_n:
                 continue
 
-            # Build candidate refined lines for this window with strict per-line collapse & stretch guards
+            # Commit ONLY interior CORE lines (discarding halo boundary context lines!) with collapse & stretch guards
             cand_updates: list[tuple[int, dict]] = []
             cursor = 0
             squished = 0
             exploded = 0
+            core_checked = 0
             for idx, txt, n_tok in valid_pairs:
                 tok_slice = items[cursor: cursor + n_tok]
                 cursor += n_tok
-                if not tok_slice:
+                if idx not in core_set or not tok_slice:
                     continue
+                core_checked += 1
                 local_s = float(tok_slice[0].start_time)
                 local_e = float(tok_slice[-1].end_time)
                 q_dur = local_e - local_s
                 n_syl = estimate_syllable_units(txt)
                 orig_dur = max(0.35, float(lines[idx]["end"]) - float(lines[idx]["start"]))
                 is_squished = q_dur <= max(0.18, 0.04 * n_syl)
-                is_exploded = q_dur > max(9.5, orig_dur * 2.2)
+                is_exploded = q_dur > max(9.5, orig_dur * 2.4)
                 if is_squished:
                     squished += 1
                 if is_exploded:
@@ -3454,8 +3635,8 @@ def refine_lines_with_qwen3(
                     words_out.append({"start": ws, "end": we, "word": wt})
                 cand_updates.append((idx, {"start": abs_s, "end": abs_e, "text": txt, "words": words_out}))
 
-            # Accept healthy lines in this window even if 1 outlier line exploded/squished (<=15% anomaly rate)
-            if cand_updates and ((squished + exploded) / max(1, len(valid_pairs))) <= 0.15:
+            # Accept healthy core lines in this window even if 1 outlier line exploded/squished (<=20% anomaly rate)
+            if cand_updates and ((squished + exploded) / max(1, core_checked)) <= 0.20:
                 for idx, upd in cand_updates:
                     refined[idx] = upd
                 refined_windows += 1
@@ -3482,7 +3663,7 @@ def refine_lines_with_qwen3(
                         w["start"] = round(max(cs, min(ce, float(w["start"]))), 3)
                         w["end"] = round(max(w["start"], min(ce, float(w["end"]))), 3)
 
-        refined = refine_alignment_with_acoustics(refined, db_profile, step_sec, audio_dur, first_onset)
+        refined = refine_alignment_with_acoustics(refined, db_profile, step_sec, audio_dur, first_onset, conservative=True)
         print(f"[Lyrics] Qwen3-ForcedAligner refined {refined_windows}/{len(windows)} windows ({len(refined)} lines)", file=sys.stderr, flush=True)
         return refined, True
     except Exception as exc:
@@ -3546,6 +3727,7 @@ def align_official_lyrics_with_stable_ts(
                 audio_16k, first_onset, probe_lines,
                 sub_lang=sub_lang, meta_lang=meta_lang, preloaded_model=model,
             )
+            whisper_lang = _whisper_align_lang(lang)
         if lang_out is not None:
             lang_out["lang"] = lang
 

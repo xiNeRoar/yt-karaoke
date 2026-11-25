@@ -160,7 +160,7 @@ def test_worker_and_separator_invariants() -> None:
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
     assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map, lang=lang)" in lw_src, "Must pass real db_profile + time_map + lang to detect unaligned Song #2 / encores!"
     assert "if (is_mashup_title and len(multi_song_pools) < 2) or not official_lines:" in lw_src, "Must never overwrite resolved multi_song_pools with split-brain Shazam strings!"
-    assert "prev_gap >= 4.0" in lw_src, "Qwen3 windows must split at instrumental interludes (>=4s) to prevent stretched ghost lines!"
+    assert "prev_gap >= interlude_gap" in lw_src and "_build_qwen3_windows(lines)" in lw_src, "Qwen3 windows must split at instrumental interludes via _build_qwen3_windows to prevent stretched ghost lines!"
     assert "lrc_covers_audio" in lw_src, "LRC fast-path must verify full vocal coverage so single-song LRC never hijacks multi-song videos!"
     assert "async with Shazam() as shazam:" in lw_src, "Shazam probes must close aiohttp ClientSession via async context manager"
     assert '"zh": "Chinese"' in lw_src and '"yue": "Cantonese"' in lw_src, "Qwen3 must map Mandarin zh -> Chinese and Cantonese yue -> Cantonese!"
@@ -742,6 +742,83 @@ def test_storage_and_gateway_resilience() -> None:
     print("[PASS] Storage empty-catalog protection + Gateway missing TTL & isolated lyrics rate-limit bucket")
 
 
+def test_generic_alignment_recovery_and_qwen3_windows() -> None:
+    import types
+    import lyrics_worker as lw
+
+    # 1) Touching Whisper boundaries MUST recover sung intermediate lines (never drop chorus lines!)
+    pl = ["我就算輸 都不會後悔", "都總會着緊我", "正確路線哪此一個", "當戰敗了不等於錯"]
+    cur = {"start": 67.0, "end": 71.6, "text": pl[0], "sim": 0.9}
+    nxt = {"start": 72.0, "end": 76.0, "text": pl[3], "sim": 0.9}
+    # Simulate continuous singing vocal energy across [67.0, 76.0] (9.0s active)
+    mid_rec, new_cur_e, new_nxt_s = lw._recover_missing_lines_between_anchors(
+        cur, nxt, pl, 0, 3, lambda ts, te: (max(0.0, te - ts - 0.3), ts, te)
+    )
+    assert [m["text"] for m in mid_rec] == ["都總會着緊我", "正確路線哪此一個"], f"Dropped sung chorus lines: {mid_rec}"
+    assert new_cur_e is not None and new_nxt_s is not None
+    assert 67.0 < new_cur_e <= mid_rec[0]["start"] < mid_rec[0]["end"] <= mid_rec[1]["start"] < mid_rec[1]["end"] <= new_nxt_s < 76.0
+
+    # 2) Genuine live verse cut (12 skipped lines inside 5s) MUST NOT be falsely injected!
+    pl_long = [f"第{i}句歌詞測試內容" for i in range(16)]
+    mid_cut, _, _ = lw._recover_missing_lines_between_anchors(
+        {"start": 60.0, "end": 62.0, "text": pl_long[0], "sim": 0.9},
+        {"start": 63.0, "end": 65.0, "text": pl_long[13], "sim": 0.9},
+        pl_long, 0, 13, lambda ts, te: (max(0.0, te - ts), ts, te),
+    )
+    assert mid_cut == [], f"Skipped verse was falsely injected: {mid_cut}"
+
+    # 3) Bilingual Cantonese+English rock song with parenthetical backing vocals MUST NOT falsely fail full alignment!
+    def _mk_seg(s, e, txt, prob):
+        return types.SimpleNamespace(
+            start=s, end=e, text=txt, words=[types.SimpleNamespace(probability=prob)]
+        )
+    segs_ok = [
+        _mk_seg(10.0, 13.0, "一街囂張嘴臉", 0.35),
+        _mk_seg(13.2, 16.2, "全然指控着 都當上法官", 0.34),
+        _mk_seg(16.4, 19.0, "Embrace your nightmare in the dark", 0.04),
+        _mk_seg(19.2, 22.0, "Now here let's start to face my heart", 0.05),
+        _mk_seg(22.2, 22.4, "(GAME ON)", 0.03),
+        _mk_seg(22.6, 25.4, "Hearing what you're saying", 0.04),
+        _mk_seg(25.6, 28.6, "我就算輸 都不會後悔", 0.38),
+        _mk_seg(28.8, 31.2, "都總會着緊我", 0.36),
+        _mk_seg(31.4, 34.0, "正確路線哪此一個", 0.33),
+        _mk_seg(34.2, 37.0, "當戰敗了不等於錯", 0.37),
+        _mk_seg(37.2, 37.4, "（月色間有份顧慮）", 0.05),
+        _mk_seg(37.6, 40.4, "懇請好好相信", 0.36),
+    ]
+    needs_live, reason = lw._alignment_needs_live_rematch(
+        types.SimpleNamespace(segments=segs_ok), 42.0, [], 0.1, time_map=None, lang="yue"
+    )
+    assert not needs_live, f"Bilingual rock + backing vocals falsely failed full alignment: {reason}"
+
+    # 4) Qwen3 halo windows: 100% core partition + 1-line halo on continuous cuts + script-switch split!
+    cont_lines = [{"start": i * 2.5, "end": i * 2.5 + 2.4, "text": f"廣東話測試第{i}句"} for i in range(20)]
+    wins = lw._build_qwen3_windows(cont_lines)
+    assert len(wins) >= 2
+    flat_core = [idx for core, _ in wins for idx in core]
+    assert flat_core == list(range(20)), f"Core partition broken: {flat_core}"
+    # Interior cut between window 0 and window 1 MUST carry right halo on win 0 and left halo on win 1!
+    c0, e0 = wins[0]
+    c1, e1 = wins[1]
+    assert e0[-1] == c1[0] and e1[0] == c0[-1], f"Missing 1-line halo across continuous boundary: {wins[:2]}"
+
+    biling_lines = (
+        [{"start": i * 2.5, "end": i * 2.5 + 2.3, "text": f"廣東話歌詞第{i}句"} for i in range(4)]
+        + [{"start": (4 + i) * 2.5, "end": (4 + i) * 2.5 + 2.3, "text": f"Straight out of the gate line {i}"} for i in range(4)]
+        + [{"start": (8 + i) * 2.5, "end": (8 + i) * 2.5 + 2.3, "text": f"再唱返廣東話第{i}句"} for i in range(4)]
+    )
+    bwins = lw._build_qwen3_windows(biling_lines)
+    assert [c for c, _ in bwins] == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]], f"Script-switch split failed: {bwins}"
+
+    # 5) Literary Cantopop whisper_lang refresh after audio Cantonese detection
+    lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
+    p_det = lw_src.index("lang = _detect_cantonese_vs_mandarin_audio(")
+    p_upd = lw_src.index("whisper_lang = _whisper_align_lang(lang)", p_det)
+    p_aln = lw_src.index("aligned = model.align(", p_det)
+    assert p_det < p_upd < p_aln, "whisper_lang must be refreshed after Cantonese audio ID before model.align()"
+    print("[PASS] Syllable-aware gap recovery, bilingual rematch tolerance, Qwen3 halo/script windows & yue lang sync")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -752,6 +829,7 @@ def main() -> int:
     test_generic_title_decomposition()
     test_bilingual_title_matching_and_artist_isolation()
     test_multilingual_cleaning_similarity_and_splitting()
+    test_generic_alignment_recovery_and_qwen3_windows()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()
