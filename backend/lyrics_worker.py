@@ -523,6 +523,26 @@ def fetch_official_lyrics(
     return best_synced, best_lines, best_source
 
 
+def _extract_bracketed_titles(title: str) -> list[str]:
+    """Extract quoted/bracketed segments using paired delimiters so nested quotes
+    (e.g. 《唯獨不可敗給名為「我」的你》《戀愛腦之死》) are never truncated at inner quotes!
+    """
+    if not title:
+        return []
+    found: list[str] = []
+    # Prefer outer book-title brackets 《...》 first; fall back to 「」/『』/"" if fewer than 2 《》 exist
+    outer_books = [m.strip() for m in re.findall(r"《([^《》]{2,48})》", title) if m.strip()]
+    if len(outer_books) >= 2:
+        found.extend(outer_books)
+    else:
+        for pat in (r"《([^《》]{2,48})》", r"「([^「」]{2,48})」", r"『([^『』]{2,48})』", r"\"([^\"]{2,48})\""):
+            for m in re.findall(pat, title):
+                s = m.strip()
+                if s:
+                    found.append(s)
+    return list(dict.fromkeys(found))
+
+
 def fetch_multi_song_lyrics_from_title(title: str, duration: float) -> list[list[str]]:
     """Generic multi-song lookup for long videos (>=5.3 min) containing >=2 bracketed titles
     (e.g. CHILL CLUB 2-song sets, concert medleys like '《Song A》《Song B》').
@@ -530,13 +550,7 @@ def fetch_multi_song_lyrics_from_title(title: str, duration: float) -> list[list
     """
     if duration < 320.0 or not title:
         return []
-    raw_quotes = [
-        m.strip()
-        for m in re.findall(r"[《「『\"]([^《》「」『』\"]{2,40})[》」』\"]", title)
-        if m.strip()
-    ]
-    # Deduplicate preserving order
-    pieces = list(dict.fromkeys(raw_quotes))
+    pieces = _extract_bracketed_titles(title)
     if len(pieces) < 2:
         return []
 
@@ -1217,8 +1231,16 @@ def refine_alignment_with_acoustics(
     return lines
 
 
-def _alignment_needs_live_rematch(aligned, audio_dur: float, db_profile: np.ndarray, step_sec: float) -> tuple[bool, str]:
-    """Detect skipped verses, mid-song starts, swapped sections, or crushed lines in monotonic alignment."""
+def _alignment_needs_live_rematch(
+    aligned,
+    audio_dur: float,
+    db_profile: np.ndarray,
+    step_sec: float,
+    time_map: Optional[list[tuple[float, float, float, float]]] = None,
+) -> tuple[bool, str]:
+    """Detect skipped verses, mid-song starts, swapped sections, crushed lines, OR uncovered singing
+    (e.g. Song #2 / encore in a multi-song video) in monotonic single-song alignment.
+    """
     segs = [s for s in (aligned.segments or []) if (s.text or "").strip()]
     if not segs:
         return True, "empty"
@@ -1244,15 +1266,23 @@ def _alignment_needs_live_rematch(aligned, audio_dur: float, db_profile: np.ndar
     if low_ratio >= 0.24:
         return True, f"low_prob={low_ratio:.2f}"
 
-    # Also check if there's >20s of active singing after the last aligned line (e.g. repeated encore)
+    # Check BOTH uncovered head AND uncovered tail against REAL vocal energy (mapped back from compressed time!)
     if len(db_profile) > 0 and audio_dur > 0:
-        last_end = float(segs[-1].end)
-        tail_idx = int((last_end + 4.0) / step_sec)
+        real_first = _map_comp_to_real(float(segs[0].start), time_map) if time_map else float(segs[0].start)
+        real_last = _map_comp_to_real(float(segs[-1].end), time_map) if time_map else float(segs[-1].end)
+        cov_thr = _adaptive_vocal_threshold_db(db_profile, margin_db=2.0)
+
+        tail_idx = int((real_last + 4.0) / step_sec)
         if tail_idx < len(db_profile):
-            tail_thr = _adaptive_vocal_threshold_db(db_profile, margin_db=3.0)
-            active_tail_sec = float(np.sum(db_profile[tail_idx:] > tail_thr)) * step_sec
+            active_tail_sec = float(np.sum(db_profile[tail_idx:] > cov_thr)) * step_sec
             if active_tail_sec >= 18.0:
                 return True, f"unaligned_tail={active_tail_sec:.1f}s"
+
+        head_idx = int(max(0.0, real_first - 4.0) / step_sec)
+        if head_idx > 0:
+            active_head_sec = float(np.sum(db_profile[:head_idx] > cov_thr)) * step_sec
+            if active_head_sec >= 18.0:
+                return True, f"unaligned_head={active_head_sec:.1f}s"
 
     return False, "ok"
 
@@ -2095,8 +2125,7 @@ def align_official_lyrics_with_stable_ts(
         else:
             raise
 
-    comp_dur = (len(align_audio) / 16000.0) if isinstance(align_audio, np.ndarray) else audio_dur
-    needs_live, reason = _alignment_needs_live_rematch(aligned, comp_dur, np.array([]), step_sec)
+    needs_live, reason = _alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map)
     if needs_live:
         print(f"[Lyrics] Detected non-standard live/abridged structure ({reason}); engaging section-anchored live alignment...", flush=True)
         live_lines = _run_live_safe()
@@ -2386,7 +2415,7 @@ def main() -> int:
                 }
                 out_file.parent.mkdir(parents=True, exist_ok=True)
                 write_json_atomic(out_file, result, stamp_updated_at=False)
-                update("ready", 100, "歌詞已就緒")
+                update("finalizing", 98, "載入歌詞中...")
                 return 0
 
             cached_vocal_profile = detect_vocal_energy_profile(vocals_path)
@@ -2408,7 +2437,7 @@ def main() -> int:
                     }
                     out_file.parent.mkdir(parents=True, exist_ok=True)
                     write_json_atomic(out_file, result, stamp_updated_at=False)
-                    update("ready", 100, "歌詞已就緒")
+                    update("finalizing", 98, "載入歌詞中...")
                     return 0
             # GPU busy / Qwen3 skipped -> keep these exact human YouTube lines for CPU stable-ts word alignment!
             yt_human_official_lines = clean_lyric_lines([ln["text"] for ln in yt_lines])
@@ -2452,7 +2481,7 @@ def main() -> int:
             }
             out_file.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(out_file, result, stamp_updated_at=False)
-            update("ready", 100, "歌詞已就緒")
+            update("finalizing", 98, "載入歌詞中...")
             return 0
 
         if not vocals_path.exists():
@@ -2489,7 +2518,7 @@ def main() -> int:
                     }
                     out_file.parent.mkdir(parents=True, exist_ok=True)
                     write_json_atomic(out_file, result, stamp_updated_at=False)
-                    update("ready", 100, "歌詞已就緒")
+                    update("finalizing", 98, "載入歌詞中...")
                     return 0
 
         # Layer 2B: Automatic Shazam audio fingerprinting for Mashups/Medleys OR videos whose title has no song name!

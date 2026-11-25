@@ -143,6 +143,8 @@ def test_worker_and_separator_invariants() -> None:
     assert "_lyrics_ram.pop(evid" in gw_src, "Gateway must evict stale lyrics RAM on HQ upgrade"
     # 5) Exhaustive lyrics_worker.py exit-path invariants (ALL branches under BOTH GPU-free and low-VRAM CPU!)
     lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
+    assert 'update("ready"' not in lw_src, "lyrics_worker.py must leave status at finalizing until separator.py caches lines!"
+    assert "Worker produced empty lyrics" in sep_src, "separator.py must fail loudly instead of leaving status at finalizing!"
     assert "if not vocals_path.exists():" in lw_src, "Layer 1 youtube_sub must require word alignment when vocals exist"
     assert "if lrc_synced and not force_ai and not vocals_path.exists():" in lw_src, "Layer 2 LRC must require word alignment when vocals exist"
     assert "require_all_windows=True" in lw_src, "0-word scaffolds must require 100% window coverage from Qwen3"
@@ -150,6 +152,7 @@ def test_worker_and_separator_invariants() -> None:
     assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
+    assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map)" in lw_src, "Must pass real db_profile + time_map to detect unaligned Song #2 / encores!"
     assert "async with Shazam() as shazam:" in lw_src, "Shazam probes must close aiohttp ClientSession via async context manager"
     # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
@@ -273,7 +276,10 @@ def test_generic_title_decomposition() -> None:
     assert any("隱形遊樂場" in q for q in c2), f"Missing song in {c2}"
     c3 = lw._extract_query_candidates("Random Vlog", track="富士山下", artist="陳奕迅")
     assert c3[0] == "陳奕迅 富士山下", f"Structured metadata should be #1: {c3}"
-    print("[PASS] Generic zero-blacklist title decomposition")
+    # Nested quotes inside 《...》 (e.g. 《唯獨不可敗給名為「我」的你》《戀愛腦之死》) must NEVER truncate at inner 「」!
+    b_multi = lw._extract_bracketed_titles("《CHILL CLUB》💙 晚安莉莉《唯獨不可敗給名為「我」的你》《戀愛腦之死》")
+    assert "唯獨不可敗給名為「我」的你" in b_multi and "戀愛腦之死" in b_multi, f"Nested quotes broken: {b_multi}"
+    print("[PASS] Generic zero-blacklist title decomposition + nested-quote multi-song parser")
 
 
 def test_word_bunching_deglitcher() -> None:
