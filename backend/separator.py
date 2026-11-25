@@ -272,6 +272,9 @@ class KaraokeSeparatorManager:
                 errors="replace",
                 creationflags=CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
             )
+            hq_proc_key = f"hq__{key}"
+            with self._lock:
+                self._active_procs[hq_proc_key] = proc
             try:
                 _, stderr_text = proc.communicate(timeout=360)
             except subprocess.TimeoutExpired:
@@ -281,6 +284,9 @@ class KaraokeSeparatorManager:
                     self._hq_upgrade_backoff[key] = time.time() + 21600
                 self.log.warning("HQUpgrade", f"Timed out upgrading {vid} ({mode}); will retry in 6h")
                 return False
+            finally:
+                with self._lock:
+                    self._active_procs.pop(hq_proc_key, None)
 
             if proc.returncode == 2:
                 # VRAM dipped before model load — skip cleanly without backoff
@@ -377,6 +383,7 @@ class KaraokeSeparatorManager:
                 self.start_lyrics_generation(
                     vid, mode, force_ai=True,
                     local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                    meta_hint=upgraded_meta,
                 )
                 pre_voc_hint = None
                 pre_inst_hint = None
@@ -638,6 +645,11 @@ class KaraokeSeparatorManager:
 
         sf = self._status_file(video_id, mode)
         with self._lock:
+            # Re-verify inside lock (prevents TOCTOU duplicate workers & queue overflow under concurrent requests!)
+            if key in self._queued_keys:
+                return self.get_status(video_id, mode)
+            if len(self._queued_keys) >= self.max_queue_size:
+                raise OverflowError(f"目前已有 {len(self._queued_keys)} 首歌曲排隊處理中，請等幾十秒再試。")
             self._queued_keys.add(key)
             q_pos = len(self._queued_keys)
             init_payload = {
@@ -1041,7 +1053,10 @@ class KaraokeSeparatorManager:
         # 1) Ultra-fast bounded LRU in-memory cache (~4KB/song, 0 MB local disk, <1ms response!)
         with self._lock:
             is_running = video_id in self._lyrics_in_progress
-            is_known_missing = video_id in self._lyrics_gdrive_missing
+            miss_ts = self._lyrics_gdrive_missing.get(video_id)
+            is_known_missing = (miss_ts is not None) and ((time.time() - miss_ts) < 300.0)
+            if miss_ts is not None and not is_known_missing:
+                self._lyrics_gdrive_missing.pop(video_id, None)
             if not is_running:
                 mem = self._lyrics_mem_cache.get(video_id)
                 if mem and mem.get("lines"):
@@ -1055,10 +1070,12 @@ class KaraokeSeparatorManager:
                 return json.loads(sf.read_text(encoding="utf-8"))
             except Exception:
                 pass
+        if is_running:
+            return {"video_id": video_id, "status": "running", "progress": 10, "stage_text": "對齊歌詞中...", "lines": []}
 
-        # 3) Check local temp lyrics file if present
+        # 3) Check local temp lyrics file if present (ONLY when not running so force_ai never serves stale disk lyrics!)
         lf = self._lyrics_file(video_id)
-        if lf.exists():
+        if not is_running and lf.exists():
             try:
                 data = json.loads(lf.read_text(encoding="utf-8"))
                 if data.get("lines"):
@@ -1115,6 +1132,10 @@ class KaraokeSeparatorManager:
             with self._lock:
                 self._lyrics_mem_cache.pop(video_id, None)
                 self._lyrics_gdrive_missing.pop(video_id, None)
+            try:
+                self._lyrics_file(video_id).unlink(missing_ok=True)
+            except Exception:
+                pass
 
         with self._lock:
             if video_id in self._lyrics_in_progress:

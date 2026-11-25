@@ -25,6 +25,16 @@ class KaraokePitchProcessor extends AudioWorkletProcessor {
     this.minDelay = 64;
     this.phase = 0;
     this.currentRatio = 1.0;
+    this.port.onmessage = (ev) => {
+      if (ev && ev.data && ev.data.type === "reset") {
+        this.bufL.fill(0);
+        this.bufR.fill(0);
+        this.writePos = 0;
+        this.phase = 0;
+        const semi = typeof ev.data.semitones === "number" ? ev.data.semitones : 0;
+        this.currentRatio = Math.pow(2, semi / 12);
+      }
+    };
   }
 
   _readHermite(buf, pos) {

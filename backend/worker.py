@@ -223,9 +223,36 @@ def main() -> int:
             yt_sub_url = ""
             _subs = info.get("subtitles") or {}
             if isinstance(_subs, dict) and _subs:
-                _pref = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko", "en"]
-                _chosen = next((l for l in _pref if l in _subs), next(iter(_subs.keys()), ""))
-                _fmts = _subs.get(_chosen) or []
+                import re as _re
+                _vlang = (info.get("language") or "").strip().lower()
+                _has_kana = bool(_re.search(r"[\u3040-\u30ff]", title))
+                _has_hangul = bool(_re.search(r"[\uac00-\ud7af]", title))
+                _has_cjk = bool(_re.search(r"[\u4e00-\u9fff]", title))
+                if _vlang.startswith("yue") or (_vlang.startswith("zh") and "hk" in _vlang):
+                    _pref = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh"]
+                elif _vlang.startswith("zh"):
+                    _pref = ["zh-Hant", "zh-TW", "zh-HK", "zh-Hans", "zh-CN", "zh", "yue"]
+                elif _vlang.startswith("ja") or _has_kana:
+                    _pref = ["ja", "ja-JP"]
+                elif _vlang.startswith("ko") or _has_hangul:
+                    _pref = ["ko", "ko-KR"]
+                elif _vlang.startswith("en") or (not _has_cjk and _re.search(r"[A-Za-z]{3,}", title)):
+                    _pref = ["en", "en-US", "en-GB"]
+                elif _has_cjk:
+                    _pref = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh"]
+                else:
+                    _pref = ["en", "yue-HK", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko"]
+                _keys = list(_subs.keys())
+                _chosen = ""
+                for _p in _pref:
+                    _pl = _p.lower()
+                    _hit = next((k for k in _keys if k.lower() == _pl), None) or next(
+                        (k for k in _keys if k.lower().startswith(_pl + "-") or k.lower().startswith(_pl + "_")), None
+                    )
+                    if _hit:
+                        _chosen = _hit
+                        break
+                _fmts = _subs.get(_chosen) or [] if _chosen else []
                 _j3 = next((f.get("url") for f in _fmts if f.get("ext") == "json3" and f.get("url")), "")
                 if _j3:
                     yt_sub_lang = _chosen

@@ -157,10 +157,14 @@ def test_worker_and_separator_invariants() -> None:
     assert "prev_gap >= 4.0" in lw_src, "Qwen3 windows must split at instrumental interludes (>=4s) to prevent stretched ghost lines!"
     assert "lrc_covers_audio" in lw_src, "LRC fast-path must verify full vocal coverage so single-song LRC never hijacks multi-song videos!"
     assert "async with Shazam() as shazam:" in lw_src, "Shazam probes must close aiohttp ClientSession via async context manager"
+    assert '"zh": "Chinese"' in lw_src and '"yue": "Cantonese"' in lw_src, "Qwen3 must map Mandarin zh -> Chinese and Cantonese yue -> Cantonese!"
     # Frontend structural invariants
     ct_src = (EXTENSION / "content.js").read_text(encoding="utf-8")
     assert "engine.getCurrentPosition()" in ct_src and "state.active && engine.isPlaying" in ct_src, "Lyrics clock must lock to WebAudio playback position!"
     assert "state.lyricsLines = [];" in ct_src, "Deactivating karaoke must clear cached lyricsLines so reopening fetches fresh server lyrics!"
+    assert "lyricsReqSeq" in ct_src, "requestLyrics must guard against out-of-order async responses!"
+    pw_src = (EXTENSION / "pitch-worklet.js").read_text(encoding="utf-8")
+    assert 'ev.data.type === "reset"' in pw_src, "pitch-worklet must support buffer reset on song switch/seek!"
     # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
     assert "OrderedDict" in gw_src and "_lyrics_ram_max" in gw_src, "Gateway lyrics cache must be bounded LRU"
@@ -446,6 +450,75 @@ def test_lrc_multi_timestamp_and_asr_splitting_and_invariants() -> None:
     print("[PASS] Multi-timestamp LRC, Whisper run-on splitting, reverb-bleed trim, zero-overlap & zero-WORD_OOB invariants")
 
 
+def test_multilingual_p0_and_p1_invariants() -> None:
+    import numpy as np
+    import lyrics_worker as lw
+
+    # 1) P0 #1: English/Japanese/Korean MVs with Chinese translation CC MUST pick native language (never zh-TW!)
+    assert lw._pick_youtube_subtitle_lang({"zh-TW": [], "en-US": []}, title="Taylor Swift - Blank Space (Official MV)") == "en-US"
+    assert lw._pick_youtube_subtitle_lang({"zh-HK": [], "ja-JP": []}, title="YOASOBI「アイドル」Official Music Video") == "ja-JP"
+    assert lw._pick_youtube_subtitle_lang({"zh-TW": [], "ko-KR": []}, title="NewJeans (뉴진스) 'Hype Boy' Official MV") == "ko-KR"
+    assert lw._pick_youtube_subtitle_lang({"ar": [], "es": []}, title="Taylor Swift - Style") is None  # never fall back to Arabic!
+
+    # 2) P0 #2: Japanese Kanji MUST NOT be corrupted by OpenCC s2hk, and language detection distinguishes ja/ko/yue/zh/en!
+    assert lw.to_hk_traditional("気持ちの発声") == "気持ちの発声", "OpenCC corrupted Japanese Kanji!"
+    assert lw.detect_lyrics_language(["君の気持ち", "Love you forever"]) == "ja"
+    assert lw.detect_lyrics_language(["사랑해 baby", "Don't stop now"]) == "ko"
+    assert lw.detect_lyrics_language(["我唔係喺度等你"]) == "yue"
+    assert lw.detect_lyrics_language(["故事的小黃花", "從出生那年就飄著"]) == "zh"
+
+    # 3) P0 #3: Bracketed titles (【晴天】), numeric titles (1874, 505), and 1-char CJK titles (張國榮 紅) MUST match!
+    assert lw._track_matches_title("晴天", "周杰倫", "周杰倫 Jay Chou【晴天】Official MV") >= 1.4
+    assert lw._track_matches_title("1874", "陳奕迅", "陳奕迅 Eason Chan - 1874") >= 1.4
+    assert lw._track_matches_title("505", "Arctic Monkeys", "Arctic Monkeys - 505 (Official Audio)") >= 1.4
+    assert lw._track_matches_title("紅", "張國榮", "張國榮 - 紅 (Official MV)") >= 1.4
+    assert lw._track_matches_title("el", "Random", "Adele - Hello") == 0.0, "Short Latin substring false match!"
+
+    # 4) P0 #5: Syllable estimator treats English lines by syllables (~12), not raw letters (~45)!
+    en_syl = lw.estimate_syllable_units("I don't wanna miss a thing, cause even when I dream of you")
+    assert 10.0 <= en_syl <= 18.0, f"Unexpected English syllable count: {en_syl}"
+
+    # 5) P1 #7: Digital silence (-120 dB) floored to -75 dB so threshold doesn't collapse to -60 dB!
+    dig_sil = np.concatenate([np.full(50, -120.0), np.full(100, -14.0)]).astype(np.float32)
+    assert lw._adaptive_vocal_threshold_db(dig_sil) > -50.0, "Digital silence dragged threshold too low!"
+
+    # 6) P1 #8: _map_comp_to_real(is_end=True) snaps gap timestamps backward (NEVER teleports across a 30s guitar solo!)
+    tmap = [(0.0, 10.0, 0.0, 10.0), (10.35, 20.35, 40.0, 50.0)]
+    assert lw._map_comp_to_real(10.10, tmap, is_end=True) == 10.0, "Line end teleported across 30s solo!"
+    assert lw._map_comp_to_real(10.10, tmap, is_end=False) == 40.0, "Line start failed to snap forward!"
+
+    # 7) P1 #9: _smooth_bunched_words rescues [hog, 0s, 0s, 0s] collapse AND stays strictly <= line_end on fast rap!
+    hog = [
+        {"word": "不", "start": 10.0, "end": 13.0},
+        {"word": "需", "start": 13.0, "end": 13.0},
+        {"word": "急", "start": 13.0, "end": 13.0},
+        {"word": "切", "start": 13.0, "end": 13.0},
+    ]
+    hog_out = lw._smooth_bunched_words(hog, 10.0, 13.0, np.array([]), 0.1)
+    assert hog_out[0]["end"] < 12.0 and hog_out[-1]["end"] <= 13.0, f"Hog collapse not redistributed: {hog_out}"
+
+    # 8) P1 #10: Mid-song live chorus repeat (>= 3 anchors between verse & outro) MUST be preserved!
+    pool = [f"L{i:02d}" for i in range(40)]
+    mid_rep = [
+        {"start": 10.0, "end": 12.0, "text": "L01", "sim": 0.8},
+        {"start": 12.1, "end": 14.0, "text": "L02", "sim": 0.8},
+        {"start": 14.1, "end": 16.0, "text": "L10", "sim": 0.8},
+        {"start": 16.1, "end": 18.0, "text": "L11", "sim": 0.8},
+        {"start": 18.1, "end": 20.0, "text": "L12", "sim": 0.8},
+        # Mid-song repeated chorus!
+        {"start": 22.0, "end": 24.0, "text": "L10", "sim": 0.85},
+        {"start": 24.1, "end": 26.0, "text": "L11", "sim": 0.85},
+        {"start": 26.1, "end": 28.0, "text": "L12", "sim": 0.85},
+        # Rest of song
+        {"start": 30.0, "end": 32.0, "text": "L20", "sim": 0.8},
+        {"start": 32.1, "end": 34.0, "text": "L21", "sim": 0.8},
+        {"start": 34.1, "end": 36.0, "text": "L22", "sim": 0.8},
+    ]
+    runs_mid = lw._select_monotonic_run_anchors(mid_rep, pool)
+    assert len(runs_mid) == 2, f"Mid-song live chorus repeat was dropped: {runs_mid}"
+    print("[PASS] Multilingual P0/P1 invariants (subs, Kanji, 【title】/1874/1-char, EN syllables, solo snap, hog CDF, mid-song repeat)")
+
+
 def test_sidecar_watcher_cp1252_safety() -> None:
     if not WATCHER.exists():
         print("[SKIP] watcher.py not installed")
@@ -487,6 +560,7 @@ def main() -> int:
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()
     test_lrc_multi_timestamp_and_asr_splitting_and_invariants()
+    test_multilingual_p0_and_p1_invariants()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()
     print("\nALL REGRESSION TESTS PASSED!")

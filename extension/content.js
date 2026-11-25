@@ -267,6 +267,14 @@
       setSemitones(val) {
         targetSemitones = val;
       },
+      reset(semi = 0) {
+        bufL.fill(0);
+        bufR.fill(0);
+        writePos = 0;
+        phase = 0;
+        targetSemitones = semi;
+        currentRatio = Math.pow(2, semi / 12);
+      },
     };
   }
 
@@ -329,6 +337,11 @@
               const p = workletNode.parameters.get("semitones");
               if (p) p.setValueAtTime(val, this.ctx.currentTime);
             },
+            reset: (semi = 0) => {
+              try {
+                workletNode.port.postMessage({ type: "reset", semitones: semi });
+              } catch (_e) {}
+            },
           };
         } catch (err) {
           console.warn("[YT AI KTV] AudioWorklet fallback engaged:", err);
@@ -350,9 +363,21 @@
       }
     }
 
+    _effectiveSemitones() {
+      // Automatically preserve musical pitch when user slows/speeds YouTube playbackRate (e.g. 0.75x practice)!
+      const rateComp = this.playbackRate && Math.abs(this.playbackRate - 1.0) > 0.005
+        ? -12.0 * Math.log2(this.playbackRate)
+        : 0.0;
+      return Math.max(-12, Math.min(12, this.semitones + rateComp));
+    }
+
     _updateRouting() {
       if (!this.ctx || !this.mixBus || !this.masterGain) return;
-      const needPitch = this.semitones !== 0 && !!this.pitchWrapper;
+      const effSemi = this._effectiveSemitones();
+      const needPitch = Math.abs(effSemi) > 0.01 && !!this.pitchWrapper;
+      if (this.pitchWrapper) {
+        this.pitchWrapper.setSemitones(effSemi);
+      }
       if (needPitch === this.pitchRouted) return;
 
       try {
@@ -365,6 +390,7 @@
       }
 
       if (needPitch) {
+        if (this.pitchWrapper.reset) this.pitchWrapper.reset(effSemi);
         this.mixBus.connect(this.pitchWrapper.node);
         this.pitchWrapper.node.connect(this.masterGain);
         this.pitchRouted = true;
@@ -407,6 +433,7 @@
     stopSources() {
       if (this.instSource) {
         try {
+          this.instSource.onended = null;
           this.instSource.stop();
           this.instSource.disconnect();
         } catch (_e) {}
@@ -414,10 +441,14 @@
       }
       if (this.vocSource) {
         try {
+          this.vocSource.onended = null;
           this.vocSource.stop();
           this.vocSource.disconnect();
         } catch (_e) {}
         this.vocSource = null;
+      }
+      if (this.pitchWrapper && this.pitchWrapper.reset) {
+        this.pitchWrapper.reset(this._effectiveSemitones());
       }
       this.isPlaying = false;
     }
@@ -434,7 +465,12 @@
 
       if (this.ctx.state === "suspended") {
         this.ctx.resume().catch(() => {});
+        // Do NOT mark isPlaying=true while AudioContext is still suspended (prevents 4x/sec restart leak!)
+        return;
       }
+
+      this.playbackRate = playbackRate;
+      this._updateRouting();
 
       const instSrc = this.ctx.createBufferSource();
       const vocSrc = this.ctx.createBufferSource();
@@ -447,6 +483,11 @@
       vocSrc.connect(this.vocGain);
 
       const now = this.ctx.currentTime + 0.01;
+      instSrc.onended = () => {
+        if (this.instSource === instSrc) {
+          this.isPlaying = false;
+        }
+      };
       instSrc.start(now, safeOffset);
       vocSrc.start(now, safeOffset);
 
@@ -454,7 +495,6 @@
       this.vocSource = vocSrc;
       this.startCtxTime = now;
       this.startOffset = safeOffset;
-      this.playbackRate = playbackRate;
       this.isPlaying = true;
     }
 
@@ -651,6 +691,10 @@
     if (!state.active) return;
     const video = getVideoElement();
     if (!video) return;
+    if (video !== state.attachedVideo) {
+      attachVideoSync();
+      return;
+    }
 
     if (isAdPlaying()) {
       if (engine.isPlaying) engine.stopSources();
@@ -1238,8 +1282,11 @@
     setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0);
   }
 
+  let lyricsReqSeq = 0;
+
   async function requestLyrics(forceAi = false) {
     if (!state.videoId) return;
+    const reqSeq = ++lyricsReqSeq;
     const targetVideoId = state.videoId;
     const targetMode = state.mode;
 
@@ -1263,7 +1310,7 @@
       mode: targetMode,
       force_ai: forceAi,
     });
-    if (state.videoId !== targetVideoId || !state.lyricsEnabled) return;
+    if (reqSeq !== lyricsReqSeq || state.videoId !== targetVideoId || !state.lyricsEnabled) return;
 
     if (!res.ok) {
       state.lyricsLoading = false;
@@ -1288,11 +1335,11 @@
     stopLyricsPolling();
     let inFlight = false;
     state.lyricsPollTimer = setInterval(async () => {
-      if (inFlight || !state.lyricsEnabled || state.videoId !== targetVideoId) return;
+      if (inFlight || reqSeq !== lyricsReqSeq || !state.lyricsEnabled || state.videoId !== targetVideoId) return;
       inFlight = true;
       try {
         const stRes = await apiRequest(`/api/lyrics/${targetVideoId}?mode=${targetMode}`);
-        if (state.videoId !== targetVideoId || !state.lyricsEnabled) return;
+        if (reqSeq !== lyricsReqSeq || state.videoId !== targetVideoId || !state.lyricsEnabled) return;
         if (!stRes.ok || !stRes.data) return;
         const d = stRes.data;
         if (d.status === "ready" && d.lines) {
@@ -1337,6 +1384,7 @@
       if (state.videoId === videoId) setStatus(msg, false, pct);
     });
     if (state.videoId !== videoId || state.mode !== mode) return;
+    if (engine.loadedKey !== `${videoId}_${mode}` || !engine.instBuffer || !engine.vocBuffer) return;
     state.active = true;
     state.busy = false;
     attachVideoSync();
@@ -1441,6 +1489,7 @@
       setStatus(job.stage_text || "正在處理中...", false, job.progress || 10);
       startPollingJob(targetVideoId, targetMode, true);
     } catch (err) {
+      if (state.videoId !== targetVideoId || state.mode !== targetMode) return;
       state.busy = false;
       setStatus(`啟動失敗：${err.message}`, true, 0);
       updateUI();

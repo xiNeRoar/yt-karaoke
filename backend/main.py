@@ -115,7 +115,7 @@ async def security_and_cors_middleware(request: Request, call_next):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Karaoke-Client"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Karaoke-Client, X-Karaoke-Token"
         resp.headers["Access-Control-Allow-Private-Network"] = "true"
 
     resp.headers["X-Content-Type-Options"] = "nosniff"

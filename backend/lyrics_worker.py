@@ -41,11 +41,11 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LIVE_KEYWORDS_RE = re.compile(
-    r"(live|concert|演唱會|演唱会|音樂會|音乐会|現場|现场|cover|翻唱|acoustic|unplugged|remix|plug\s*dj|medley|串燒|ktv|試聽|试听|短版|cut|clip|片段|mashup|組曲|组曲|合集|精選|精选|聯唱|联唱)",
+    r"(\blive\b|\bconcert\b|演唱會|演唱会|音樂會|音乐会|現場|现场|\bcover\b|翻唱|\bacoustic\b|\bunplugged\b|\bremix\b|plug\s*dj|\bmedley\b|串燒|\bktv\b|試聽|试听|短版|\bcut\b|\bclip\b|片段|\bmashup\b|組曲|组曲|合集|精選|精选|聯唱|联唱)",
     re.IGNORECASE,
 )
 MASHUP_KEYWORDS_RE = re.compile(
-    r"(mashup|medley|串燒|串烧|組曲|组曲|合集|合輯|精選|精选|聯唱|联唱|top\s*\d+|金曲|歌單|歌单|連播|连播|特輯|特辑|勁歌金曲|劲歌金曲)",
+    r"(\bmashup\b|\bmedley\b|串燒|串烧|組曲|组曲|合集|合輯|精選|精选|聯唱|联唱|\btop\s*\d+\b|歌單|歌单|連播|连播|特輯|特辑|勁歌金曲|劲歌金曲)",
     re.IGNORECASE,
 )
 HALLUCINATION_RE = re.compile(
@@ -115,8 +115,15 @@ def query_free_vram_mb() -> float:
         return 0.0
 
 
+def _is_non_chinese_cjk(text: str) -> bool:
+    """True when text contains Japanese Kana or Korean Hangul (must NEVER be passed through Chinese OpenCC!)."""
+    return bool(re.search(r"[\u3040-\u30ff\uac00-\ud7af]", text or ""))
+
+
 def to_hk_traditional(text: str) -> str:
-    if not text:
+    if not text or _is_non_chinese_cjk(text):
+        return text
+    if not re.search(r"[\u4e00-\u9fff]", text):
         return text
     try:
         from opencc import OpenCC
@@ -125,6 +132,29 @@ def to_hk_traditional(text: str) -> str:
         return to_hk_traditional._cc.convert(text)
     except Exception:
         return text
+
+
+def estimate_syllable_units(text: str) -> float:
+    """Language-agnostic sung syllable estimator (1.0/CJK or Hangul char, 0.7/Kana, vowel-cluster syllables for Latin).
+    Prevents raw character counts from breaking English/European/Japanese alignment & Qwen3 padding thresholds!
+    """
+    if not text:
+        return 1.0
+    cjk_ko = len(re.findall(r"[\u4e00-\u9fff\uac00-\ud7af]", text))
+    kana = len(re.findall(r"[\u3040-\u30ff]", text))
+    latin_words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ']+", text)
+    latin_syl = 0.0
+    for w in latin_words:
+        wl = re.sub(r"[^a-zà-öø-ÿ]", "", w.lower())
+        if not wl:
+            continue
+        groups = re.findall(r"[aeiouyà-öø-ÿ]+", wl)
+        s_cnt = max(1, len(groups))
+        if len(wl) > 3 and wl.endswith("e") and not wl.endswith("le") and s_cnt > 1:
+            s_cnt -= 1
+        latin_syl += float(s_cnt)
+    total = float(cjk_ko) + 0.7 * float(kana) + latin_syl
+    return max(1.0, total)
 
 
 def to_simplified(text: str) -> str:
@@ -153,7 +183,8 @@ def extract_lyrics_from_description(yt_desc: str) -> list[str]:
                 best_block = cur_block
             cur_block = []
             continue
-        if url_re.search(s) or CREDIT_LINE_RE.match(s) or len(s) > 46 or len(s) < 3:
+        max_line_len = 88 if not re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", s) else 46
+        if url_re.search(s) or CREDIT_LINE_RE.match(s) or len(s) > max_line_len or len(s) < 3:
             if len(cur_block) > len(best_block):
                 best_block = cur_block
             cur_block = []
@@ -171,9 +202,22 @@ def extract_lyrics_from_description(yt_desc: str) -> list[str]:
 
 
 def clean_search_title(title: str) -> str:
-    t = re.sub(r"[\[\(【（][^\]\)】）]*[\]\)】）]", " ", title)
-    t = re.sub(r"[_|\-/]+", " ", t)
-    t = re.sub(r"\b(official|mv|music video|lyrics|lyric video|hd|4k|hq|audio|\d+)\b", " ", t, flags=re.IGNORECASE)
+    """Normalize noise tokens while PRESERVING bracketed song titles (e.g. 【晴天】, [十年])
+    and numeric song titles (e.g. 1874, 505, 2002, 7 Years)!
+    """
+    # Strip explicit MV/audio/quality tags inside brackets, but keep actual song titles inside 【...】/[...]!
+    t = re.sub(
+        r"[\[\(【（]\s*(?:official\s*(?:music\s*video|lyric\s*video|video|mv|audio|visualizer)|"
+        r"music\s*video|lyric\s*video|lyrics?\s*mv|mv|hd|4k|hq|audio|live|full\s*ver\.?)\s*[\]\)】）]",
+        " ",
+        title,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"[\[\(【（\]\)】）_|\-/]+", " ", t)
+    t = re.sub(r"\b(official|mv|music video|lyrics|lyric video|hd|4k|hq|audio)\b", " ", t, flags=re.IGNORECASE)
+    # Only drop standalone 4-digit broadcast years (1950..2039) when other words exist — NEVER strip song numbers like 1874/505/2002!
+    t_no_yr = re.sub(r"(?<!\d)(?:19[5-9]\d|20[0-3]\d)(?!\d)", " ", t)
+    t = t_no_yr if len(re.sub(r"\s+", "", t_no_yr)) >= 2 else t
     t = re.sub(r"\s+", " ", t).strip()
     return t or title
 
@@ -216,21 +260,23 @@ def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
 
 def parse_lrc(lrc_text: str) -> list[dict]:
     lines = []
-    ts_re = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
+    ts_re = re.compile(r"\[(\d+):(\d+(?:[.:]\d+)?)\]")
+    inline_ts_re = re.compile(r"<\d+:\d+(?:[.:]\d+)?>")
+    raw_all = ts_re.sub("", lrc_text or "")
+    is_non_zh = _is_non_chinese_cjk(raw_all)
     for raw in lrc_text.splitlines():
         s_raw = raw.strip()
         timestamps = ts_re.findall(s_raw)
         if not timestamps:
             continue
-        # Strip ALL [mm:ss.xx] tags so multi-timestamp chorus lines ([00:52.1][02:05.3]Lyrics)
-        # expand cleanly into every sung occurrence with zero leftover bracket tags!
-        text = ts_re.sub("", s_raw).strip()
-        if not text or CREDIT_LINE_RE.match(text):
+        # Strip ALL [mm:ss.xx] tags and enhanced-LRC <mm:ss.xx> tags so multi-timestamp chorus lines expand cleanly!
+        text = inline_ts_re.sub("", ts_re.sub("", s_raw)).strip()
+        if not text or CREDIT_LINE_RE.match(text) or text in ("純音樂，請欣賞", "纯音乐，请欣赏", "♪", "♫", "~"):
             continue
-        hk_text = to_hk_traditional(text)
+        clean_text = text if is_non_zh else to_hk_traditional(text)
         for mins_s, secs_s in timestamps:
-            t_sec = round(int(mins_s) * 60 + float(secs_s), 2)
-            lines.append({"start": t_sec, "end": 0.0, "text": hk_text, "words": []})
+            t_sec = round(int(mins_s) * 60 + float(secs_s.replace(":", ".")), 2)
+            lines.append({"start": t_sec, "end": 0.0, "text": clean_text, "words": []})
 
     lines.sort(key=lambda x: x["start"])
     for i, item in enumerate(lines):
@@ -243,12 +289,13 @@ def parse_lrc(lrc_text: str) -> list[dict]:
 
 def _adaptive_vocal_threshold_db(db_profile: np.ndarray, margin_db: float = 0.0) -> float:
     """Compute a mathematically bounded, scale-invariant vocal activity threshold strictly inside (p15, p90).
-    Handles compressed live stems (dr ~ 9 dB), clean studio stems (dr ~ 50 dB), and high-DR rock+ballad tracks!
+    Floors digital silence (-120 dB) to -75 dB so studio digital-zero intros never drag threshold down to -60 dB!
     """
     if len(db_profile) < 10:
         return -40.0 + margin_db
-    p15 = float(np.percentile(db_profile, 15))
-    p90 = float(np.percentile(db_profile, 90))
+    clipped = np.maximum(db_profile, -75.0)
+    p15 = float(np.percentile(clipped, 15))
+    p90 = float(np.percentile(clipped, 90))
     dr = max(0.0, p90 - p15)
     base = max(p15 + 0.30 * dr, p90 - 30.0)
     base = min(base, p15 + 0.55 * dr)
@@ -294,44 +341,55 @@ def segment_has_vocal_energy(db_profile: np.ndarray, step_sec: float, start_s: f
 
 def _track_matches_title(track_name: str, artist_name: str, yt_title_clean: str) -> float:
     """Score how well a lyrics DB candidate (track_name, artist_name) matches the YouTube video title.
-    Returns 0.0 if track_name does NOT actually appear in yt_title_clean (prevents artist-only wrong-song hits
-    like returning '張敬軒 - 斷點' when searching '張敬軒 - 春秋'!).
+    Preserves 1-char CJK titles (when artist also matches), numeric titles (1874/505/2002),
+    word-boundary Latin titles (prevents 'el' matching 'adelehello'), and Kana/Hangul scripts!
     """
-    # Unify HK/TW/CN variant glyphs (著/着, 裡/裏, 說/説, 臺/台) via OpenCC Simplified for comparison ONLY
+    t_base = re.sub(r"[\(\[（【].*?[\)\]）】]", "", track_name or "").strip() or (track_name or "")
     t_norm = re.sub(r"[\s\W_]+", "", to_simplified(track_name or "")).lower()
-    t_base = re.sub(r"[\(\[（【].*?[\)\]）】]", "", track_name or "")
     t_base_norm = re.sub(r"[\s\W_]+", "", to_simplified(t_base)).lower()
     y_norm = re.sub(r"[\s\W_]+", "", to_simplified(yt_title_clean or "")).lower()
+    a_norm = re.sub(r"[\s\W_]+", "", to_simplified(artist_name or "")).lower()
+    artist_matched = bool(a_norm and len(a_norm) >= 2 and a_norm in y_norm)
 
     if not t_base_norm or not y_norm:
         return 0.0
 
-    # Must actually match the song's track name (not a 1-char substring of an artist name!)
+    is_pure_latin_num = bool(re.fullmatch(r"[a-z0-9]+", t_base_norm))
+    y_words_lower = re.sub(r"[^\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", " ", to_simplified(yt_title_clean or "")).lower()
+    t_base_words = re.sub(r"[^\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", " ", to_simplified(t_base)).lower().strip()
+
     score = 0.0
     if t_base_norm == y_norm:
         score = 2.0
+    elif len(t_base_norm) == 1:
+        # Allow famous 1-char CJK song titles (e.g. 張國榮-紅, 追, 默, 恋) ONLY when artist matches AND token is isolated!
+        if artist_matched and re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", t_base_norm):
+            if re.search(rf"(?:^|[\s《》「」『』【】\[\]()（）\-—–/|｜]){re.escape(t_base_norm)}(?:$|[\s《》「」『』【】\[\]()（）\-—–/|｜])", to_simplified(yt_title_clean or "")):
+                score = 1.15
+    elif is_pure_latin_num and len(t_base_norm) <= 6:
+        # Short Latin/numeric titles (505, 1874, 22, Hello, One) MUST match on word boundaries (not 'el' in 'adelehello'!)
+        if t_base_words and re.search(rf"(?<![a-z0-9]){re.escape(t_base_words)}(?![a-z0-9])", y_words_lower):
+            score = 1.0 + min(0.8, len(t_base_norm) * 0.12)
     elif len(t_base_norm) >= 2 and t_base_norm in y_norm:
-        # Strong exact track-name containment; longer track names score clearly higher
         score = 1.0 + min(0.8, len(t_base_norm) * 0.12)
     else:
-        # Fuzzy fallback for minor spelling differences (Traditional/Simplified/punctuation)
-        cjk_t = set(re.findall(r"[\u4e00-\u9fff]", t_base_norm))
-        cjk_y = set(re.findall(r"[\u4e00-\u9fff]", y_norm))
+        # Script-aware fuzzy overlap (Hanzi + Kana + Hangul) or per-segment Latin similarity
+        cjk_t = set(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", t_base_norm))
+        cjk_y = set(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", y_norm))
         if len(cjk_t) >= 2:
             overlap = len(cjk_t & cjk_y) / len(cjk_t)
             if overlap >= 0.75:
                 score = overlap
-        elif len(t_base_norm) >= 2:
-            sim = SequenceMatcher(None, t_base_norm, y_norm).ratio()
-            if sim >= 0.65:
-                score = sim
+        elif len(t_base_norm) >= 3:
+            segs = [re.sub(r"[\s\W_]+", "", s).lower() for s in re.split(r"[｜|—–/《》「」『』【】\[\]()（）]+|\s+-\s+", yt_title_clean or "") if s.strip()]
+            best_sim = max((SequenceMatcher(None, t_base_norm, sg).ratio() for sg in (segs + [y_norm]) if sg), default=0.0)
+            if best_sim >= 0.72:
+                score = best_sim
 
     if score <= 0.0:
         return 0.0
 
-    # Bonus if artist name also appears in the YouTube title (disambiguates same-title songs)
-    a_norm = re.sub(r"[\s\W_]+", "", to_simplified(artist_name or "")).lower()
-    if a_norm and len(a_norm) >= 2 and a_norm in y_norm:
+    if artist_matched:
         score += 0.4
     elif t_norm == t_base_norm:
         score += 0.05
@@ -408,11 +466,13 @@ def fetch_official_lyrics(
     are queried concurrently (~0.8-1.5s total) and strictly scored against the full title + metadata.
     """
     cleaned = clean_search_title(title)
-    match_context = " ".join(x for x in (cleaned, yt_track, yt_artist, yt_channel) if x).strip()
+    # Include RAW title in match_context so bracketed (【晴天】) and numeric (1874/505) song titles are NEVER lost!
+    match_context = " ".join(x for x in (title, cleaned, yt_track, yt_artist, yt_channel) if x).strip()
     queries = _extract_query_candidates(title, track=yt_track, artist=yt_artist, channel=yt_channel)
 
     is_live_or_alt = bool(LIVE_KEYWORDS_RE.search(title)) or bool(LIVE_KEYWORDS_RE.search(yt_desc[:200]))
     best_synced = None
+    best_synced_score = 0.0
     best_lines: list[str] = []
     best_source = ""
     best_score = 0.0
@@ -455,13 +515,18 @@ def fetch_official_lyrics(
             best_score = match_sc
             best_lines = cand_lines
             best_source = f"LRCLIB ({tr_name})"
+            # Clear any lower-scoring synced LRC from a different song so it can NEVER hijack the fast path!
+            if best_synced_score < best_score:
+                best_synced = None
+                best_synced_score = 0.0
 
         if not is_live_or_alt and sl and duration > 0 and match_sc >= best_score:
             it_dur = float(it.get("duration") or 0)
-            if abs(it_dur - duration) <= 2.0:
+            if abs(it_dur - duration) <= 2.5:
                 parsed = parse_lrc(sl)
                 if len(parsed) >= 6:
                     best_synced = parsed
+                    best_synced_score = match_sc
                     best_source = "LRCLIB"
                     best_score = match_sc
 
@@ -513,8 +578,14 @@ def fetch_official_lyrics(
                     best_score = sc
                     best_lines = clean_lyric_lines([x["text"] for x in parsed])
                     best_source = f"NetEase ({s.get('name') or ''})"
-                    if not best_synced and not is_live_or_alt:
+                    ne_dur = float(s.get("duration") or 0.0) / 1000.0
+                    dur_ok = (duration > 0.0 and ne_dur > 0.0 and abs(ne_dur - duration) <= 2.5)
+                    if not is_live_or_alt and dur_ok:
                         best_synced = parsed
+                        best_synced_score = sc
+                    elif best_synced_score < best_score:
+                        best_synced = None
+                        best_synced_score = 0.0
                     break
             except Exception:
                 continue
@@ -857,6 +928,54 @@ def _get_yt_cookie_opts() -> dict:
     return {}
 
 
+def _pick_youtube_subtitle_lang(subs: dict, title: str = "", video_lang: str = "") -> Optional[str]:
+    """Select the YouTube human subtitle track that actually matches the SONG'S language (exact or BCP-47 prefix).
+    Never forces Chinese fan translations onto English/Japanese/Korean MVs and never falls back to arbitrary languages!
+    """
+    if not isinstance(subs, dict) or not subs:
+        return None
+    keys = list(subs.keys())
+
+    def _find_prefix(prefixes: list[str]) -> Optional[str]:
+        for pref in prefixes:
+            pl = pref.lower()
+            # Exact match first
+            for k in keys:
+                if k.lower() == pl:
+                    return k
+            # BCP-47 prefix match (e.g. en -> en-US / en-GB, ja -> ja-JP, zh -> zh-Hant)
+            for k in keys:
+                kl = k.lower()
+                if kl.startswith(pl + "-") or kl.startswith(pl + "_"):
+                    return k
+        return None
+
+    v_low = (video_lang or "").strip().lower()
+    t = title or ""
+    has_kana = bool(re.search(r"[\u3040-\u30ff]", t))
+    has_hangul = bool(re.search(r"[\uac00-\ud7af]", t))
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", t))
+
+    if v_low.startswith("yue") or (v_low.startswith("zh") and ("hk" in v_low)):
+        prefs = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh"]
+    elif v_low.startswith("zh"):
+        prefs = ["zh-Hant", "zh-TW", "zh-HK", "zh-Hans", "zh-CN", "zh", "yue"]
+    elif v_low.startswith("ja") or has_kana:
+        prefs = ["ja", "ja-JP"]
+    elif v_low.startswith("ko") or has_hangul:
+        prefs = ["ko", "ko-KR"]
+    elif v_low.startswith("en") or (not has_cjk and re.search(r"[A-Za-z]{3,}", t)):
+        prefs = ["en", "en-US", "en-GB"]
+    elif v_low and len(v_low) >= 2:
+        prefs = [v_low.split("-")[0]]
+    elif has_cjk:
+        prefs = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh"]
+    else:
+        prefs = ["en", "yue-HK", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko"]
+
+    return _find_prefix(prefs)
+
+
 def _download_json3_subtitles(json3_url: str, chosen_lang: str) -> Optional[list[dict]]:
     if not json3_url:
         return None
@@ -866,17 +985,28 @@ def _download_json3_subtitles(json3_url: str, chosen_lang: str) -> Optional[list
             return None
         data = r.json()
         lines = []
+        is_cjk = (chosen_lang or "").lower().startswith(("zh", "yue"))
+        non_lyric_cue_re = re.compile(r"^[\[\(（【][^\]\)）】]{1,32}[\]\)）】]$")
         for ev in data.get("events") or []:
             segs = ev.get("segs")
             if not segs:
                 continue
-            text = re.sub(r"\s+", " ", "".join(s.get("utf8", "") for s in segs).replace("\n", " ")).strip()
-            if not text or text in ("♪", "♫", "[音樂]", "[Music]", "（音樂）"):
+            raw_joined = "".join(s.get("utf8", "") for s in segs).strip()
+            if not raw_joined:
+                continue
+            # If bilingual 2-line CC ("I love you\n我愛你"), keep only the line matching chosen_lang script!
+            sub_lines = [ln.strip() for ln in raw_joined.splitlines() if ln.strip()]
+            if len(sub_lines) == 2:
+                has_c0 = bool(re.search(r"[\u4e00-\u9fff]", sub_lines[0]))
+                has_c1 = bool(re.search(r"[\u4e00-\u9fff]", sub_lines[1]))
+                if has_c0 != has_c1:
+                    raw_joined = (sub_lines[0] if has_c0 else sub_lines[1]) if is_cjk else (sub_lines[1] if has_c0 else sub_lines[0])
+            text = re.sub(r"\s+", " ", raw_joined.replace("\n", " ")).strip()
+            if not text or text in ("♪", "♫", "[音樂]", "[Music]", "（音樂）") or non_lyric_cue_re.match(text) or CREDIT_LINE_RE.match(text):
                 continue
             start_s = round((ev.get("tStartMs") or 0) / 1000.0, 2)
             dur_s = (ev.get("dDurationMs") or 4000) / 1000.0
             end_s = round(start_s + max(0.5, dur_s), 2)
-            is_cjk = (chosen_lang or "").startswith(("zh", "yue"))
             lines.append({
                 "start": start_s,
                 "end": end_s,
@@ -909,12 +1039,12 @@ def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], 
     yt_track = (info.get("track") or "").strip()
     yt_artist = (info.get("artist") or info.get("creator") or "").strip()
     yt_channel = (info.get("channel") or info.get("uploader") or "").strip()
+    video_lang = (info.get("language") or "").strip()
     subs = info.get("subtitles") or {}
     if not subs:
         return None, "", title, duration, desc, yt_track, yt_artist, yt_channel
 
-    preferred_langs = ["yue-HK", "yue", "zh-HK", "zh-Hant", "zh-TW", "zh", "ja", "ko", "en"]
-    chosen_lang = next((l for l in preferred_langs if l in subs), next(iter(subs.keys()), None))
+    chosen_lang = _pick_youtube_subtitle_lang(subs, title=title, video_lang=video_lang)
     if not chosen_lang:
         return None, "", title, duration, desc, yt_track, yt_artist, yt_channel
 
@@ -927,19 +1057,30 @@ def fetch_youtube_human_subtitles(video_id: str) -> tuple[Optional[list[dict]], 
     return lines, chosen_lang, title, duration, desc, yt_track, yt_artist, yt_channel
 
 
-def detect_lyrics_language(lines: list[str]) -> str:
-    joined = "".join(lines)
+CANTONESE_MARKERS_RE = re.compile(r"[嘅唔係喺咗啲冇佢咁哋睇諗嗰乜嘢嚟㗎咩喺呢]")
+
+
+def detect_lyrics_language(lines: list[str], sub_lang: str = "") -> str:
+    """Detect lyrics language over non-whitespace/non-punctuation script ratios (correctly handles mixed K-pop/J-pop/EN
+    and distinguishes Cantonese 'yue' from Mandarin 'zh' when markers or subtitle metadata exist).
+    """
+    joined = re.sub(r"[\s\W_]+", "", "".join(lines or ""))
     if not joined:
         return "zh"
     cjk = len(re.findall(r"[\u4e00-\u9fff]", joined))
     jp = len(re.findall(r"[\u3040-\u30ff]", joined))
     ko = len(re.findall(r"[\uac00-\ud7af]", joined))
     total = max(1, len(joined))
-    if jp / total > 0.15:
+    if jp / total >= 0.03:
         return "ja"
-    if ko / total > 0.15:
+    if ko / total >= 0.05:
         return "ko"
-    if cjk / total > 0.2:
+    if cjk / total >= 0.22:
+        sl = (sub_lang or "").lower()
+        if sl.startswith("yue") or "hk" in sl:
+            return "yue"
+        if len(CANTONESE_MARKERS_RE.findall(joined)) >= 2:
+            return "yue"
         return "zh"
     return "en"
 
@@ -1000,7 +1141,10 @@ def build_silence_collapsed_audio(
                 islands.append((s_idx * step_s, i * step_s))
             in_isl = False
     if in_isl:
-        islands.append((s_idx * step_s, len(padded) * step_s))
+        if islands and (s_idx * step_s - islands[-1][1]) < min_silence_sec:
+            islands[-1] = (islands[-1][0], len(padded) * step_s)
+        else:
+            islands.append((s_idx * step_s, len(padded) * step_s))
 
     if not islands:
         dur = n_total / sr
@@ -1030,12 +1174,27 @@ def build_silence_collapsed_audio(
     return np.concatenate(chunks), mapping
 
 
-def _map_comp_to_real(t_comp: float, mapping: list[tuple[float, float, float, float]]) -> float:
-    for cs, ce, rs, re_ in mapping:
+def _map_comp_to_real(
+    t_comp: float,
+    mapping: list[tuple[float, float, float, float]],
+    is_end: bool = False,
+) -> float:
+    """Map compressed timestamp back to real audio time WITHOUT teleporting line ends across collapsed solos!
+    When t_comp lands inside the 0.35s synthetic gap between island k and island k+1, snap `is_end=True`
+    backward to island k's real end (`re_k`) and `is_end=False` forward to island k+1's real start (`rs_{k+1}`).
+    """
+    if not mapping:
+        return t_comp
+    for idx, (cs, ce, rs, re_) in enumerate(mapping):
+        if t_comp < cs - 1e-4:
+            # t_comp sits in the synthetic silence gap between mapping[idx-1] and mapping[idx]
+            if idx > 0 and is_end:
+                return mapping[idx - 1][3]
+            return rs
         if t_comp <= ce + 1e-4:
             frac = max(0.0, min(1.0, (t_comp - cs) / max(1e-6, ce - cs)))
             return rs + frac * (re_ - rs)
-    return mapping[-1][3] if mapping else t_comp
+    return mapping[-1][3]
 
 
 def _distribute_by_vocal_energy_cdf(
@@ -1125,30 +1284,50 @@ def _smooth_bunched_words(
         w["end"] = round(e_i, 2)
         prev_e = e_i
 
+    # Also detect post-clamp zero-duration tokens (e.g. when onset/tail snap squeezed boundary tokens to 0.00s)
+    is_collapsed = [
+        raw_collapsed[idx] or ((float(ws[idx]["end"]) - float(ws[idx]["start"])) <= 0.021)
+        for idx in range(n)
+    ]
+
     # Pass 2: Redistribute contiguous collapsed runs across their true bounded acoustic span via Energy CDF
+    # Also rescue classic [hog, 0s, 0s, 0s] / [0s, 0s, 0s, hog] Whisper collapse where an adjacent token swallowed the span!
     i = 0
     while i < n:
-        if raw_collapsed[i]:
+        if is_collapsed[i]:
             j = i + 1
-            while j < n and raw_collapsed[j]:
+            while j < n and is_collapsed[j]:
                 j += 1
-            span_s = ws[i - 1]["end"] if i > 0 else line_start
-            span_e = ws[j]["start"] if j < n else line_end
+            run_s, run_e = i, j
+            span_s = ws[run_s - 1]["end"] if run_s > 0 else line_start
+            span_e = ws[run_e]["start"] if run_e < n else line_end
+            if span_e <= span_s + 0.05:
+                # Expand to include adjacent duration-hogging token so Energy CDF redistributes the full acoustic span
+                left_dur = (ws[run_s - 1]["end"] - ws[run_s - 1]["start"]) if run_s > 0 else 0.0
+                right_dur = (ws[run_e]["end"] - ws[run_e]["start"]) if run_e < n else 0.0
+                if left_dur >= right_dur and left_dur > 0.35 and run_s > 0:
+                    run_s -= 1
+                    span_s = ws[run_s - 1]["end"] if run_s > 0 else line_start
+                elif right_dur > 0.35 and run_e < n:
+                    run_e += 1
+                    span_e = ws[run_e]["start"] if run_e < n else line_end
             if span_e > span_s + 0.05:
-                _distribute_by_vocal_energy_cdf(ws[i:j], span_s, span_e, db_profile, step_sec)
-            i = j
+                _distribute_by_vocal_energy_cdf(ws[run_s:run_e], span_s, span_e, db_profile, step_sec)
+            i = max(j, run_e)
         else:
             i += 1
 
-    # Pass 3: Enforce strict monotonic continuity
+    # Pass 3: Enforce strict monotonic continuity strictly INSIDE [line_start, line_end] (never overflow on fast rap!)
+    min_step = min(0.04, max(0.01, (line_end - line_start) / max(1, n)))
     prev_e = line_start
     for idx, w in enumerate(ws):
-        w_s = max(prev_e, float(w["start"]))
-        w_e = max(w_s + 0.04, min(line_end, float(w["end"])))
+        remaining_min = min_step * (n - 1 - idx)
+        w_s = max(prev_e, min(line_end - remaining_min, float(w["start"])))
+        w_e = max(w_s + min_step, min(line_end - remaining_min, float(w["end"])))
         if idx == n - 1:
-            w_e = max(w_s + 0.04, line_end)
+            w_e = max(w_s, line_end)
         w["start"] = round(w_s, 2)
-        w["end"] = round(w_e, 2)
+        w["end"] = round(min(line_end, w_e), 2)
         prev_e = w["end"]
     return ws
 
@@ -1430,18 +1609,23 @@ def _select_monotonic_run_anchors(run_items: list[dict], pool_lines: list[str]) 
         [{**run_items[ii], "_idx": pos} for ii, pos in primary_chain]
     ]
 
-    # Preserve genuine live encore / repeated-chorus blocks (>= 3 monotonically advancing unused anchors)
-    # occurring strictly before or after the primary backbone, while rejecting isolated 1-2 line outliers!
-    first_primary_i = primary_chain[0][0]
-    last_primary_i = primary_chain[-1][0]
-    for side_idxs in (
-        [i for i in all_idxs if i < first_primary_i and i not in used_items],
-        [i for i in all_idxs if i > last_primary_i and i not in used_items],
-    ):
-        if len(side_idxs) >= 3:
-            encore_chain = _dp_longest_monotonic(side_idxs)
-            if len(encore_chain) >= 3:
-                sub_runs.append([{**run_items[ii], "_idx": pos} for ii, pos in encore_chain])
+    # Iteratively preserve ALL genuine live encore / mid-song repeated-chorus blocks (>= 3 monotonically advancing
+    # unused anchors in any contiguous temporal span — before, between, OR after the primary backbone!)
+    # while rejecting isolated 1-2 line out-of-order ASR outliers!
+    unused = [i for i in all_idxs if i not in used_items]
+    if len(unused) >= 3:
+        # Partition unused indices into contiguous temporal gaps separated by used_items
+        gap_groups: list[list[int]] = []
+        for ui in unused:
+            if not gap_groups or (ui - gap_groups[-1][-1]) > 2:
+                gap_groups.append([ui])
+            else:
+                gap_groups[-1].append(ui)
+        for grp in gap_groups:
+            if len(grp) >= 3:
+                repeat_chain = _dp_longest_monotonic(grp)
+                if len(repeat_chain) >= 3:
+                    sub_runs.append([{**run_items[ii], "_idx": pos} for ii, pos in repeat_chain])
 
     sub_runs.sort(key=lambda r: float(r[0]["start"]))
     return sub_runs
@@ -1468,13 +1652,13 @@ def _alignment_needs_live_rematch(
     prev_start = -1.0
     for seg in segs:
         txt = (seg.text or "").strip()
-        n_chars = max(1, len(_norm_lyrics_cmp(txt)))
-        rs = _map_comp_to_real(float(seg.start), time_map) if time_map else float(seg.start)
-        re_ = _map_comp_to_real(float(seg.end), time_map) if time_map else float(seg.end)
+        n_syl = estimate_syllable_units(txt)
+        rs = _map_comp_to_real(float(seg.start), time_map, is_end=False) if time_map else float(seg.start)
+        re_ = _map_comp_to_real(float(seg.end), time_map, is_end=True) if time_map else float(seg.end)
         dur = re_ - rs
-        if dur < max(0.45, 0.09 * n_chars) or (prev_start >= 0 and (rs - prev_start) < 0.25):
+        if dur < max(0.45, 0.09 * n_syl) or (prev_start >= 0 and (rs - prev_start) < 0.25):
             crushed += 1
-        if n_chars >= 4 and dur < 0.55:
+        if n_syl >= 4.0 and dur < 0.55:
             tight_run += 1
             max_tight_run = max(max_tight_run, tight_run)
         else:
@@ -1493,8 +1677,8 @@ def _alignment_needs_live_rematch(
 
     # Check BOTH uncovered head AND uncovered tail against REAL vocal energy (mapped back from compressed time!)
     if len(db_profile) > 0 and audio_dur > 0:
-        real_first = _map_comp_to_real(float(segs[0].start), time_map) if time_map else float(segs[0].start)
-        real_last = _map_comp_to_real(float(segs[-1].end), time_map) if time_map else float(segs[-1].end)
+        real_first = _map_comp_to_real(float(segs[0].start), time_map, is_end=False) if time_map else float(segs[0].start)
+        real_last = _map_comp_to_real(float(segs[-1].end), time_map, is_end=True) if time_map else float(segs[-1].end)
         cov_thr = _adaptive_vocal_threshold_db(db_profile, margin_db=2.0)
 
         tail_idx = int((real_last + 4.0) / step_sec)
@@ -1639,17 +1823,29 @@ def _live_section_anchored_align(
     comp_time_map: list[tuple[float, float, float, float]] = []
 
     # Fast GPU BatchedInferencePipeline (~2-4s for a 4-min concert on RTX 5060 Ti!)
+    # Run on silence-collapsed audio with vad_filter=False & word_timestamps=True so falsetto/reverberant singing
+    # is NEVER dropped by speech-trained Silero VAD, and multi-song mashups auto-detect mixed languages!
+    is_multi_pool_in = bool(initial_song_pools and len(initial_song_pools) >= 2)
+    transcribe_lang = None if is_multi_pool_in else ("zh" if lang == "yue" else lang)
+    if len(audio_16k) > 0 and len(db_profile) > 0:
+        comp_audio, comp_time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
+        if len(comp_audio) == 0 or not comp_time_map:
+            comp_audio, comp_time_map = audio_input, []
+    else:
+        comp_audio, comp_time_map = audio_input, []
+
     if use_cuda and len(audio_16k) > 0:
         try:
             from faster_whisper import BatchedInferencePipeline, WhisperModel
             if isinstance(model, WhisperModel):
                 batched = BatchedInferencePipeline(model=model)
                 b_segs, _ = batched.transcribe(
-                    audio_16k,
-                    language=lang,
+                    comp_audio,
+                    language=transcribe_lang,
                     batch_size=8,
                     beam_size=2,
-                    vad_filter=True,
+                    vad_filter=False,
+                    word_timestamps=True,
                     condition_on_previous_text=False,
                 )
                 raw_segments = list(b_segs)
@@ -1658,16 +1854,9 @@ def _live_section_anchored_align(
             raw_segments = []
 
     if not raw_segments:
-        transcribe_input = audio_input
-        if len(audio_16k) > 0 and len(db_profile) > 0:
-            comp_audio, comp_time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
-            if len(comp_audio) > 0 and comp_time_map:
-                transcribe_input = comp_audio
-            else:
-                comp_time_map = []
         res = model.transcribe(
-            transcribe_input,
-            language=lang,
+            comp_audio,
+            language=transcribe_lang,
             beam_size=2,
             vad=False,
             suppress_silence=False,
@@ -1681,18 +1870,18 @@ def _live_section_anchored_align(
     for s in raw_segments:
         raw_t = (s.text or "").strip()
         s_raw, e_raw = float(s.start), float(s.end)
-        s_real = _map_comp_to_real(s_raw, comp_time_map) if comp_time_map else s_raw
-        e_real = _map_comp_to_real(e_raw, comp_time_map) if comp_time_map else e_raw
+        s_real = _map_comp_to_real(s_raw, comp_time_map, is_end=False) if comp_time_map else s_raw
+        e_real = _map_comp_to_real(e_raw, comp_time_map, is_end=True) if comp_time_map else e_raw
         e_real = max(s_real + 0.05, e_real)
         words_mapped = []
         for w in (getattr(s, "words", None) or []):
             ws_r, we_r = float(w.start), float(w.end)
-            ws_real = _map_comp_to_real(ws_r, comp_time_map) if comp_time_map else ws_r
-            we_real = _map_comp_to_real(we_r, comp_time_map) if comp_time_map else we_r
+            ws_real = _map_comp_to_real(ws_r, comp_time_map, is_end=False) if comp_time_map else ws_r
+            we_real = _map_comp_to_real(we_r, comp_time_map, is_end=True) if comp_time_map else we_r
             words_mapped.append({"word": getattr(w, "word", "") or "", "start": ws_real, "end": max(ws_real, we_real)})
         norm_segments.append({"start": s_real, "end": e_real, "text": raw_t, "words": words_mapped})
 
-        txt = to_hk_traditional(raw_t) if lang == "zh" else raw_t
+        txt = to_hk_traditional(raw_t) if lang in ("zh", "yue") else raw_t
         if not txt or HALLUCINATION_RE.search(txt) or GARBAGE_CHARS_RE.search(txt):
             continue
         if not segment_has_vocal_energy(db_profile, step_sec, s_real, e_real):
@@ -1773,7 +1962,10 @@ def _live_section_anchored_align(
                 off_pools = line_to_pools.get(off, set())
                 if off_pools and cur_pool not in off_pools:
                     cur_pool = min(off_pools)
-                if m_out and m_out[-1]["text"] == off and (ts - m_out[-1]["end"]) < 7.5:
+                # Preserve legitimate back-to-back identical lines (e.g. "Let it go" / "Let it go") when
+                # the official lyrics genuinely repeat that line consecutively!
+                is_true_repeat = off in n_map.get(off, set())
+                if m_out and m_out[-1]["text"] == off and (ts - m_out[-1]["end"]) < 7.5 and not is_true_repeat:
                     # Extend the existing line's end timestamp instead of discarding its second half!
                     m_out[-1]["end"] = max(m_out[-1]["end"], te)
                 else:
@@ -2137,16 +2329,16 @@ def _live_section_anchored_align(
 
         if len(al_segs) == len(blk):
             for seg, ref in zip(al_segs, blk):
-                seg_s = _map_comp_to_real(float(seg.start), blk_time_map) if blk_time_map else float(seg.start)
-                seg_e = _map_comp_to_real(float(seg.end), blk_time_map) if blk_time_map else float(seg.end)
+                seg_s = _map_comp_to_real(float(seg.start), blk_time_map, is_end=False) if blk_time_map else float(seg.start)
+                seg_e = _map_comp_to_real(float(seg.end), blk_time_map, is_end=True) if blk_time_map else float(seg.end)
                 raw_s = b_start + seg_s
                 raw_e = b_start + seg_e
                 raw_dur = raw_e - raw_s
-                n_chars = max(1, len(_norm_lyrics_cmp(ref["text"])))
+                n_syl = estimate_syllable_units(ref["text"])
                 is_real_anchor = float(ref.get("sim") or 0.0) > 0.0
                 # Acoustic verification for recovered non-anchor lines (sim == 0):
                 # If the forced aligner crushes a recovered line to near-zero duration, the singer skipped/abridged it live -> drop it!
-                if (not is_real_anchor) and (raw_dur <= 0.12 or (n_chars >= 4 and (raw_dur / n_chars) < 0.035)):
+                if (not is_real_anchor) and (raw_dur <= 0.12 or (n_syl >= 4.0 and (raw_dur / n_syl) < 0.035)):
                     continue
                 s_abs = round(max(first_onset, raw_s), 2)
                 e_abs = round(max(s_abs + 0.35, raw_e), 2)
@@ -2163,8 +2355,8 @@ def _live_section_anchored_align(
                         wt = (w.word or "").strip()
                         if not wt:
                             continue
-                        ws_l = _map_comp_to_real(float(w.start), blk_time_map) if blk_time_map else float(w.start)
-                        we_l = _map_comp_to_real(float(w.end), blk_time_map) if blk_time_map else float(w.end)
+                        ws_l = _map_comp_to_real(float(w.start), blk_time_map, is_end=False) if blk_time_map else float(w.start)
+                        we_l = _map_comp_to_real(float(w.end), blk_time_map, is_end=True) if blk_time_map else float(w.end)
                         ws = round(max(s_abs, b_start + ws_l), 3)
                         we = round(max(ws, b_start + we_l), 3)
                         words_out.append({"start": ws, "end": we, "word": wt})
@@ -2192,7 +2384,7 @@ def _live_section_anchored_align(
 
 
 QWEN3_LANG_MAP = {
-    "zh": "Cantonese",
+    "zh": "Chinese",
     "yue": "Cantonese",
     "en": "English",
     "ja": "Japanese",
@@ -2204,6 +2396,40 @@ QWEN3_LANG_MAP = {
     "pt": "Portuguese",
     "ru": "Russian",
 }
+
+
+def _detect_cantonese_vs_mandarin_audio(
+    audio_16k: np.ndarray,
+    first_onset: float,
+    lines: list[dict],
+    sub_lang: str = "",
+) -> str:
+    """Resolve Chinese lyrics ('zh' vs 'yue') so Mandarin songs use Qwen3 'Chinese' and Cantonese songs use 'Cantonese'!"""
+    base = detect_lyrics_language([ln.get("text", "") for ln in lines], sub_lang=sub_lang)
+    if base != "zh":
+        return base
+    # Check subtitle hint or Cantonese colloquial markers already caught above; if still ambiguous literary Chinese
+    # (e.g. 林夕/黃偉文 Cantopop vs Jay Chou Mandopop), run a fast 20s Whisper language-ID check when audio is present.
+    if len(audio_16k) >= 16000 * 10:
+        try:
+            add_nvidia_dll_dirs()
+            from faster_whisper import WhisperModel
+            s0 = int(max(0.0, first_onset) * 16000)
+            s1 = min(len(audio_16k), s0 + 16000 * 24)
+            clip = audio_16k[s0:s1]
+            if len(clip) >= 16000 * 5:
+                free_mb = query_free_vram_mb()
+                dev = "cuda" if free_mb >= 2000 else "cpu"
+                ctype = "float16" if dev == "cuda" else "int8"
+                m = WhisperModel("large-v3-turbo", device=dev, compute_type=ctype, download_root=str(MODEL_DIR))
+                _, info = m.transcribe(clip, beam_size=1, vad_filter=False, condition_on_previous_text=False)
+                det = (getattr(info, "language", "") or "").lower()
+                del m
+                if det == "yue":
+                    return "yue"
+        except Exception:
+            pass
+    return "zh"
 
 
 def refine_lines_with_qwen3(
@@ -2230,7 +2456,7 @@ def refine_lines_with_qwen3(
     if device_mode != "gpu" and free_mb < 2200:
         return lines, False
 
-    lang = detect_lyrics_language([ln.get("text", "") for ln in lines])
+    lang = _detect_cantonese_vs_mandarin_audio(audio_16k, first_onset, lines)
     qwen_lang = QWEN3_LANG_MAP.get(lang)
     if not qwen_lang:
         return lines, False
@@ -2252,6 +2478,12 @@ def refine_lines_with_qwen3(
             cur_win.append(idx)
     if cur_win:
         windows.append(cur_win)
+    # Merge tiny trailing 1-line window into prior window when no interlude separates them (prevents <1s skip aborts!)
+    if len(windows) >= 2 and len(windows[-1]) == 1:
+        gap_last = float(lines[windows[-1][0]]["start"]) - float(lines[windows[-2][-1]]["end"])
+        span_merged = float(lines[windows[-1][-1]]["end"]) - float(lines[windows[-2][0]]["start"])
+        if gap_last < 4.0 and span_merged <= 65.0:
+            windows[-2].extend(windows.pop())
 
     try:
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -2271,20 +2503,20 @@ def refine_lines_with_qwen3(
         refined_windows = 0
 
         for wi, idx_list in enumerate(windows):
-            prev_end = float(lines[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
+            # Use ALREADY-REFINED previous window end so adjacent windows NEVER expand into the same vocal region!
+            prev_end = float(refined[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
             next_start = float(lines[idx_list[-1] + 1]["start"]) if (idx_list[-1] + 1) < len(lines) else audio_dur
-            # Structural drift rescue: if Stage 1 compressed any line (<0.12s/char), expand the audio window
-            # across the full available gap so Qwen3 can pull drifted lines back to their real sung positions!
+            # Structural drift rescue using SYLLABLE UNITS (not raw chars, which broke all English songs!):
             has_compressed = any(
-                (float(lines[i]["end"]) - float(lines[i]["start"])) / max(1, len(re.sub(r"\s+", "", lines[i].get("text", "")))) < 0.12
+                (float(lines[i]["end"]) - float(lines[i]["start"])) / estimate_syllable_units(lines[i].get("text", "")) < 0.12
                 for i in idx_list
             )
-            eff_pad = 15.0 if has_compressed else max_pad_sec
-            pad_left = min(eff_pad, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * (0.9 if has_compressed else 0.45)))
-            pad_right = min(eff_pad, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * (0.9 if has_compressed else 0.45)))
-            w_t0 = max(0.0, float(lines[idx_list[0]]["start"]) - pad_left)
+            eff_pad = 12.0 if has_compressed else max_pad_sec
+            pad_left = min(eff_pad, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * (0.85 if has_compressed else 0.45)))
+            pad_right = min(eff_pad, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * (0.85 if has_compressed else 0.45)))
+            w_t0 = max(prev_end, float(lines[idx_list[0]]["start"]) - pad_left)
             w_t1 = min(audio_dur, float(lines[idx_list[-1]]["end"]) + pad_right)
-            if w_t1 - w_t0 < 1.0 or w_t1 - w_t0 > 120.0:
+            if w_t1 - w_t0 < 0.35 or w_t1 - w_t0 > 120.0:
                 continue
 
             s0 = int(round(w_t0 * 16000))
@@ -2322,9 +2554,9 @@ def refine_lines_with_qwen3(
                 local_s = float(tok_slice[0].start_time)
                 local_e = float(tok_slice[-1].end_time)
                 q_dur = local_e - local_s
-                n_chars = max(1, len(_norm_lyrics_cmp(txt)))
+                n_syl = estimate_syllable_units(txt)
                 orig_dur = max(0.35, float(lines[idx]["end"]) - float(lines[idx]["start"]))
-                is_squished = q_dur <= max(0.18, 0.04 * n_chars)
+                is_squished = q_dur <= max(0.18, 0.04 * n_syl)
                 is_exploded = q_dur > max(9.5, orig_dur * 2.2)
                 if is_squished:
                     squished += 1
@@ -2490,8 +2722,8 @@ def align_official_lyrics_with_stable_ts(
         txt = (seg.text or "").strip()
         if not txt:
             continue
-        raw_s = _map_comp_to_real(float(seg.start), time_map) if time_map else float(seg.start)
-        raw_e = _map_comp_to_real(float(seg.end), time_map) if time_map else float(seg.end)
+        raw_s = _map_comp_to_real(float(seg.start), time_map, is_end=False) if time_map else float(seg.start)
+        raw_e = _map_comp_to_real(float(seg.end), time_map, is_end=True) if time_map else float(seg.end)
         start_s = round(max(first_onset, raw_s), 2)
         end_s = round(max(start_s + 0.4, raw_e), 2)
 
@@ -2502,8 +2734,8 @@ def align_official_lyrics_with_stable_ts(
             wt = (w.word or "").strip()
             if not wt:
                 continue
-            ws_r = _map_comp_to_real(float(w.start), time_map) if time_map else float(w.start)
-            we_r = _map_comp_to_real(float(w.end), time_map) if time_map else float(w.end)
+            ws_r = _map_comp_to_real(float(w.start), time_map, is_end=False) if time_map else float(w.start)
+            we_r = _map_comp_to_real(float(w.end), time_map, is_end=True) if time_map else float(w.end)
             ws = round(max(start_s, ws_r), 3)
             we = round(max(ws, we_r), 3)
             words_out.append({"start": ws, "end": we, "word": wt})
@@ -2537,8 +2769,9 @@ def fast_probe_transcribe_for_rescue(
 
     free_mb = query_free_vram_mb()
     use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
-    is_cjk_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or ""))
-    prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_cjk_title else None
+    # Never inject Cantonese prompt on Japanese Kanji or Korean titles!
+    is_zh_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or "")) and not _is_non_chinese_cjk(title_hint or "")
+    prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_zh_title else None
 
     def _run(dev: str):
         ctype = "float16" if dev == "cuda" else "int8"
@@ -2585,8 +2818,9 @@ def fallback_free_transcribe(
 
     free_mb = query_free_vram_mb()
     use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
-    is_cjk_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or ""))
-    prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_cjk_title else None
+    # Never inject Cantonese prompt on Japanese Kanji or Korean titles!
+    is_zh_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or "")) and not _is_non_chinese_cjk(title_hint or "")
+    prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_zh_title else None
 
     def _run(dev: str):
         ctype = "float16" if dev == "cuda" else "int8"
