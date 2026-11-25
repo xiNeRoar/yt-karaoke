@@ -1254,7 +1254,7 @@ class KaraokeSeparatorManager:
                     self._active_procs[key] = proc
 
                 dur_sec = float(meta.get("duration") or 0.0)
-                lyrics_timeout = max(240, min(900, int(dur_sec * 1.25)))
+                lyrics_timeout = max(480, min(1200, int(dur_sec * 2.2))) if dur_sec > 0 else 600
                 try:
                     stderr_text, _ = proc.communicate(timeout=lyrics_timeout)
                 except subprocess.TimeoutExpired:
