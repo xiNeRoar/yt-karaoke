@@ -656,7 +656,15 @@ def test_bilingual_title_matching_and_artist_isolation() -> None:
     s_studio = lw._track_matches_title("晴天", "周杰倫", "周杰倫 Jay Chou【晴天】Official MV")
     s_live = lw._track_matches_title("晴天 (Live)", "周杰倫", "周杰倫 Jay Chou【晴天】Official MV")
     assert s_studio > s_live, f"Live track was not penalized vs studio: studio={s_studio}, live={s_live}"
-    print("[PASS] Bilingual 1-char scoring (MC 抽), year titles, K-Pop/J-Pop cleaning, artist isolation & version penalty")
+
+    # 6) Structural single-word Latin guard (zero show blacklists!):
+    # Unmatched-artist 1-word Latin track MUST match a complete structural segment, blocking "Chill" in "CHILL CLUB"
+    # and "Take" in "THE FIRST TAKE", while still permitting genuine covers of 1-word titles like "Cover Girl - Hello"!
+    assert lw._track_matches_title("Chill", "Random Artist", "CHILL CLUB | 晚安莉莉") == 0.0
+    assert lw._track_matches_title("Take", "Random Artist", "THE FIRST TAKE | YOASOBI") == 0.0
+    assert s_fake == 0.0, f"Dreariness - Inhale should score 0.0 inside bilingual segment '抽 Inhale', got {s_fake}"
+    assert lw._track_matches_title("Hello", "Adele", "Cover Girl - Hello") > 1.0
+    print("[PASS] Bilingual 1-char scoring (MC 抽), year titles, K-Pop/J-Pop cleaning, artist isolation, segment guard & version penalty")
 
 
 def test_multilingual_cleaning_similarity_and_splitting() -> None:

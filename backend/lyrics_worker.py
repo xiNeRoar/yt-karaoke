@@ -616,6 +616,12 @@ def _track_matches_title(
     artist_matched = artist_lvl > 0.0
     y_words_lower = re.sub(r"[^\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", " ", y_simp).lower()
 
+    y_seg_norms = [
+        re.sub(r"[^\w\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+", " ", to_simplified(sg)).lower().strip()
+        for sg in re.split(r"[｜|—–/《》「」『』【】\[\]()（）［］]+|\s+-\s+", yt_title_clean or "")
+        if sg and sg.strip()
+    ]
+
     def _score_one_variant(variant: str) -> float:
         v_norm = re.sub(r"[\s\W_]+", "", to_simplified(variant)).lower()
         if not v_norm:
@@ -636,10 +642,13 @@ def _track_matches_title(
                     return 1.45
             return 0.0
         if is_pure_latin_num and len(v_norm) <= 6:
-            # Short Latin/numeric titles (505, 1874, 2002, Hello, One) MUST match on word boundaries (not 'el' in 'adelehello'!)
+            # Short Latin/numeric titles (505, 1874, 2002, Hello, One) MUST match on word boundaries;
+            # when artist does NOT match, a single English word MUST match a complete title segment
+            # (blocks random 'Chill' matching 'CHILL CLUB' or 'Inhale' matching '抽 Inhale', while keeping covers like 'Singer - Hello'!).
             if v_words and re.search(rf"(?<![a-z0-9]){re.escape(v_words)}(?![a-z0-9])", y_words_lower):
-                # Script-fair score: single short English word doesn't get runaway ASCII letter bonus over 1-char CJK!
                 word_cnt = len(v_words.split())
+                if word_cnt == 1 and not artist_matched and v_words not in y_seg_norms:
+                    return 0.0
                 return 1.15 + min(0.35, (word_cnt - 1) * 0.15 + (0.12 if len(v_norm) >= 4 else 0.0))
             return 0.0
         if len(v_norm) >= 2 and v_norm in y_norm:
@@ -647,9 +656,12 @@ def _track_matches_title(
                 cjk_len = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", v_norm))
                 return 1.20 + min(0.55, cjk_len * 0.11)
             word_cnt = max(1, len(v_words.split()))
-            # Word-boundary guard for single English words embedded inside another word
-            if word_cnt == 1 and v_words and not re.search(rf"(?<![a-z0-9]){re.escape(v_words)}(?![a-z0-9])", y_words_lower):
-                return 0.0
+            # Word-boundary & complete-segment guard for single English words without artist match
+            if word_cnt == 1 and v_words:
+                if not re.search(rf"(?<![a-z0-9]){re.escape(v_words)}(?![a-z0-9])", y_words_lower):
+                    return 0.0
+                if not artist_matched and v_words not in y_seg_norms:
+                    return 0.0
             return 1.15 + min(0.55, word_cnt * 0.14)
 
         # Script-aware fuzzy overlap (Hanzi + Kana + Hangul) or per-segment Latin similarity
@@ -845,8 +857,9 @@ def fetch_official_lyrics(
     against title + track + artist metadata (excluding noisy uploader channel names).
     """
     cleaned = clean_search_title(title)
-    # Include RAW title + structured track/artist (NEVER dump noisy yt_channel names into title matching!)
-    match_context = " ".join(x for x in (title, cleaned, yt_track, yt_artist) if x).strip()
+    # Include RAW title + structured track/artist joined with ' | ' so complete-segment checks preserve boundaries
+    # (NEVER dump noisy yt_channel names into title matching!)
+    match_context = " | ".join(x for x in (title, cleaned, yt_track, yt_artist) if x).strip()
     queries = _extract_query_candidates(title, track=yt_track, artist=yt_artist, channel=yt_channel)
 
     is_live_or_alt = bool(LIVE_KEYWORDS_RE.search(title)) or bool(LIVE_KEYWORDS_RE.search(yt_desc[:200]))
@@ -2355,10 +2368,22 @@ def _live_section_anchored_align(
 
     # Fast GPU BatchedInferencePipeline (~2-4s for a 4-min concert on RTX 5060 Ti!)
     # Run on silence-collapsed audio with vad_filter=False & word_timestamps=True so falsetto/reverberant singing
-    # is NEVER dropped by speech-trained Silero VAD, and multi-song mashups auto-detect mixed languages!
-    is_multi_pool_in = bool(initial_song_pools and len(initial_song_pools) >= 2)
+    # is NEVER dropped by speech-trained Silero VAD. Lock Whisper language when all song pools share one language
+    # (prevents Cantonese/Mandarin rock concerts from hallucinating random English!); only auto-detect for mixed-language medleys!
+    def _resolve_pool_wlang(pl: list[str]) -> str:
+        pl_lang = detect_lyrics_language(pl)
+        if pl_lang == "zh" and lang == "yue":
+            pl_lang = "yue"
+        return _whisper_align_lang(pl_lang)
+
+    pool_wlangs = (
+        {_resolve_pool_wlang(p) for p in initial_song_pools if p}
+        if initial_song_pools
+        else set()
+    )
+    is_mixed_lang_medley = len(pool_wlangs) >= 2
     whisper_lang = _whisper_align_lang(lang)
-    transcribe_lang = None if is_multi_pool_in else whisper_lang
+    transcribe_lang = None if is_mixed_lang_medley else (next(iter(pool_wlangs)) if len(pool_wlangs) == 1 else whisper_lang)
     if len(audio_16k) > 0 and len(db_profile) > 0:
         comp_audio, comp_time_map = build_silence_collapsed_audio(audio_16k, db_profile, step_sec, sr=16000)
         if len(comp_audio) == 0 or not comp_time_map:
@@ -2550,6 +2575,38 @@ def _live_section_anchored_align(
     matched, unmatched_gaps = _match_against_pool(official_lines, song_pools)
     matched_asr_count = len(asr_segs) - len(unmatched_gaps)
 
+    # Structural Pool Pruning (zero-blacklist defense against TV-show/festival brackets that collide with unrelated DB songs):
+    # If >=2 pools exist, drop any bogus pool with <3 distinct high-confidence matches (sim >= 0.35) or <8% share
+    # when real sung pools have >=8 matches, then re-match cleanly strictly against the real sung songs!
+    if len(song_pools) >= 2 and matched:
+        pool_distinct_hi: list[set[str]] = [set() for _ in song_pools]
+        pool_total_hits: list[int] = [0 for _ in song_pools]
+        for cur_m in matched:
+            m_txt = cur_m["text"]
+            m_sim = float(cur_m.get("sim") or 0.0)
+            for pi, pl in enumerate(song_pools):
+                if m_txt in pl:
+                    pool_total_hits[pi] += 1
+                    if m_sim >= 0.35:
+                        pool_distinct_hi[pi].add(_norm_lyrics_cmp(m_txt))
+        max_pool_hits = max(pool_total_hits) if pool_total_hits else 0
+        total_pool_hits = max(1, sum(pool_total_hits))
+        kept_pools = [
+            song_pools[pi]
+            for pi in range(len(song_pools))
+            if len(pool_distinct_hi[pi]) >= 3
+            and not (max_pool_hits >= 8 and (pool_total_hits[pi] / total_pool_hits) < 0.08)
+        ]
+        if kept_pools and len(kept_pools) < len(song_pools):
+            print(
+                f"[Lyrics] Pruned {len(song_pools) - len(kept_pools)} non-sung/noise pool(s); kept {len(kept_pools)} active song pool(s).",
+                flush=True,
+            )
+            song_pools = kept_pools
+            official_lines = [ln for p in song_pools for ln in p]
+            matched, unmatched_gaps = _match_against_pool(official_lines, song_pools)
+            matched_asr_count = len(asr_segs) - len(unmatched_gaps)
+
     # Smart Shazam rescue: if title-based lyrics poorly matched (<35%) — e.g. clickbait title or unlisted Mashup —
     # run Shazam multi-track fingerprinting and re-match the ALREADY-transcribed ASR segments (0 extra Whisper time!)
     if not shazam_already_tried and (not matched or (len(asr_segs) >= 6 and (matched_asr_count / len(asr_segs)) < 0.35)):
@@ -2734,11 +2791,23 @@ def _live_section_anchored_align(
                     song_runs.append([{**it, "_pool": pi} for it in sub_r])
 
     # MACRO-BOUNDARY -> PER-SONG FULL SILENCE-COLLAPSED ALIGNMENT:
-    # For sequential multi-song live sets (e.g. 2-song TV live / concert setlists where each song is sung in full),
-    # slice the audio cleanly at the inter-song acoustic boundary and run full silence-collapsed model.align()
-    # per song (0% dropped rock/fast lines, chronological order even if sung reversed, 0-anchor show brackets pruned!).
-    # Genuine interleaved/abridged medleys automatically fall through to section-anchored alignment!
-    valid_pool_runs = [r for r in song_runs if r and r[0].get("_pool", -1) >= 0 and len(r) >= 4]
+    # Coalesce contiguous runs of the same song pool (ignoring tiny <=2-line foreign noise blips or chorus-repeat splits!)
+    # so sequential multi-song live sets (e.g. 2-song TV live / concert setlists) ALWAYS engage full per-song alignment!
+    macro_pool_runs: list[tuple[int, list[dict]]] = []
+    for r in song_runs:
+        if not r:
+            continue
+        pi = r[0].get("_pool", -1)
+        if pi < 0:
+            continue
+        if len(r) <= 2 and macro_pool_runs and macro_pool_runs[-1][0] != pi:
+            # Tiny 1-2 line blip between segments of another song: do not split macro song spans!
+            continue
+        if macro_pool_runs and macro_pool_runs[-1][0] == pi:
+            macro_pool_runs[-1][1].extend(r)
+        else:
+            macro_pool_runs.append((pi, list(r)))
+    valid_pool_runs = [items for _, items in macro_pool_runs if len(items) >= 4]
     pool_ids_seq = [r[0]["_pool"] for r in valid_pool_runs]
     is_sequential_distinct_songs = (
         len(valid_pool_runs) >= 2
@@ -2782,18 +2851,43 @@ def _live_section_anchored_align(
         return t_left + frac * (t_right - t_left)
 
     if is_sequential_distinct_songs:
-        # Compute macro boundaries [s_i, e_i] for each sequential song run
+        # Compute macro boundaries [s_i, e_i] for each sequential song run, trimming long spoken TV host intros/outros!
         macro_slices: list[tuple[float, float, int, list[dict]]] = []
-        split_points: list[float] = [0.0]
+        first_r = valid_pool_runs[0]
+        lead_first_idx = max(0, int(first_r[0].get("_idx", 0)))
+        if lead_first_idx == 0:
+            start_0 = max(0.0, float(first_r[0]["start"]) - 3.0)
+        else:
+            start_0 = max(0.0, float(first_r[0]["start"]) - max(10.0, lead_first_idx * 4.5 + 4.0))
+            _, v_lead_s, _ = _contiguous_vocal_span(
+                db_profile, step_sec, gap_thr, start_0, float(first_r[0]["start"]), direction="backward", max_silent_gap=12.0
+            )
+            start_0 = max(start_0, v_lead_s - 2.0)
+        if start_0 < 4.0:
+            start_0 = 0.0
+        split_points: list[float] = [start_0]
         for idx_r in range(len(valid_pool_runs) - 1):
             r_cur = valid_pool_runs[idx_r]
             r_nxt = valid_pool_runs[idx_r + 1]
             pl_cur = song_pools[r_cur[0]["_pool"]]
-            rem_cur = max(0, len(pl_cur) - 1 - r_cur[-1]["_idx"])
-            lead_nxt = max(0, r_nxt[0]["_idx"])
+            rem_cur = max(0, len(pl_cur) - 1 - int(r_cur[-1].get("_idx", len(pl_cur) - 1)))
+            lead_nxt = max(0, int(r_nxt[0].get("_idx", 0)))
             sp = _find_inter_song_split(float(r_cur[-1]["end"]), float(r_nxt[0]["start"]), rem_cur, lead_nxt)
             split_points.append(sp)
-        split_points.append(total_sec_est)
+        last_r = valid_pool_runs[-1]
+        pl_last = song_pools[last_r[0]["_pool"]]
+        rem_last = max(0, len(pl_last) - 1 - int(last_r[-1].get("_idx", len(pl_last) - 1)))
+        if rem_last == 0:
+            end_last = min(total_sec_est, float(last_r[-1]["end"]) + 3.0)
+        else:
+            end_last = min(total_sec_est, float(last_r[-1]["end"]) + max(10.0, rem_last * 4.5 + 4.0))
+            _, _, v_trail_e = _contiguous_vocal_span(
+                db_profile, step_sec, gap_thr, float(last_r[-1]["end"]), end_last, direction="forward", max_silent_gap=12.0
+            )
+            end_last = min(end_last, v_trail_e + 2.0)
+        if total_sec_est - end_last < 4.0:
+            end_last = total_sec_est
+        split_points.append(end_last)
 
         # Verify each song looks like a full performance (not a tiny 30s abridged snippet!)
         all_full_songs = True
@@ -2801,7 +2895,8 @@ def _live_section_anchored_align(
             pi = r_cur[0]["_pool"]
             pl_cur = song_pools[pi]
             sl_s, sl_e = split_points[idx_r], split_points[idx_r + 1]
-            span_cov = (r_cur[-1]["_idx"] - r_cur[0]["_idx"] + 1) / max(1, len(pl_cur))
+            idxs_r = [int(it.get("_idx", 0)) for it in r_cur if int(it.get("_idx", -1)) >= 0]
+            span_cov = ((max(idxs_r) - min(idxs_r) + 1) / max(1, len(pl_cur))) if idxs_r else 0.0
             if (sl_e - sl_s) < 90.0 and span_cov < 0.55:
                 all_full_songs = False
                 break
@@ -2813,6 +2908,9 @@ def _live_section_anchored_align(
             for sl_s, sl_e, pi, r_cur in macro_slices:
                 pl_cur = song_pools[pi]
                 s_lang = detect_lyrics_language(pl_cur)
+                # Preserve Cantonese ('yue') calibration for literary Cantopop songs (no colloquial markers)!
+                if s_lang == "zh" and lang == "yue":
+                    s_lang = "yue"
                 di0 = max(0, int(sl_s / step_sec))
                 di1 = min(len(db_profile), int(sl_e / step_sec))
                 a0 = max(0, int(sl_s * 16000))
@@ -3175,13 +3273,14 @@ def refine_lines_with_qwen3(
     sub_lang: str = "",
     meta_lang: str = "",
     detected_lang: str = "",
+    progress_cb=None,
+    max_total_sec: float = 45.0,
 ) -> tuple[list[dict], bool]:
     """Windowed batched Cantonese/multilingual word-level timestamp refinement using Qwen3-ForcedAligner-0.6B.
 
     Takes globally scaffolded lines (from stable-ts, which already resolves repeated choruses & live cuts),
-    groups them into clean ~50s windows (no repeated chorus inside a window), and runs Qwen3-ForcedAligner
-    across each window to produce ultra-accurate per-character KTV sweep timestamps (~2-3s total on GPU).
-    Falls back gracefully per-window or globally to original lines on low VRAM / CPU / any error.
+    groups them into bounded ~32-38s windows (<=10 lines, zero WDDM VRAM spillover!), and runs Qwen3-ForcedAligner
+    under a strict wall-clock budget so optional polish NEVER stalls the user for minutes.
     """
     if not lines or len(lines) < 2 or device_mode == "cpu" or len(audio_16k) == 0:
         return lines, False
@@ -3202,14 +3301,14 @@ def refine_lines_with_qwen3(
 
     audio_dur = len(audio_16k) / 16000.0
 
-    # Group lines into clean ~45-55s windows AND ALWAYS split at instrumental interludes (>= 4.0s gap)
-    # so Qwen3-ForcedAligner NEVER sees a 20-35s instrumental break inside a window (eliminates stretched ghost lines!)
+    # Group lines into compact <=35s / <=10-line windows AND split at instrumental interludes (>= 4.0s gap)
+    # so Qwen3-ForcedAligner NEVER sees giant 80-120s chunks that spill into Windows Shared GPU RAM!
     windows: list[list[int]] = []
     cur_win: list[int] = []
     win_start = float(lines[0]["start"])
     for idx, ln in enumerate(lines):
         prev_gap = (float(ln["start"]) - float(lines[cur_win[-1]]["end"])) if cur_win else 0.0
-        if cur_win and (prev_gap >= 4.0 or float(ln["end"]) - win_start > 55.0 or len(cur_win) >= 14):
+        if cur_win and (prev_gap >= 4.0 or float(ln["end"]) - win_start > 35.0 or len(cur_win) >= 10):
             windows.append(cur_win)
             cur_win = [idx]
             win_start = float(ln["start"])
@@ -3221,12 +3320,15 @@ def refine_lines_with_qwen3(
     if len(windows) >= 2 and len(windows[-1]) == 1:
         gap_last = float(lines[windows[-1][0]]["start"]) - float(lines[windows[-2][-1]]["end"])
         span_merged = float(lines[windows[-1][-1]]["end"]) - float(lines[windows[-2][0]]["start"])
-        if gap_last < 4.0 and span_merged <= 65.0:
+        if gap_last < 4.0 and span_merged <= 42.0:
             windows[-2].extend(windows.pop())
 
+    qwen_t0 = time.monotonic()
     aligner = None
     try:
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "8")
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "25")
         import torch
         if not torch.cuda.is_available():
             return lines, False
@@ -3251,6 +3353,18 @@ def refine_lines_with_qwen3(
         refined_windows = 0
 
         for wi, idx_list in enumerate(windows):
+            if (time.monotonic() - qwen_t0) > max_total_sec:
+                print(
+                    f"[Lyrics] Qwen3-ForcedAligner hit {max_total_sec:.0f}s budget at window {wi}/{len(windows)}; keeping {refined_windows} refined windows.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+            if progress_cb is not None:
+                try:
+                    progress_cb(wi + 1, len(windows))
+                except Exception:
+                    pass
             # Use ALREADY-REFINED previous window end so adjacent windows NEVER expand into the same vocal region!
             prev_end = float(refined[idx_list[0] - 1]["end"]) if idx_list[0] > 0 else 0.0
             next_start = float(lines[idx_list[-1] + 1]["start"]) if (idx_list[-1] + 1) < len(lines) else audio_dur
@@ -3259,12 +3373,12 @@ def refine_lines_with_qwen3(
                 (float(lines[i]["end"]) - float(lines[i]["start"])) / estimate_syllable_units(lines[i].get("text", "")) < 0.07
                 for i in idx_list
             )
-            eff_pad = 12.0 if has_compressed else max_pad_sec
-            pad_left = min(eff_pad, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * (0.85 if has_compressed else 0.45)))
-            pad_right = min(eff_pad, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * (0.85 if has_compressed else 0.45)))
+            eff_pad = min(5.0, max(max_pad_sec, 4.5)) if has_compressed else max_pad_sec
+            pad_left = min(eff_pad, max(0.25, (float(lines[idx_list[0]]["start"]) - prev_end) * (0.75 if has_compressed else 0.45)))
+            pad_right = min(eff_pad, max(0.25, (next_start - float(lines[idx_list[-1]]["end"])) * (0.75 if has_compressed else 0.45)))
             w_t0 = max(prev_end, float(lines[idx_list[0]]["start"]) - pad_left)
             w_t1 = min(audio_dur, float(lines[idx_list[-1]]["end"]) + pad_right)
-            if w_t1 - w_t0 < 0.35 or w_t1 - w_t0 > 120.0:
+            if w_t1 - w_t0 < 0.35 or w_t1 - w_t0 > 50.0:
                 continue
 
             s0 = int(round(w_t0 * 16000))
@@ -3290,7 +3404,15 @@ def refine_lines_with_qwen3(
                 continue
 
             win_text = "\n".join(p[1] for p in valid_pairs)
-            res = aligner.align(audio=(chunk_audio, 16000), text=win_text, language=win_qwen_lang)
+            try:
+                res = aligner.align(audio=(chunk_audio, 16000), text=win_text, language=win_qwen_lang)
+            except Exception as _we:
+                print(f"[Lyrics] Qwen3 window {wi + 1}/{len(windows)} skipped: {_we}", file=sys.stderr, flush=True)
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
             items = list(res[0].items) if (res and len(res) > 0) else []
             expected_n = sum(p[2] for p in valid_pairs)
             if not items or len(items) != expected_n:
@@ -3843,6 +3965,7 @@ def main() -> int:
                     yt_lines, audio_16k_yt, db_prof_yt, step_yt, args.device_mode, onset_yt,
                     max_pad_sec=1.5, require_all_windows=True,
                     sub_lang=yt_lang, meta_lang=yt_video_lang,
+                    progress_cb=lambda cur_w, tot_w: update("running", 65 + int(28 * cur_w / max(1, tot_w)), f"精修歌詞時間軸 ({cur_w}/{tot_w})..."),
                 )
                 if q_ok and len(yt_ref) >= 4:
                     result = {
@@ -3956,6 +4079,7 @@ def main() -> int:
                     shifted_lrc, audio_16k, db_profile, step_sec, args.device_mode, first_onset,
                     max_pad_sec=2.5, require_all_windows=True,
                     sub_lang=yt_lang, meta_lang=yt_video_lang,
+                    progress_cb=lambda cur_w, tot_w: update("running", 65 + int(28 * cur_w / max(1, tot_w)), f"精修歌詞時間軸 ({cur_w}/{tot_w})..."),
                 )
                 if q_ok and len(q_lines) >= 4:
                     result = {
@@ -4016,6 +4140,7 @@ def main() -> int:
                 ai_lines, qwen_ok = refine_lines_with_qwen3(
                     ai_lines, audio_16k, db_profile, step_sec, args.device_mode, first_onset,
                     sub_lang=yt_lang, meta_lang=yt_video_lang, detected_lang=lang_out.get("lang", ""),
+                    progress_cb=lambda cur_w, tot_w: update("running", 82 + int(14 * cur_w / max(1, tot_w)), f"精修歌詞時間軸 ({cur_w}/{tot_w})..."),
                 )
             if len(shazam_tracks) >= 2:
                 src = "mashup_qwen3_align" if qwen_ok else "mashup_shazam_align"
