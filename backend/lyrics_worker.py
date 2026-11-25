@@ -1805,6 +1805,86 @@ def _smooth_bunched_words(
         else:
             i += 1
 
+    # Pass 2B: Acoustic-verified Freeze-Then-Burst rescue (catches Qwen3 80ms frame bursts & active-singing dead gaps
+    # where lyrics sit frozen while singing continues and then suddenly shoot across half a line!).
+    # Strictly preserves real silent breath pauses (requires active vocal energy in db_profile!) and fast rap!
+    line_dur = max(0.0, line_end - line_start)
+    if n >= 3 and line_dur >= 0.8:
+        syls = [max(1.0, estimate_syllable_units(str(w.get("word") or ""))) for w in ws]
+        total_syl = sum(syls)
+        line_pace = line_dur / max(1.0, total_syl)
+        has_db = len(db_profile) >= 10 and step_sec > 0
+        gap_thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=-1.0) if has_db else 0.0
+
+        def _gap_has_active_singing(t0: float, t1: float) -> bool:
+            if not has_db or (t1 - t0) < 0.35:
+                return False
+            f0 = max(0, int(t0 / step_sec))
+            f1 = min(len(db_profile), int(np.ceil(t1 / step_sec)))
+            if f1 <= f0 + 2:
+                return False
+            return float(np.mean(db_profile[f0:f1] > gap_thr_db)) >= 0.65
+
+        if line_pace >= 0.16:
+            # Find runs of >=2 frame-quantized burst tokens (<=0.095s/syl, e.g. Qwen3 80ms frames)
+            is_burst = [((ws[k]["end"] - ws[k]["start"]) / syls[k]) <= 0.095 for k in range(n)]
+            i = 0
+            while i < n:
+                if is_burst[i]:
+                    j = i + 1
+                    while j < n and is_burst[j]:
+                        j += 1
+                    if (j - i) >= 2:
+                        run_s, run_e = i, j
+                        prev_end = ws[run_s - 1]["end"] if run_s > 0 else line_start
+                        next_start = ws[run_e]["start"] if run_e < n else line_end
+                        left_gap = ws[run_s]["start"] - prev_end
+                        right_gap = next_start - ws[run_e - 1]["end"]
+                        changed = False
+
+                        # Signature 1: Active-singing dead gap right before or after a quantized burst run
+                        if left_gap >= 0.40 and _gap_has_active_singing(prev_end, ws[run_s]["start"]):
+                            span_s = prev_end
+                            span_e = next_start if (right_gap >= 0.40 and _gap_has_active_singing(ws[run_e - 1]["end"], next_start)) else ws[run_e - 1]["end"]
+                            if span_e > span_s + 0.10:
+                                _distribute_by_vocal_energy_cdf(ws[run_s:run_e], span_s, span_e, db_profile, step_sec)
+                                changed = True
+                        elif right_gap >= 0.40 and _gap_has_active_singing(ws[run_e - 1]["end"], next_start):
+                            span_s = ws[run_s]["start"]
+                            span_e = next_start
+                            if span_e > span_s + 0.10:
+                                _distribute_by_vocal_energy_cdf(ws[run_s:run_e], span_s, span_e, db_profile, step_sec)
+                                changed = True
+
+                        # Signature 2: Single touching hog token (>=0.75s & >=2.8x line pace) glued to a >=2-token burst
+                        if not changed:
+                            left_dur = (ws[run_s - 1]["end"] - ws[run_s - 1]["start"]) if run_s > 0 else 0.0
+                            right_dur = (ws[run_e]["end"] - ws[run_e]["start"]) if run_e < n else 0.0
+                            left_rate = (left_dur / syls[run_s - 1]) if run_s > 0 else 0.0
+                            right_rate = (right_dur / syls[run_e]) if run_e < n else 0.0
+                            left_hog = (
+                                run_s > 0
+                                and left_gap <= 0.15
+                                and (left_rate >= max(0.75, 2.8 * line_pace) or (left_dur >= 0.42 * line_dur and left_rate >= 0.55))
+                            )
+                            right_hog = (
+                                run_e < n
+                                and right_gap <= 0.15
+                                and (right_rate >= max(0.75, 2.8 * line_pace) or (right_dur >= 0.42 * line_dur and right_rate >= 0.55))
+                            )
+                            if left_hog or right_hog:
+                                if left_hog and (not right_hog or left_dur >= right_dur):
+                                    run_s -= 1
+                                else:
+                                    run_e += 1
+                                span_s = ws[run_s]["start"]
+                                span_e = ws[run_e - 1]["end"]
+                                if span_e > span_s + 0.10:
+                                    _distribute_by_vocal_energy_cdf(ws[run_s:run_e], span_s, span_e, db_profile, step_sec)
+                    i = j
+                else:
+                    i += 1
+
     # Pass 3: Enforce strict monotonic continuity strictly INSIDE [line_start, line_end] (never overflow on fast rap!)
     min_step = min(0.04, max(0.01, (line_end - line_start) / max(1, n)))
     prev_e = line_start
@@ -3459,7 +3539,7 @@ def refine_lines_with_qwen3(
     meta_lang: str = "",
     detected_lang: str = "",
     progress_cb=None,
-    max_total_sec: float = 45.0,
+    max_total_sec: Optional[float] = None,
 ) -> tuple[list[dict], bool]:
     """Windowed batched Cantonese/multilingual word-level timestamp refinement using Qwen3-ForcedAligner-0.6B.
 
@@ -3519,10 +3599,11 @@ def refine_lines_with_qwen3(
         refined = [dict(ln) for ln in lines]
         refined_windows = 0
 
+        eff_budget_sec = float(max_total_sec) if max_total_sec is not None else max(45.0, min(95.0, audio_dur * 0.25))
         for wi, (core_idxs, ext_idxs) in enumerate(windows):
-            if (time.monotonic() - qwen_t0) > max_total_sec:
+            if (time.monotonic() - qwen_t0) > eff_budget_sec:
                 print(
-                    f"[Lyrics] Qwen3-ForcedAligner hit {max_total_sec:.0f}s budget at window {wi}/{len(windows)}; keeping {refined_windows} refined windows.",
+                    f"[Lyrics] Qwen3-ForcedAligner hit {eff_budget_sec:.0f}s budget at window {wi}/{len(windows)}; keeping {refined_windows} refined windows.",
                     file=sys.stderr,
                     flush=True,
                 )

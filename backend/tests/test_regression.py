@@ -352,7 +352,44 @@ def test_word_bunching_deglitcher() -> None:
     comp_live = np.concatenate([np.full(30, -33.0), np.full(60, -28.0), np.full(30, -24.1)]).astype(np.float32)
     comp_thr = lw._adaptive_vocal_threshold_db(comp_live)
     assert -33.0 < comp_thr < -28.0, f"Compressed live threshold must lie strictly between p15 (-33) and p50 (-28), got {comp_thr:.1f}"
-    print("[PASS] First-principles Energy-CDF recovery + silent-solo trim + bounded scale-invariant threshold")
+    # Case 5: Qwen3 80ms Hog-Then-Burst (1 char frozen 2.0s, then 5 chars burst at 0.08s each!) -> smoothly recovered!
+    qwen_hog_burst = [
+        {"word": "全", "start": 10.00, "end": 12.00},
+        {"word": "然", "start": 12.00, "end": 12.08},
+        {"word": "指", "start": 12.08, "end": 12.16},
+        {"word": "控", "start": 12.16, "end": 12.24},
+        {"word": "着", "start": 12.24, "end": 12.32},
+        {"word": "都", "start": 12.32, "end": 12.40},
+    ]
+    hb_out = lw._smooth_bunched_words(qwen_hog_burst, 10.00, 12.40, np.array([]), 0.1)
+    for w in hb_out:
+        assert 0.30 <= (w["end"] - w["start"]) <= 0.50, f"Qwen3 hog-burst not smoothed: {hb_out}"
+
+    # Case 6: Active-singing dead gap (1.8s freeze while vocals are loud) + 80ms burst -> smoothly recovered,
+    #         while genuine SILENT breath pause MUST stay paused!
+    sing_db = np.full(200, -14.0, dtype=np.float32)  # continuous singing 0..20s
+    sing_db[:20] = -60.0  # floor reference so adaptive thr sits around -32 dB
+    gap_burst = [
+        {"word": "我", "start": 10.00, "end": 10.30},
+        {"word": "就", "start": 12.10, "end": 12.18},
+        {"word": "算", "start": 12.18, "end": 12.26},
+        {"word": "輸", "start": 12.26, "end": 12.34},
+        {"word": "都", "start": 12.34, "end": 12.42},
+    ]
+    gb_out = lw._smooth_bunched_words(gap_burst, 10.00, 12.42, sing_db, 0.1)
+    assert (gb_out[1]["start"] - gb_out[0]["end"]) < 0.10 and (gb_out[2]["end"] - gb_out[2]["start"]) >= 0.40, f"Active-singing freeze gap not smoothed: {gb_out}"
+
+    # Case 7: Legitimate held final note (no adjacent 80ms burst!) MUST NOT be flattened!
+    held_note = [
+        {"word": "愛", "start": 10.00, "end": 10.35},
+        {"word": "你", "start": 10.35, "end": 10.70},
+        {"word": "到", "start": 10.70, "end": 11.05},
+        {"word": "永", "start": 11.05, "end": 11.40},
+        {"word": "遠", "start": 11.40, "end": 13.40},
+    ]
+    hn_out = lw._smooth_bunched_words(held_note, 10.00, 13.40, sing_db, 0.1)
+    assert abs(hn_out[-1]["start"] - 11.40) < 0.02 and (hn_out[-1]["end"] - hn_out[-1]["start"]) >= 1.95, f"Real held final note was distorted: {hn_out}"
+    print("[PASS] First-principles Energy-CDF recovery + Qwen3 freeze-burst deglitch + silent-solo trim + bounded threshold")
 
 
 def test_silence_collapse_and_mapping() -> None:
@@ -816,7 +853,38 @@ def test_generic_alignment_recovery_and_qwen3_windows() -> None:
     p_upd = lw_src.index("whisper_lang = _whisper_align_lang(lang)", p_det)
     p_aln = lw_src.index("aligned = model.align(", p_det)
     assert p_det < p_upd < p_aln, "whisper_lang must be refreshed after Cantonese audio ID before model.align()"
-    print("[PASS] Syllable-aware gap recovery, bilingual rematch tolerance, Qwen3 halo/script windows & yue lang sync")
+
+    # 6) Qwen3 80ms hog-then-burst smoothing (works even without numpy/db_profile) + fast-rap / held-note preservation
+    qwen_hb = [
+        {"word": "全", "start": 10.00, "end": 12.00},
+        {"word": "然", "start": 12.00, "end": 12.08},
+        {"word": "指", "start": 12.08, "end": 12.16},
+        {"word": "控", "start": 12.16, "end": 12.24},
+        {"word": "着", "start": 12.24, "end": 12.32},
+        {"word": "都", "start": 12.32, "end": 12.40},
+    ]
+    hb_fixed = lw._smooth_bunched_words(qwen_hb, 10.00, 12.40, [], 0.1)
+    assert all(0.30 <= (w["end"] - w["start"]) <= 0.50 for w in hb_fixed), f"Qwen3 hog-burst not smoothed: {hb_fixed}"
+    rap_keep = [
+        {"word": "快", "start": 10.00, "end": 10.08},
+        {"word": "使", "start": 10.08, "end": 10.16},
+        {"word": "用", "start": 10.16, "end": 10.24},
+        {"word": "雙", "start": 10.24, "end": 10.32},
+        {"word": "截", "start": 10.32, "end": 10.40},
+        {"word": "棍", "start": 11.60, "end": 12.10},
+    ]
+    rap_fixed = lw._smooth_bunched_words(rap_keep, 10.00, 12.10, [], 0.1)
+    assert abs(rap_fixed[4]["end"] - 10.40) < 0.02, f"Fast rap smeared: {rap_fixed}"
+    held_keep = [
+        {"word": "愛", "start": 10.00, "end": 10.35},
+        {"word": "你", "start": 10.35, "end": 10.70},
+        {"word": "到", "start": 10.70, "end": 11.05},
+        {"word": "永", "start": 11.05, "end": 11.40},
+        {"word": "遠", "start": 11.40, "end": 13.40},
+    ]
+    held_fixed = lw._smooth_bunched_words(held_keep, 10.00, 13.40, [], 0.1)
+    assert abs(held_fixed[-1]["start"] - 11.40) < 0.02, f"Held final note distorted: {held_fixed}"
+    print("[PASS] Syllable-aware gap recovery, bilingual rematch tolerance, Qwen3 halo/script windows, yue sync & freeze-burst smoothing")
 
 
 def main() -> int:
