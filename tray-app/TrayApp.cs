@@ -761,26 +761,86 @@ namespace YtKaraokeTray
             }
         }
 
+        private List<int> FindListeningPidsOnPort(int port)
+        {
+            var pids = new List<int>();
+            try
+            {
+                var p = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "netstat",
+                    Arguments = "-ano -p TCP",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true
+                });
+                if (p == null) return pids;
+                string output = p.StandardOutput.ReadToEnd();
+                p.WaitForExit(2000);
+                string suffix = ":" + port;
+                foreach (var rawLine in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var line = rawLine.Trim();
+                    if (!line.StartsWith("TCP", StringComparison.OrdinalIgnoreCase)) continue;
+                    var cols = Regex.Split(line, @"\s+");
+                    if (cols.Length < 5) continue;
+                    if (!cols[1].EndsWith(suffix, StringComparison.Ordinal)) continue;
+                    if (!string.Equals(cols[3], "LISTENING", StringComparison.OrdinalIgnoreCase)) continue;
+                    int pid;
+                    if (int.TryParse(cols[4], out pid) && pid > 0 && !pids.Contains(pid))
+                    {
+                        pids.Add(pid);
+                    }
+                }
+            }
+            catch { }
+            return pids;
+        }
+
+        private void KillPidTree(int pid)
+        {
+            if (pid <= 0) return;
+            try
+            {
+                var kill = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "taskkill",
+                    Arguments = "/T /F /PID " + pid,
+                    CreateNoWindow = true,
+                    UseShellExecute = false
+                });
+                if (kill != null) kill.WaitForExit(3000);
+            }
+            catch { }
+        }
+
         private void StopBackend()
         {
             lock (_procLock)
             {
                 _starting = false;
+
+                // 1) Ask any running backend (even if launched externally) to shut down cleanly via admin token
+                try
+                {
+                    var req = (HttpWebRequest)WebRequest.Create(ApiBase + "/api/admin/shutdown");
+                    req.Method = "POST";
+                    req.Timeout = 1500;
+                    req.ReadWriteTimeout = 1500;
+                    string tok = ReadAdminToken();
+                    if (!string.IsNullOrEmpty(tok)) req.Headers["X-Admin-Token"] = tok;
+                    req.ContentLength = 0;
+                    using (var resp = (HttpWebResponse)req.GetResponse()) { }
+                    Thread.Sleep(250);
+                }
+                catch { }
+
+                // 2) Terminate tracked child process tree if TrayApp spawned it
                 if (_backendProcess != null)
                 {
                     try
                     {
-                        if (!_backendProcess.HasExited)
-                        {
-                            var kill = Process.Start(new ProcessStartInfo
-                            {
-                                FileName = "taskkill",
-                                Arguments = "/T /F /PID " + _backendProcess.Id,
-                                CreateNoWindow = true,
-                                UseShellExecute = false
-                            });
-                            if (kill != null) kill.WaitForExit(3000);
-                        }
+                        if (!_backendProcess.HasExited) KillPidTree(_backendProcess.Id);
                     }
                     catch { }
                     finally
@@ -789,6 +849,22 @@ namespace YtKaraokeTray
                         _backendProcess = null;
                     }
                 }
+
+                // 3) Structural fallback: if an externally-started/orphan python backend still holds port 18765, terminate it cleanly
+                foreach (int pid in FindListeningPidsOnPort(18765))
+                {
+                    try
+                    {
+                        var proc = Process.GetProcessById(pid);
+                        string pname = (proc.ProcessName ?? "").ToLowerInvariant();
+                        if (pname == "python" || pname == "pythonw" || pname == "uv")
+                        {
+                            KillPidTree(pid);
+                        }
+                    }
+                    catch { }
+                }
+
                 _backendOnline = false;
             }
             AppendLog("[System] Backend stopped.");

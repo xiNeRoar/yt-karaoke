@@ -540,6 +540,25 @@ class KaraokeSeparatorManager:
         with self._lock:
             return len(self._queued_keys)
 
+    def terminate_active_workers(self) -> None:
+        """Gracefully terminate all active separation/lyrics worker subprocesses on shutdown."""
+        with self._lock:
+            procs = list(self._active_procs.values())
+            self._active_procs.clear()
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=2)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
     def check_rate_limit(self, client_ip: str) -> bool:
         """Returns True if allowed, False if IP exceeded rate_limit_per_10min."""
         now = time.time()
@@ -1231,16 +1250,20 @@ class KaraokeSeparatorManager:
 
                 if proc.returncode == 0 and out_file.exists():
                     # Load into RAM cache immediately so Extension gets lyrics in <1ms!
+                    data = None
                     try:
                         data = json.loads(out_file.read_text(encoding="utf-8"))
-                        if data.get("lines"):
-                            self._put_lyrics_mem(video_id, data)
-                            _write_json_atomic(
-                                status_file,
-                                {"video_id": video_id, "status": "ready", "progress": 100, "stage_text": "歌詞已就緒", "error": None},
-                            )
-                    except Exception:
-                        pass
+                    except Exception as parse_exc:
+                        self.log.error("Lyrics", f"Invalid lyrics JSON ({video_id}): {parse_exc}")
+                    if not isinstance(data, dict) or not data.get("lines"):
+                        self.log.error("Lyrics", f"Worker produced empty lyrics ({video_id})")
+                        raise RuntimeError("暫未能對齊歌詞")
+
+                    self._put_lyrics_mem(video_id, data)
+                    _write_json_atomic(
+                        status_file,
+                        {"video_id": video_id, "status": "ready", "progress": 100, "stage_text": "歌詞已就緒", "error": None},
+                    )
 
                     # Sync tiny lyrics.json (~4KB) to Google Drive in background and remove local copy (0 MB disk!)
                     if self.storage_mode == "gdrive" and self.gdrive.is_configured() and self.gdrive.has_song(video_id, mode):

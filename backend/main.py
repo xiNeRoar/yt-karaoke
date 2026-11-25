@@ -284,6 +284,23 @@ def trigger_extension_reload(x_admin_token: Optional[str] = Header(default=None)
     return {"status": "ok", "extension_reload_nonce": EXTENSION_RELOAD_NONCE}
 
 
+@app.post("/api/admin/shutdown")
+def admin_shutdown(x_admin_token: Optional[str] = Header(default=None)):
+    """Cleanly stop the backend (and any active worker subprocesses) even if launched externally."""
+    _require_admin(x_admin_token)
+
+    def _delayed_exit() -> None:
+        time.sleep(0.15)
+        try:
+            manager.terminate_active_workers()
+        except Exception:
+            pass
+        os._exit(0)
+
+    threading.Thread(target=_delayed_exit, daemon=True, name="admin-shutdown").start()
+    return {"status": "stopping"}
+
+
 @app.post("/api/admin/gdrive/migrate")
 def gdrive_migrate(x_admin_token: Optional[str] = Header(default=None)):
     _require_admin(x_admin_token)
