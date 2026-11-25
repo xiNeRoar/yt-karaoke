@@ -85,7 +85,7 @@ def main() -> int:
         vid = it["video_id"]
         title = (it.get("title") or vid)[:42]
         dur = float(it.get("duration") or 0)
-        ly = httpx.get(f"{args.base}/api/lyrics/{vid}", timeout=15).json()
+        ly = httpx.get(f"{args.base}/api/lyrics/{vid}", timeout=45).json()
         flags = audit_song(vid, title, dur, ly)
         src = ly.get("source") or ""
         lines = ly.get("lines") or []
