@@ -696,7 +696,7 @@ def shazam_scan_and_fetch_lyrics(
         flush=True,
     )
 
-    # Fetch 100% official lyrics for every identified song and combine into one multi-song pool!
+    # Fetch 100% official lyrics for every identified song and preserve per-track pools (zero split-brain)!
     combined_lines: list[str] = []
     for tr in unique_tracks:
         query_title = f"{tr['artist']} {tr['title']}".strip()
@@ -706,6 +706,7 @@ def shazam_scan_and_fetch_lyrics(
         if not lines and tr.get("shz_lyrics"):
             lines = tr["shz_lyrics"]
         if lines:
+            tr["official_lines"] = list(lines)
             combined_lines.extend(lines)
 
     return combined_lines, unique_tracks
@@ -1231,6 +1232,162 @@ def refine_alignment_with_acoustics(
     return lines
 
 
+def _contiguous_vocal_span(
+    db_profile: np.ndarray,
+    step_sec: float,
+    gap_thr: float,
+    t_start: float,
+    t_end: float,
+    direction: str = "backward",
+    max_silent_gap: float = 8.0,
+) -> tuple[float, float, float]:
+    """Return (active_vocal_seconds, first_active_t, last_active_t) inside [t_start, t_end]
+    restricted to vocal activity connected to the anchor edge without crossing a dead-silent gap > max_silent_gap.
+    Prevents TV host intros/applause or post-song MC banter from pulling song lines across long silences.
+    """
+    if len(db_profile) == 0 or t_end <= t_start or step_sec <= 0:
+        return (0.0, t_start, t_end)
+    i0 = max(0, int(t_start / step_sec))
+    i1 = min(len(db_profile), int(t_end / step_sec))
+    if i1 <= i0:
+        return (0.0, t_start, t_end)
+
+    raw_act = db_profile[i0:i1] > gap_thr
+    n = len(raw_act)
+    # Require >= 2 active frames in a 3-frame window (0.3s) to filter isolated 1-frame cymbal/breath clicks
+    sustained = np.zeros(n, dtype=bool)
+    for k in range(n):
+        if raw_act[k]:
+            lo = max(0, k - 1)
+            hi = min(n, k + 2)
+            if int(np.sum(raw_act[lo:hi])) >= 2:
+                sustained[k] = True
+
+    max_gap_frames = max(1, int(round(max_silent_gap / step_sec)))
+    kept_indices: list[int] = []
+    if direction == "backward":
+        silent_run = 0
+        for k in range(n - 1, -1, -1):
+            if sustained[k]:
+                kept_indices.append(k)
+                silent_run = 0
+            else:
+                silent_run += 1
+                if silent_run > max_gap_frames:
+                    break
+        kept_indices.reverse()
+    elif direction == "forward":
+        silent_run = 0
+        for k in range(n):
+            if sustained[k]:
+                kept_indices.append(k)
+                silent_run = 0
+            else:
+                silent_run += 1
+                if silent_run > max_gap_frames:
+                    break
+    else:
+        kept_indices = [int(k) for k in np.flatnonzero(sustained)]
+
+    if not kept_indices:
+        return (0.0, t_start, t_end)
+    return (
+        float(len(kept_indices)) * step_sec,
+        (i0 + kept_indices[0]) * step_sec,
+        (i0 + kept_indices[-1] + 1) * step_sec,
+    )
+
+
+def _select_monotonic_run_anchors(run_items: list[dict], pool_lines: list[str]) -> list[list[dict]]:
+    """Assign optimal strictly-monotonic official-lyrics indices within a single song run via Weighted DP.
+
+    Eliminates isolated out-of-order ASR false positives (e.g. matching Verse 1 English rap to an Outro line,
+    which would otherwise poison Leading Recovery and drop the opening verse), while preserving genuine
+    repeated live encore blocks (>= 3 consecutive monotonically-progressing anchors).
+    """
+    if not run_items or not pool_lines:
+        return [run_items] if run_items else []
+
+    exact_pos: dict[str, list[int]] = {}
+    norm_pos: dict[str, list[int]] = {}
+    for idx, txt in enumerate(pool_lines):
+        exact_pos.setdefault(txt, []).append(idx)
+        nk = _norm_lyrics_cmp(txt)
+        if nk:
+            norm_pos.setdefault(nk, []).append(idx)
+
+    cands_per_item: list[list[int]] = []
+    for item in run_items:
+        txt = item["text"]
+        cs = exact_pos.get(txt) or norm_pos.get(_norm_lyrics_cmp(txt)) or []
+        cands_per_item.append(cs)
+
+    def _dp_longest_monotonic(item_indices: list[int]) -> list[tuple[int, int]]:
+        nodes: list[tuple[int, int, float]] = []
+        for ii in item_indices:
+            sim_w = 1.0 + max(0.0, float(run_items[ii].get("sim") or 0.0))
+            for pos in cands_per_item[ii]:
+                nodes.append((ii, pos, sim_w))
+        if not nodes:
+            return []
+        m = len(nodes)
+        dp = [nd[2] for nd in nodes]
+        parent = [-1] * m
+        for j in range(m):
+            ij, pj, wj = nodes[j]
+            best_val = wj
+            best_p = -1
+            for i in range(j):
+                ii, pi, _ = nodes[i]
+                if ii < ij and pi < pj:
+                    diff = pj - pi
+                    # Gentle smoothness tie-breaker favors consecutive lyric progression over wild skips
+                    trans = 0.18 if diff <= 6 else (0.06 if diff <= 16 else 0.0)
+                    cand_v = dp[i] + wj + trans
+                    if cand_v > best_val:
+                        best_val = cand_v
+                        best_p = i
+            dp[j] = best_val
+            parent[j] = best_p
+        best_end = max(range(m), key=lambda k: dp[k])
+        chain: list[tuple[int, int]] = []
+        cur = best_end
+        while cur != -1:
+            chain.append((nodes[cur][0], nodes[cur][1]))
+            cur = parent[cur]
+        chain.reverse()
+        return chain
+
+    all_idxs = [i for i in range(len(run_items)) if cands_per_item[i]]
+    if not all_idxs:
+        return []
+
+    primary_chain = _dp_longest_monotonic(all_idxs)
+    if not primary_chain:
+        return []
+
+    used_items = {ii for ii, _ in primary_chain}
+    sub_runs: list[list[dict]] = [
+        [{**run_items[ii], "_idx": pos} for ii, pos in primary_chain]
+    ]
+
+    # Preserve genuine live encore / repeated-chorus blocks (>= 3 monotonically advancing unused anchors)
+    # occurring strictly before or after the primary backbone, while rejecting isolated 1-2 line outliers!
+    first_primary_i = primary_chain[0][0]
+    last_primary_i = primary_chain[-1][0]
+    for side_idxs in (
+        [i for i in all_idxs if i < first_primary_i and i not in used_items],
+        [i for i in all_idxs if i > last_primary_i and i not in used_items],
+    ):
+        if len(side_idxs) >= 3:
+            encore_chain = _dp_longest_monotonic(side_idxs)
+            if len(encore_chain) >= 3:
+                sub_runs.append([{**run_items[ii], "_idx": pos} for ii, pos in encore_chain])
+
+    sub_runs.sort(key=lambda r: float(r[0]["start"]))
+    return sub_runs
+
+
 def _alignment_needs_live_rematch(
     aligned,
     audio_dur: float,
@@ -1502,6 +1659,9 @@ def _live_section_anchored_align(
         if initial_song_pools
         else ([list(official_lines)] if official_lines else [])
     )
+    # Structural invariant: official_lines and song_pools MUST share identical line strings (zero split-brain!)
+    if song_pools:
+        official_lines = [ln for p in song_pools for ln in p]
     matched, unmatched_gaps = _match_against_pool(official_lines, song_pools)
     matched_asr_count = len(asr_segs) - len(unmatched_gaps)
 
@@ -1512,10 +1672,12 @@ def _live_section_anchored_align(
             audio_16k, db_profile, step_sec, inst_path=inst_path, scan_mashup=True
         )
         if shz_lines:
-            m2, g2 = _match_against_pool(shz_lines, [shz_lines])
+            shz_pools = [tr["official_lines"] for tr in shz_tracks if tr.get("official_lines")] or [list(shz_lines)]
+            shz_combined = [ln for p in shz_pools for ln in p]
+            m2, g2 = _match_against_pool(shz_combined, shz_pools)
             if (len(asr_segs) - len(g2)) > matched_asr_count:
-                official_lines = shz_lines
-                song_pools = [list(shz_lines)]
+                official_lines = shz_combined
+                song_pools = shz_pools
                 matched, unmatched_gaps = m2, g2
                 matched_asr_count = len(asr_segs) - len(unmatched_gaps)
 
@@ -1625,64 +1787,62 @@ def _live_section_anchored_align(
             (i0 + int(active_idx[-1]) + 1) * step_sec,
         )
 
-    # Assign each matched anchor to its originating song pool + line index (preferring monotonic progression)
-    pool_pos_maps: list[dict[str, list[int]]] = []
-    for pl in song_pools:
-        pm: dict[str, list[int]] = {}
-        for idx, txt in enumerate(pl):
-            pm.setdefault(txt, []).append(idx)
-        pool_pos_maps.append(pm)
+    # Assign each matched anchor to its originating song pool (with normalized fallback so punctuation never splits pools),
+    # partition into contiguous song runs, and resolve strictly-monotonic lyric indices via Weighted DP!
+    pool_exact_sets: list[set[str]] = [set(pl) for pl in song_pools]
+    pool_norm_sets: list[set[str]] = [{_norm_lyrics_cmp(ln) for ln in pl if _norm_lyrics_cmp(ln)} for pl in song_pools]
 
-    annotated: list[dict] = []
+    raw_song_runs: list[tuple[int, list[dict]]] = []
     cur_pool_i = 0
-    last_idx_in_pool: dict[int, int] = {}
     for cur in matched:
         txt = cur["text"]
-        # Prefer staying in current song pool if txt exists there; otherwise switch to the pool containing txt
+        ntxt = _norm_lyrics_cmp(txt)
         chosen_p = -1
-        if cur_pool_i < len(pool_pos_maps) and txt in pool_pos_maps[cur_pool_i]:
+        if cur_pool_i < len(song_pools) and (txt in pool_exact_sets[cur_pool_i] or (ntxt and ntxt in pool_norm_sets[cur_pool_i])):
             chosen_p = cur_pool_i
         else:
-            for pi, pm in enumerate(pool_pos_maps):
-                if txt in pm:
+            for pi in range(len(song_pools)):
+                if txt in pool_exact_sets[pi] or (ntxt and ntxt in pool_norm_sets[pi]):
                     chosen_p = pi
                     break
         if chosen_p >= 0:
             cur_pool_i = chosen_p
-            cands = pool_pos_maps[chosen_p][txt]
-            prev_i = last_idx_in_pool.get(chosen_p, -1)
-            l_idx = next((p for p in cands if p > prev_i), cands[0])
-            last_idx_in_pool[chosen_p] = l_idx
-            annotated.append({**cur, "_pool": chosen_p, "_idx": l_idx})
+        if not raw_song_runs or chosen_p != raw_song_runs[-1][0] or chosen_p < 0:
+            raw_song_runs.append((chosen_p, [cur]))
         else:
-            annotated.append({**cur, "_pool": -1, "_idx": -1})
+            raw_song_runs[-1][1].append(cur)
 
-    # Partition annotated anchors into contiguous song runs (e.g. Run 0 = Song 1, Run 1 = Song 2)
+    # Apply Weighted Monotonic Anchor Consensus per song run (eliminates isolated out-of-order ASR outliers!)
     song_runs: list[list[dict]] = []
-    for item in annotated:
-        if not song_runs or item["_pool"] != song_runs[-1][0]["_pool"] or item["_pool"] < 0:
-            song_runs.append([item])
+    for pi, r_items in raw_song_runs:
+        if pi < 0 or pi >= len(song_pools):
+            song_runs.append([{**it, "_pool": -1, "_idx": -1} for it in r_items])
         else:
-            song_runs[-1].append(item)
+            for sub_r in _select_monotonic_run_anchors(r_items, song_pools[pi]):
+                if sub_r:
+                    song_runs.append([{**it, "_pool": pi} for it in sub_r])
 
     filled: list[dict] = []
     for r_i, run in enumerate(song_runs):
         pi = run[0]["_pool"]
         if pi < 0 or pi >= len(song_pools):
-            filled.extend(run)
+            filled.extend({k2: v2 for k2, v2 in it.items() if not k2.startswith("_")} for it in run)
             continue
         pl = song_pools[pi]
         prev_bound = (song_runs[r_i - 1][-1]["end"] + 0.5) if r_i > 0 else first_onset
         next_bound = (song_runs[r_i + 1][0]["start"] - 0.5) if (r_i + 1 < len(song_runs)) else total_sec_est
 
-        # 1) Leading lines recovery (0 .. first_idx - 1) if continuous vocals precede the first anchor!
+        # 1) Leading lines recovery (0 .. first_idx - 1) walking BACKWARD across contiguous singing
+        #    (stops at >8s silent intro/host breaks so Verse 1 never gets pulled into TV intro chatter!)
         first_item = run[0]
         first_idx = first_item["_idx"]
         if first_idx > 0 and first_item["start"] - prev_bound >= 2.0:
             lead_n = first_idx
             max_lead_window = min(first_item["start"] - prev_bound, max(12.0, lead_n * 5.2))
             win_s = max(prev_bound, first_item["start"] - max_lead_window)
-            act_sec, v_first, _ = _active_vocal_span(win_s, first_item["start"])
+            act_sec, v_first, _ = _contiguous_vocal_span(
+                db_profile, step_sec, gap_thr, win_s, first_item["start"], direction="backward", max_silent_gap=8.0
+            )
             if act_sec >= max(1.2, 0.75 * lead_n):
                 span_s = max(prev_bound, v_first)
                 span_e = first_item["start"]
@@ -1718,14 +1878,17 @@ def _live_section_anchored_align(
                                 "sim": 0.0,
                             })
 
-        # 3) Trailing lines recovery (last_idx + 1 .. len(pl) - 1) if continuous vocals follow the last anchor!
+        # 3) Trailing lines recovery (last_idx + 1 .. len(pl) - 1) walking FORWARD across contiguous singing
+        #    (stops at >8s silent break so post-song MC banter / applause never steals the outro!)
         last_item = run[-1]
         last_idx = last_item["_idx"]
         if 0 <= last_idx < len(pl) - 1 and next_bound - last_item["end"] >= 2.0:
             trail_n = len(pl) - 1 - last_idx
             max_trail_window = min(next_bound - last_item["end"], max(12.0, trail_n * 5.2))
             win_e = min(next_bound, last_item["end"] + max_trail_window)
-            act_sec, _, v_last = _active_vocal_span(last_item["end"], win_e)
+            act_sec, _, v_last = _contiguous_vocal_span(
+                db_profile, step_sec, gap_thr, last_item["end"], win_e, direction="forward", max_silent_gap=8.0
+            )
             if act_sec >= max(1.2, 0.75 * trail_n):
                 span_s = last_item["end"]
                 span_e = min(next_bound, v_last)
@@ -2521,17 +2684,24 @@ def main() -> int:
                     update("finalizing", 98, "載入歌詞中...")
                     return 0
 
-        # Layer 2B: Automatic Shazam audio fingerprinting for Mashups/Medleys OR videos whose title has no song name!
+        # Layer 2B: Automatic Shazam audio fingerprinting ONLY when title did NOT already resolve a multi-song set!
+        # Never overwrite multi_song_pools' official_lines with flat Shazam strings (prevents split-brain pool mismatch).
         shazam_tried = False
         shazam_tracks: list[dict] = []
-        if is_mashup_title or not official_lines:
+        if (is_mashup_title and len(multi_song_pools) < 2) or not official_lines:
             update("running", 35, "辨識歌曲中...")
             shazam_tried = True
             shz_lines, shazam_tracks = shazam_scan_and_fetch_lyrics(
                 audio_16k, db_profile, step_sec, inst_path=inst_path, scan_mashup=is_mashup_title
             )
             if shz_lines:
-                official_lines = shz_lines
+                shz_pools = [tr["official_lines"] for tr in shazam_tracks if tr.get("official_lines")]
+                if shz_pools:
+                    multi_song_pools = shz_pools
+                    official_lines = [ln for p in shz_pools for ln in p]
+                else:
+                    multi_song_pools = []
+                    official_lines = shz_lines
 
         # Layer 3A (BEST): 2-Stage Forced Alignment of 100% REAL official lyrics!
         # Stage 1: stable-ts global scaffold (handles repeated choruses, live skipped verses, mashups).

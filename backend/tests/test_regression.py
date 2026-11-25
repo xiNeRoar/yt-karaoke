@@ -153,6 +153,7 @@ def test_worker_and_separator_invariants() -> None:
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
     assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map)" in lw_src, "Must pass real db_profile + time_map to detect unaligned Song #2 / encores!"
+    assert "if (is_mashup_title and len(multi_song_pools) < 2) or not official_lines:" in lw_src, "Must never overwrite resolved multi_song_pools with split-brain Shazam strings!"
     assert "async with Shazam() as shazam:" in lw_src, "Shazam probes must close aiohttp ClientSession via async context manager"
     # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
@@ -356,6 +357,47 @@ def test_silence_collapse_and_mapping() -> None:
     print("[PASS] Silence collapse & piecewise real-time mapping across instrumental breaks")
 
 
+def test_monotonic_anchor_consensus_and_contiguous_span() -> None:
+    import numpy as np
+    import lyrics_worker as lw
+
+    # 1) Weighted Monotonic Anchor Consensus: a spurious Verse-1 match to Outro line #60 before genuine lines 16..20
+    #    PLUS an isolated spurious jump to line #5 at the end MUST be pruned while genuine anchors stay intact!
+    pool = [f"Line {i:02d}" for i in range(66)]
+    noisy_run = [
+        {"start": 52.5, "end": 55.6, "text": "Line 60", "sim": 0.42},  # spurious early outlier!
+        {"start": 55.7, "end": 57.5, "text": "Line 16", "sim": 0.78},
+        {"start": 57.6, "end": 59.2, "text": "Line 17", "sim": 0.80},
+        {"start": 59.3, "end": 62.7, "text": "Line 18", "sim": 0.85},
+        {"start": 62.8, "end": 64.3, "text": "Line 19", "sim": 0.82},
+        {"start": 195.0, "end": 197.5, "text": "Line 60", "sim": 0.72},
+        {"start": 198.0, "end": 200.5, "text": "Line 62", "sim": 0.75},
+        {"start": 201.0, "end": 202.0, "text": "Line 05", "sim": 0.40},  # spurious outro outlier!
+    ]
+    runs = lw._select_monotonic_run_anchors(noisy_run, pool)
+    assert len(runs) == 1, f"Expected 1 clean monotonic run, got {len(runs)}"
+    idxs = [it["_idx"] for it in runs[0]]
+    assert idxs == [16, 17, 18, 19, 60, 62], f"Outliers not pruned cleanly: {idxs}"
+
+    # 2) Genuine live encore repeat (>= 3 consecutive forward anchors after primary song) MUST be preserved!
+    encore_run = noisy_run[:-1] + [
+        {"start": 215.0, "end": 218.0, "text": "Line 17", "sim": 0.82},
+        {"start": 218.1, "end": 221.0, "text": "Line 18", "sim": 0.85},
+        {"start": 221.1, "end": 224.0, "text": "Line 19", "sim": 0.84},
+    ]
+    runs2 = lw._select_monotonic_run_anchors(encore_run, pool)
+    assert len(runs2) == 2 and [it["_idx"] for it in runs2[1]] == [17, 18, 19], f"Genuine encore lost: {runs2}"
+
+    # 3) Gap-bounded backward vocal span: TV host intro at 0..4s separated by 24s silence from Verse 1 at 28..55s
+    #    MUST stop at 28.0s and NEVER pull Verse 1 back into 0..4s host chatter!
+    db = np.full(600, -75.0, dtype=np.float32)  # 60s @ 0.1s/step
+    db[5:35] = -28.0     # TV host intro / applause 0.5s..3.5s
+    db[280:555] = -26.0  # Real Verse 1 singing 28.0s..55.5s
+    act_s, v_first, v_last = lw._contiguous_vocal_span(db, 0.1, -50.0, 0.0, 55.5, direction="backward", max_silent_gap=8.0)
+    assert 27.5 <= v_first <= 28.5 and act_s >= 25.0, f"Backward span leaked into host intro: act={act_s}, v_first={v_first}"
+    print("[PASS] Monotonic anchor consensus (outlier pruning + encore preservation) & gap-bounded vocal span")
+
+
 def test_sidecar_watcher_cp1252_safety() -> None:
     if not WATCHER.exists():
         print("[SKIP] watcher.py not installed")
@@ -395,6 +437,7 @@ def main() -> int:
     test_generic_title_decomposition()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
+    test_monotonic_anchor_consensus_and_contiguous_span()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()
     print("\nALL REGRESSION TESTS PASSED!")
