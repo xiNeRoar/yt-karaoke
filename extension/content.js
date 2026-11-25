@@ -743,6 +743,7 @@
 
     state.active = false;
     state.busy = false;
+    state.lyricsLines = [];
     disableLyricsOverlay();
     updateUI();
   }
@@ -976,20 +977,22 @@
       }
 
       // Slice word timestamps (or proportional timing) cleanly across every split KTV sub-line
-      const totalChars = Math.max(1, subTexts.reduce((acc, s) => acc + nonSpaceLen(s), 0));
+      // Compare alphanumeric/CJK content chars only so stripped punctuation in aligner tokens never skews split boundaries!
+      const contentLen = (s) => (s || "").replace(/[\s\p{P}\p{S}]+/gu, "").length;
+      const totalChars = Math.max(1, subTexts.reduce((acc, s) => acc + Math.max(1, contentLen(s) || nonSpaceLen(s)), 0));
       let wordIdx = 0;
       let elapsedChars = 0;
 
       for (let si = 0; si < subTexts.length; si++) {
         const stxt = subTexts[si];
-        const need = Math.max(1, nonSpaceLen(stxt));
+        const need = Math.max(1, contentLen(stxt) || nonSpaceLen(stxt));
         const subWords = [];
 
         if (words.length > 0 && wordIdx < words.length) {
           let collected = 0;
           while (wordIdx < words.length && (si === subTexts.length - 1 || collected < need)) {
             const w = words[wordIdx];
-            const wlen = Math.max(1, nonSpaceLen(w.word || ""));
+            const wlen = Math.max(1, contentLen(w.word || "") || nonSpaceLen(w.word || ""));
             if (si < subTexts.length - 1 && subWords.length > 0 && collected + wlen > need + 1) {
               break;
             }
@@ -1136,7 +1139,10 @@
 
     const video = getVideoElement();
     if (!video) return;
-    const now = video.currentTime + state.lyricsOffsetSec;
+    // Lock lyrics clock to actual WebAudio playback position when karaoke audio is running
+    // (eliminates up to 140ms HTML5 video.currentTime quantization jitter & honors syncOffsetMs automatically!)
+    const baseTime = state.active && engine.isPlaying ? engine.getCurrentPosition() : video.currentTime;
+    const now = baseTime + state.lyricsOffsetSec;
 
     // Find current active line OR the upcoming line right before singing begins
     let activeIdx = -1;

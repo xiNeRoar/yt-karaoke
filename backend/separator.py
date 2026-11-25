@@ -1222,8 +1222,8 @@ class KaraokeSeparatorManager:
                     cmd,
                     cwd=str(BASE_DIR),
                     env=ly_env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
@@ -1235,10 +1235,10 @@ class KaraokeSeparatorManager:
                 dur_sec = float(meta.get("duration") or 0.0)
                 lyrics_timeout = max(240, min(900, int(dur_sec * 1.25)))
                 try:
-                    _, stderr_text = proc.communicate(timeout=lyrics_timeout)
+                    stderr_text, _ = proc.communicate(timeout=lyrics_timeout)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    _, stderr_text = proc.communicate()
+                    stderr_text, _ = proc.communicate()
                     self.log.error(
                         "Lyrics",
                         f"Worker timeout ({video_id}) after {lyrics_timeout}s | stderr: {(stderr_text or '')[-1500:]}",

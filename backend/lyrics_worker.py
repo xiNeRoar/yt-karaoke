@@ -54,7 +54,9 @@ HALLUCINATION_RE = re.compile(
 )
 GARBAGE_CHARS_RE = re.compile(r"[\ufffd\u0400-\u04FF]")  # Replacement char or Cyrillic hallucinations
 CREDIT_LINE_RE = re.compile(
-    r"^\s*(作[詞词]|作曲|[編编]曲|[監监]製|製作人|混音|錄音|和音|母帶|出品|發行|原唱|翻唱|演唱|詞|曲|編|監|OP|SP|Lyricist|Composer|Arranger|Producer)\s*[:：]",
+    r"^\s*(作[詞词]|作曲|[編编]曲|[監监]製|製作人|混音|錄音|和音|母帶|出品|發行|原唱|翻唱|演唱|詞|曲|編|監|OP|SP|"
+    r"Lyricist|Lyrics\s*by|Composer|Music\s*by|Arranger|Arranged\s*by|Producer|Executive\s*Producer|"
+    r"Mixed\s*by|Mixing|Mastered\s*by|Mastering|Vocal|Vocals|Guitar|Bass|Drums|Piano|Keyboard|Strings|Chorus|Recording|Studio)\s*[:：\-]",
     re.IGNORECASE,
 )
 
@@ -214,17 +216,21 @@ def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
 
 def parse_lrc(lrc_text: str) -> list[dict]:
     lines = []
-    pat = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)")
+    ts_re = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\]")
     for raw in lrc_text.splitlines():
-        m = pat.match(raw.strip())
-        if not m:
+        s_raw = raw.strip()
+        timestamps = ts_re.findall(s_raw)
+        if not timestamps:
             continue
-        mins = int(m.group(1))
-        secs = float(m.group(2))
-        text = m.group(3).strip()
+        # Strip ALL [mm:ss.xx] tags so multi-timestamp chorus lines ([00:52.1][02:05.3]Lyrics)
+        # expand cleanly into every sung occurrence with zero leftover bracket tags!
+        text = ts_re.sub("", s_raw).strip()
         if not text or CREDIT_LINE_RE.match(text):
             continue
-        lines.append({"start": round(mins * 60 + secs, 2), "end": 0.0, "text": to_hk_traditional(text), "words": []})
+        hk_text = to_hk_traditional(text)
+        for mins_s, secs_s in timestamps:
+            t_sec = round(int(mins_s) * 60 + float(secs_s), 2)
+            lines.append({"start": t_sec, "end": 0.0, "text": hk_text, "words": []})
 
     lines.sort(key=lambda x: x["start"])
     for i, item in enumerate(lines):
@@ -263,10 +269,10 @@ def detect_vocal_energy_profile(vocals_path: Path) -> tuple[np.ndarray, np.ndarr
         ])
         db = 20.0 * np.log10(rms + 1e-12)
         thr = _adaptive_vocal_threshold_db(db)
-        # Find first sustained vocal onset (> adaptive threshold for at least 0.2s)
+        # Find first sustained vocal onset (>= 0.4s active within a 0.6s window so 0.2s cough/click blips never trigger)
         first_onset = 0.0
-        for i in range(len(db) - 2):
-            if db[i] > thr and db[i + 1] > thr:
+        for i in range(max(0, len(db) - 6)):
+            if db[i] > thr and int(np.sum(db[i : i + 6] > thr)) >= 4:
                 first_onset = max(0.0, i * 0.1 - 0.15)
                 break
         return y.astype(np.float32), db, 0.1, first_onset
@@ -459,8 +465,8 @@ def fetch_official_lyrics(
                     best_source = "LRCLIB"
                     best_score = match_sc
 
-    # 2) Parallel NetEase Cloud Music fallback (massive Cantopop / Mandopop catalog)
-    if not best_lines and queries:
+    # 2) Parallel NetEase Cloud Music search (always run if LRCLIB had no strong exact artist+track match!)
+    if (not best_lines or best_score < 1.8) and queries:
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}
         ne_queries: list[str] = []
         for q in queries[:6]:
@@ -544,15 +550,40 @@ def _extract_bracketed_titles(title: str) -> list[str]:
 
 
 def fetch_multi_song_lyrics_from_title(title: str, duration: float) -> list[list[str]]:
-    """Generic multi-song lookup for long videos (>=5.3 min) containing >=2 bracketed titles
-    (e.g. CHILL CLUB 2-song sets, concert medleys like '《Song A》《Song B》').
-    Zero hardcoded blacklists: queries each quoted piece in parallel and deduplicates by lyric content.
+    """Generic multi-song lookup for long videos containing >=2 songs in the title —
+    works for BOTH bracketed titles ('《Song A》《Song B》') AND unbracketed multi-song titles
+    (e.g. '陳奕迅 今日 黑擇明', '陳奕迅-打回原型 防不勝防').
+    Zero hardcoded blacklists: queries each candidate piece in parallel and deduplicates by lyric content.
     """
-    if duration < 320.0 or not title:
+    if not title:
         return []
     pieces = _extract_bracketed_titles(title)
-    if len(pieces) < 2:
-        return []
+    if len(pieces) >= 2:
+        if duration > 0.0 and duration < 270.0:
+            return []
+        query_pieces = pieces[:6]
+    else:
+        # Unbracketed multi-song video (e.g. 8-min 2-song mashup/medley separated by spaces/slashes/dashes)
+        if duration < 320.0 and not MASHUP_KEYWORDS_RE.search(title):
+            return []
+        cleaned = clean_search_title(title)
+        raw_toks = [
+            t.strip()
+            for t in re.split(r"[\s/|｜+＋、,&]+|\s*[-—–]\s*", cleaned)
+            if len(t.strip()) >= 2 and not re.fullmatch(r"[\d.:-]+", t.strip())
+        ]
+        # Need at least 2 distinct title tokens to represent >=2 separate songs
+        if len(raw_toks) < 2:
+            return []
+        # If first token looks like an artist name and >=3 tokens exist (e.g. "陳奕迅 今日 黑擇明"),
+        # pair artist with each subsequent token so NetEase/LRCLIB disambiguates accurately!
+        query_pieces = []
+        artist_hint = raw_toks[0] if len(raw_toks) >= 3 else ""
+        for tok in raw_toks[1:] if artist_hint else raw_toks:
+            cand = f"{artist_hint} {tok}".strip() if artist_hint else tok
+            if cand not in query_pieces:
+                query_pieces.append(cand)
+        query_pieces = query_pieces[:6]
 
     def _lookup_one(piece: str) -> list[str]:
         try:
@@ -563,8 +594,8 @@ def fetch_multi_song_lyrics_from_title(title: str, duration: float) -> list[list
 
     pools: list[list[str]] = []
     seen_fps: set[str] = set()
-    with ThreadPoolExecutor(max_workers=min(4, len(pieces))) as ex:
-        results = list(ex.map(_lookup_one, pieces[:6]))
+    with ThreadPoolExecutor(max_workers=min(4, len(query_pieces))) as ex:
+        results = list(ex.map(_lookup_one, query_pieces))
     for lines in results:
         if not lines:
             continue
@@ -1150,7 +1181,13 @@ def refine_alignment_with_acoustics(
         i0_ln = max(0, int(s / step_sec))
         i1_ln = min(n_db, int(e / step_sec))
         if (e - s) > 3.5 and i1_ln > i0_ln:
-            raw_act = db_profile[i0_ln:i1_ln] > thr_db
+            seg_slice = db_profile[i0_ln:i1_ln]
+            # For anomalously stretched lines (> 8.0s), use a local dynamic floor (max of global thr and line_p90 - 16 dB)
+            # so faint reverb / crowd cheer / backing bleed during an interlude can NEVER hold a line open for 15-36s!
+            eff_ln_thr = thr_db
+            if (e - s) > 8.0 and len(seg_slice) >= 20:
+                eff_ln_thr = max(thr_db, float(np.percentile(seg_slice, 90)) - 16.0)
+            raw_act = seg_slice > eff_ln_thr
             # Keep only frames with at least one active neighbor (eliminates 100ms stray blips)
             if len(raw_act) >= 3:
                 sustained = raw_act.copy()
@@ -1163,14 +1200,14 @@ def refine_alignment_with_acoustics(
             else:
                 act_frames = np.flatnonzero(raw_act)
             if len(act_frames) > 0:
-                # If line still spans >8s with a >=4s internal dead gap, snap to the dominant active vocal island!
+                # If line still spans >8s with a >=2.5s internal dead gap, snap to the dominant active vocal island!
                 if (e - s) > 8.0 and len(act_frames) >= 2:
                     islands = []
                     st_f = int(act_frames[0])
                     pv_f = st_f
                     for af in act_frames[1:]:
                         af_i = int(af)
-                        if (af_i - pv_f) * step_sec >= 4.0:
+                        if (af_i - pv_f) * step_sec >= 2.5:
                             islands.append((st_f, pv_f))
                             st_f = af_i
                         pv_f = af_i
@@ -1228,6 +1265,28 @@ def refine_alignment_with_acoustics(
         ws = ln.get("words") or []
         if ws:
             ln["words"] = _smooth_bunched_words(ws, ln["start"], ln["end"], db_profile, step_sec)
+
+    # 4) Global structural post-invariants: ZERO line overlaps and ZERO out-of-bounds word timestamps!
+    for i in range(len(lines)):
+        if i + 1 < len(lines) and lines[i]["end"] > lines[i + 1]["start"]:
+            if lines[i + 1]["start"] >= lines[i]["start"] + 0.20:
+                lines[i]["end"] = round(lines[i + 1]["start"], 2)
+            else:
+                lines[i + 1]["start"] = round(lines[i]["end"], 2)
+                if lines[i + 1]["end"] < lines[i + 1]["start"] + 0.25:
+                    lines[i + 1]["end"] = round(lines[i + 1]["start"] + 0.25, 2)
+        ls, le = float(lines[i]["start"]), float(lines[i]["end"])
+        ws = lines[i].get("words") or []
+        if ws:
+            prev_we = ls
+            for wi, w in enumerate(ws):
+                ws_i = max(prev_we, min(le, float(w.get("start", ls))))
+                we_i = max(ws_i, min(le, float(w.get("end", ws_i))))
+                if wi == len(ws) - 1:
+                    we_i = le
+                w["start"] = round(ws_i, 2)
+                w["end"] = round(we_i, 2)
+                prev_we = we_i
 
     return lines
 
@@ -1403,23 +1462,32 @@ def _alignment_needs_live_rematch(
         return True, "empty"
 
     crushed = 0
+    tight_run = 0
+    max_tight_run = 0
     low_prob = 0
     prev_start = -1.0
     for seg in segs:
         txt = (seg.text or "").strip()
         n_chars = max(1, len(_norm_lyrics_cmp(txt)))
-        dur = float(seg.end) - float(seg.start)
-        if dur < max(0.45, 0.09 * n_chars) or (prev_start >= 0 and (float(seg.start) - prev_start) < 0.25):
+        rs = _map_comp_to_real(float(seg.start), time_map) if time_map else float(seg.start)
+        re_ = _map_comp_to_real(float(seg.end), time_map) if time_map else float(seg.end)
+        dur = re_ - rs
+        if dur < max(0.45, 0.09 * n_chars) or (prev_start >= 0 and (rs - prev_start) < 0.25):
             crushed += 1
-        prev_start = float(seg.start)
+        if n_chars >= 4 and dur < 0.55:
+            tight_run += 1
+            max_tight_run = max(max_tight_run, tight_run)
+        else:
+            tight_run = 0
+        prev_start = rs
         probs = [w.probability for w in (seg.words or []) if w.probability is not None]
         avg_p = (sum(probs) / len(probs)) if probs else 0.0
         if avg_p < 0.28:
             low_prob += 1
 
     low_ratio = low_prob / max(1, len(segs))
-    if crushed >= 2:
-        return True, f"crushed={crushed}"
+    if crushed >= 2 or max_tight_run >= 3:
+        return True, f"crushed={crushed},tight_run={max_tight_run}"
     if low_ratio >= 0.24:
         return True, f"low_prob={low_ratio:.2f}"
 
@@ -1442,6 +1510,94 @@ def _alignment_needs_live_rematch(
                 return True, f"unaligned_head={active_head_sec:.1f}s"
 
     return False, "ok"
+
+
+def _split_long_asr_segment(
+    s_real: float,
+    e_real: float,
+    txt: str,
+    words_mapped: list[dict],
+    lang: str,
+) -> list[dict]:
+    """Break overly long Whisper run-on segments (e.g. 25-40s / 60-char blobs from silence-collapsed audio)
+    into natural single-line ASR chunks using word-level pauses, punctuation, or breath ceilings.
+    Prevents giant ASR paragraphs from failing length-ratio checks against official lyric lines!
+    """
+    norm_len = len(_norm_lyrics_cmp(txt))
+    is_cjk = lang in ("zh", "yue", "ja")
+    max_chars = 14 if is_cjk else 42
+    if norm_len <= max_chars + 4 and (e_real - s_real) <= 6.5:
+        return [{"start": s_real, "end": e_real, "text": txt, "words": words_mapped}]
+
+    # 1) Preferred: split using Whisper word timestamps on natural pauses (>=0.22s), punctuation, or length ceiling
+    if words_mapped and len(words_mapped) >= 3:
+        chunks: list[dict] = []
+        cur_ws: list[dict] = []
+        cur_chars = 0
+        for w in words_mapped:
+            wt = (w.get("word") or "").strip()
+            if not wt:
+                continue
+            w_norm = len(_norm_lyrics_cmp(wt))
+            gap = (float(w["start"]) - float(cur_ws[-1]["end"])) if cur_ws else 0.0
+            cur_dur = (float(w["end"]) - float(cur_ws[0]["start"])) if cur_ws else 0.0
+            ends_punct = bool(cur_ws and re.search(r"[，。！？、,;!?]$", (cur_ws[-1].get("word") or "").strip()))
+            should_cut = bool(cur_ws) and (
+                (gap >= 0.28 and cur_chars >= 4)
+                or (ends_punct and cur_chars >= 5)
+                or (cur_chars + w_norm > max_chars and cur_chars >= 6)
+                or (cur_dur >= 5.2 and cur_chars >= 5)
+            )
+            if should_cut:
+                joiner = "" if is_cjk else " "
+                ct = joiner.join((x.get("word") or "").strip() for x in cur_ws).strip()
+                ct = to_hk_traditional(ct) if lang in ("zh", "yue") else ct
+                if ct:
+                    chunks.append({
+                        "start": float(cur_ws[0]["start"]),
+                        "end": max(float(cur_ws[0]["start"]) + 0.2, float(cur_ws[-1]["end"])),
+                        "text": ct,
+                        "words": list(cur_ws),
+                    })
+                cur_ws = [w]
+                cur_chars = w_norm
+            else:
+                cur_ws.append(w)
+                cur_chars += w_norm
+        if cur_ws:
+            joiner = "" if is_cjk else " "
+            ct = joiner.join((x.get("word") or "").strip() for x in cur_ws).strip()
+            ct = to_hk_traditional(ct) if lang in ("zh", "yue") else ct
+            if ct:
+                chunks.append({
+                    "start": float(cur_ws[0]["start"]),
+                    "end": max(float(cur_ws[0]["start"]) + 0.2, float(cur_ws[-1]["end"])),
+                    "text": ct,
+                    "words": list(cur_ws),
+                })
+        if chunks:
+            return chunks
+
+    # 2) Fallback when word timestamps are unavailable: proportional split on punctuation/spaces/max_chars
+    raw_parts = [p.strip() for p in re.split(r"[\s，。！？、,;!?]+", txt) if p.strip()]
+    parts: list[str] = []
+    for p in raw_parts:
+        if len(p) <= max_chars:
+            parts.append(p)
+        else:
+            for k in range(0, len(p), max_chars):
+                parts.append(p[k : k + max_chars])
+    if len(parts) <= 1:
+        return [{"start": s_real, "end": e_real, "text": txt, "words": words_mapped}]
+    total_c = max(1, sum(len(p) for p in parts))
+    dur = max(0.4, e_real - s_real)
+    cur_t = s_real
+    out: list[dict] = []
+    for p in parts:
+        dt = dur * (len(p) / total_c)
+        out.append({"start": round(cur_t, 2), "end": round(cur_t + dt, 2), "text": p, "words": []})
+        cur_t += dt
+    return out
 
 
 def _even_words_for_line(text: str, start_s: float, end_s: float) -> list[dict]:
@@ -1541,7 +1697,12 @@ def _live_section_anchored_align(
             continue
         if not segment_has_vocal_energy(db_profile, step_sec, s_real, e_real):
             continue
-        asr_segs.append({"start": s_real, "end": e_real, "text": txt})
+        for sub in _split_long_asr_segment(s_real, e_real, txt, words_mapped, lang):
+            sub_t = (sub.get("text") or "").strip()
+            if not sub_t or HALLUCINATION_RE.search(sub_t) or GARBAGE_CHARS_RE.search(sub_t):
+                continue
+            if segment_has_vocal_energy(db_profile, step_sec, sub["start"], sub["end"]):
+                asr_segs.append({"start": sub["start"], "end": sub["end"], "text": sub_t})
 
     if not asr_segs:
         return []
@@ -1724,11 +1885,21 @@ def _live_section_anchored_align(
     if not matched:
         return []
 
-    # Parody / Rewritten-lyrics detection: if < 35% of active singing segments STILL don't match any official lyrics,
-    # show what the singer ACTUALLY sang instead of forcing wrong lyrics!
-    if len(asr_segs) >= 6 and (matched_asr_count / len(asr_segs)) < 0.35:
+    # Parody / Rewritten-lyrics detection: ONLY fall back to raw ASR transcript if BOTH line match ratio < 35%
+    # AND character 3-gram overlap with official lyrics is genuinely low (< 35%) — prevents Whisper segment-boundary
+    # quirks from ever discarding real official lyrics and dumping raw ASR typos!
+    asr_blob = "".join(_norm_lyrics_cmp(s["text"]) for s in asr_segs)
+    off_blob = "".join(_norm_lyrics_cmp(ln) for ln in official_lines)
+    trigram_cov = 0.0
+    if len(asr_blob) >= 12 and len(off_blob) >= 12:
+        asr_3g = {asr_blob[k : k + 3] for k in range(len(asr_blob) - 2)}
+        off_3g = {off_blob[k : k + 3] for k in range(len(off_blob) - 2)}
+        if asr_3g:
+            trigram_cov = len(asr_3g & off_3g) / len(asr_3g)
+
+    if len(asr_segs) >= 6 and (matched_asr_count / len(asr_segs)) < 0.35 and trigram_cov < 0.35:
         print(
-            f"[Lyrics] Low official-lyrics match ({matched_asr_count}/{len(asr_segs)}); "
+            f"[Lyrics] Low official-lyrics match ({matched_asr_count}/{len(asr_segs)}, 3g={trigram_cov:.2f}); "
             "treating as rewritten/adapted lyrics and using actual sung transcript.",
             flush=True,
         )
@@ -1741,26 +1912,31 @@ def _live_section_anchored_align(
             s_start, s_end = float(s["start"]), float(s["end"])
             if s_end < first_onset or not segment_has_vocal_energy(db_profile, step_sec, s_start, s_end):
                 continue
-            words_out = []
-            for w in (s.get("words") or []):
-                wt = (w["word"] or "").strip()
-                if not wt or GARBAGE_CHARS_RE.search(wt):
+            # Always split long run-on transcript segments into single-line KTV chunks (never 30s walls of text!)
+            for sub in _split_long_asr_segment(s_start, s_end, txt, s.get("words") or [], lang):
+                stxt = (sub.get("text") or "").strip()
+                if not stxt or HALLUCINATION_RE.search(stxt) or GARBAGE_CHARS_RE.search(stxt):
                     continue
-                ws = round(max(first_onset, float(w["start"])), 3)
-                we = round(max(ws, float(w["end"])), 3)
-                words_out.append({
-                    "start": ws,
-                    "end": we,
-                    "word": to_hk_traditional(wt) if lang == "zh" else wt,
+                words_out = []
+                for w in (sub.get("words") or []):
+                    wt = (w["word"] or "").strip()
+                    if not wt or GARBAGE_CHARS_RE.search(wt):
+                        continue
+                    ws = round(max(first_onset, float(w["start"])), 3)
+                    we = round(max(ws, float(w["end"])), 3)
+                    words_out.append({
+                        "start": ws,
+                        "end": we,
+                        "word": to_hk_traditional(wt) if lang == "zh" else wt,
+                    })
+                s_clamped = round(max(first_onset, float(sub["start"])), 2)
+                e_clamped = round(max(s_clamped + 0.4, float(sub["end"])), 2)
+                direct_lines.append({
+                    "start": s_clamped,
+                    "end": e_clamped,
+                    "text": stxt,
+                    "words": words_out or _even_words_for_line(stxt, s_clamped, e_clamped),
                 })
-            s_clamped = round(max(first_onset, s_start), 2)
-            e_clamped = round(max(s_clamped + 0.4, s_end), 2)
-            direct_lines.append({
-                "start": s_clamped,
-                "end": e_clamped,
-                "text": txt,
-                "words": words_out or _even_words_for_line(txt, s_clamped, e_clamped),
-            })
         audio_dur = (len(audio_16k) / 16000.0) if len(audio_16k) > 0 else 0.0
         return refine_alignment_with_acoustics(direct_lines, db_profile, step_sec, audio_dur, first_onset)
 
@@ -2061,12 +2237,14 @@ def refine_lines_with_qwen3(
 
     audio_dur = len(audio_16k) / 16000.0
 
-    # Group lines into ~45-60s windows so no repeated chorus appears in the same window
+    # Group lines into clean ~45-55s windows AND ALWAYS split at instrumental interludes (>= 4.0s gap)
+    # so Qwen3-ForcedAligner NEVER sees a 20-35s instrumental break inside a window (eliminates stretched ghost lines!)
     windows: list[list[int]] = []
     cur_win: list[int] = []
     win_start = float(lines[0]["start"])
     for idx, ln in enumerate(lines):
-        if cur_win and (float(ln["end"]) - win_start > 55.0 or len(cur_win) >= 14):
+        prev_gap = (float(ln["start"]) - float(lines[cur_win[-1]]["end"])) if cur_win else 0.0
+        if cur_win and (prev_gap >= 4.0 or float(ln["end"]) - win_start > 55.0 or len(cur_win) >= 14):
             windows.append(cur_win)
             cur_win = [idx]
             win_start = float(ln["start"])
@@ -2131,10 +2309,11 @@ def refine_lines_with_qwen3(
             if not items or len(items) != expected_n:
                 continue
 
-            # Build candidate refined lines for this window and sanity-check before committing
+            # Build candidate refined lines for this window with strict per-line collapse & stretch guards
             cand_updates: list[tuple[int, dict]] = []
             cursor = 0
             squished = 0
+            exploded = 0
             for idx, txt, n_tok in valid_pairs:
                 tok_slice = items[cursor: cursor + n_tok]
                 cursor += n_tok
@@ -2142,8 +2321,18 @@ def refine_lines_with_qwen3(
                     continue
                 local_s = float(tok_slice[0].start_time)
                 local_e = float(tok_slice[-1].end_time)
-                if (local_e - local_s) <= 0.22 and n_tok >= 4:
+                q_dur = local_e - local_s
+                n_chars = max(1, len(_norm_lyrics_cmp(txt)))
+                orig_dur = max(0.35, float(lines[idx]["end"]) - float(lines[idx]["start"]))
+                is_squished = q_dur <= max(0.18, 0.04 * n_chars)
+                is_exploded = q_dur > max(9.5, orig_dur * 2.2)
+                if is_squished:
                     squished += 1
+                if is_exploded:
+                    exploded += 1
+                # Per-line protection: never replace a healthy Stage-1 line with a Qwen3 collapse or interlude blow-up!
+                if (is_squished and orig_dur >= 0.65) or is_exploded:
+                    continue
                 abs_s = round(max(first_onset, w_t0 + local_s), 2)
                 abs_e = round(max(abs_s + 0.35, w_t0 + local_e), 2)
                 words_out = []
@@ -2151,12 +2340,12 @@ def refine_lines_with_qwen3(
                     wt = (it.text or "").strip()
                     if not wt:
                         continue
-                    ws = round(max(abs_s, w_t0 + float(it.start_time)), 3)
-                    we = round(max(ws, w_t0 + float(it.end_time)), 3)
+                    ws = round(max(abs_s, min(abs_e, w_t0 + float(it.start_time))), 3)
+                    we = round(max(ws, min(abs_e, w_t0 + float(it.end_time))), 3)
                     words_out.append({"start": ws, "end": we, "word": wt})
                 cand_updates.append((idx, {"start": abs_s, "end": abs_e, "text": txt, "words": words_out}))
 
-            if cand_updates and (squished / len(cand_updates)) <= 0.25:
+            if cand_updates and (squished / max(1, len(valid_pairs))) <= 0.15 and exploded == 0:
                 for idx, upd in cand_updates:
                     refined[idx] = upd
                 refined_windows += 1
@@ -2170,13 +2359,14 @@ def refine_lines_with_qwen3(
         if refined_windows == 0 or (require_all_windows and refined_windows < len(windows)):
             return lines, False
 
-        # Ensure strict monotonic non-overlapping line boundaries across window edges
+        # Ensure strict monotonic NON-OVERLAPPING line boundaries across window edges (zero 0.05s staircase overlaps!)
         for i in range(1, len(refined)):
             if refined[i]["start"] < refined[i - 1]["end"]:
                 mid = round((refined[i - 1]["end"] + refined[i]["start"]) / 2.0, 2)
-                refined[i - 1]["end"] = max(refined[i - 1]["start"] + 0.3, mid)
-                refined[i]["start"] = max(refined[i - 1]["end"], refined[i]["start"])
-                refined[i]["end"] = max(refined[i]["start"] + 0.35, refined[i]["end"])
+                new_prev_e = max(round(refined[i - 1]["start"] + 0.25, 2), mid)
+                refined[i - 1]["end"] = new_prev_e
+                refined[i]["start"] = max(new_prev_e, refined[i]["start"])
+                refined[i]["end"] = max(round(refined[i]["start"] + 0.30, 2), refined[i]["end"])
 
         refined = refine_alignment_with_acoustics(refined, db_profile, step_sec, audio_dur, first_onset)
         print(f"[Lyrics] Qwen3-ForcedAligner refined {refined_windows}/{len(windows)} windows ({len(refined)} lines)", file=sys.stderr, flush=True)
@@ -2655,11 +2845,21 @@ def main() -> int:
         )
 
         # Fast-path acoustic alignment when we have studio LRC scaffold + free GPU VRAM (~2.5s total with Qwen3!):
-        # Auto-compensate MV-vs-Spotify intro offset using detected first_onset before running windowed Qwen3 refinement.
+        # Auto-compensate MV-vs-Spotify intro offset AND verify full vocal coverage (blocks single-song LRC
+        # from hijacking an unbracketed 2-song video like "陳奕迅 今日 黑擇明"!).
         if lrc_synced and not force_ai and len(lrc_synced) >= 4 and len(audio_16k) > 0:
             shift = first_onset - float(lrc_synced[0]["start"])
-            if abs(shift) <= 12.0:
-                audio_dur = len(audio_16k) / 16000.0
+            audio_dur = len(audio_16k) / 16000.0
+            lrc_tail_end = float(lrc_synced[-1]["end"]) + (shift if abs(shift) > 0.6 else 0.0)
+            lrc_covers_audio = True
+            if len(db_profile) > 0 and step_sec > 0:
+                cov_thr = _adaptive_vocal_threshold_db(db_profile, margin_db=2.0)
+                t_idx = int((lrc_tail_end + 4.0) / step_sec)
+                if t_idx < len(db_profile):
+                    uncov_tail = float(np.sum(db_profile[t_idx:] > cov_thr)) * step_sec
+                    if uncov_tail >= 18.0:
+                        lrc_covers_audio = False
+            if abs(shift) <= 12.0 and lrc_covers_audio:
                 shifted_lrc = []
                 for ln in lrc_synced:
                     ns = max(0.0, round(float(ln["start"]) + (shift if abs(shift) > 0.6 else 0.0), 2))

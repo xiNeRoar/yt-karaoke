@@ -87,7 +87,7 @@ class GatewayState:
         self._lyrics_missing: "OrderedDict[str, float]" = OrderedDict()
         self._lyrics_missing_max = 2000
         self._lyrics_refreshing: dict[str, float] = {}
-        self._lyrics_refresh_ttl = 300.0
+        self._lyrics_refresh_ttl = 900.0
         self._clients: dict[str, dict] = {}
         self._rate_hist: dict[str, list[float]] = {}
         self._activate_rate_hist: dict[str, list[float]] = {}

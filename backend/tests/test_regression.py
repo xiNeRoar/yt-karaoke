@@ -154,7 +154,13 @@ def test_worker_and_separator_invariants() -> None:
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
     assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map)" in lw_src, "Must pass real db_profile + time_map to detect unaligned Song #2 / encores!"
     assert "if (is_mashup_title and len(multi_song_pools) < 2) or not official_lines:" in lw_src, "Must never overwrite resolved multi_song_pools with split-brain Shazam strings!"
+    assert "prev_gap >= 4.0" in lw_src, "Qwen3 windows must split at instrumental interludes (>=4s) to prevent stretched ghost lines!"
+    assert "lrc_covers_audio" in lw_src, "LRC fast-path must verify full vocal coverage so single-song LRC never hijacks multi-song videos!"
     assert "async with Shazam() as shazam:" in lw_src, "Shazam probes must close aiohttp ClientSession via async context manager"
+    # Frontend structural invariants
+    ct_src = (EXTENSION / "content.js").read_text(encoding="utf-8")
+    assert "engine.getCurrentPosition()" in ct_src and "state.active && engine.isPlaying" in ct_src, "Lyrics clock must lock to WebAudio playback position!"
+    assert "state.lyricsLines = [];" in ct_src, "Deactivating karaoke must clear cached lyricsLines so reopening fetches fresh server lyrics!"
     # 6) 24/7 bounded memory & stream-safety invariants across PC backend + NAS gateway
     assert "OrderedDict" in sep_src and "_lyrics_mem_max" in sep_src, "Backend lyrics cache must be bounded LRU"
     assert "OrderedDict" in gw_src and "_lyrics_ram_max" in gw_src, "Gateway lyrics cache must be bounded LRU"
@@ -398,6 +404,48 @@ def test_monotonic_anchor_consensus_and_contiguous_span() -> None:
     print("[PASS] Monotonic anchor consensus (outlier pruning + encore preservation) & gap-bounded vocal span")
 
 
+def test_lrc_multi_timestamp_and_asr_splitting_and_invariants() -> None:
+    import numpy as np
+    import lyrics_worker as lw
+
+    # 1) Multi-timestamp LRC lines ([00:52.10][02:05.30]Chorus) MUST expand into all occurrences with zero leftover tags!
+    raw_lrc = "[00:10.00]作詞：黃偉文\n[00:15.00]Lyrics by: Someone\n[00:20.00][01:40.50]曾話我愛你 我願愛到死\n[00:25.00]用盡力沒頭沒腦似鬼魅\n"
+    parsed = lw.parse_lrc(raw_lrc)
+    assert len(parsed) == 3, f"Expected 3 expanded LRC lines (credits stripped), got {parsed}"
+    assert parsed[0]["start"] == 20.0 and parsed[2]["start"] == 100.5
+    assert "[" not in parsed[0]["text"] and "]" not in parsed[2]["text"]
+
+    # 2) Giant 35s Whisper run-on segment MUST split into natural single-line ASR chunks so official matching never fails!
+    words = []
+    t = 33.5
+    text_blob = "該怎麼初次約會實在極費思量起初先推我兩次讓我檢驗正常再若便說好以禮數換你掌上找一間小店吃飯浪漫大戲開場"
+    for ch in text_blob:
+        words.append({"word": ch, "start": round(t, 2), "end": round(t + 0.35, 2)})
+        t += 0.35
+    chunks = lw._split_long_asr_segment(33.5, t, text_blob, words, "zh")
+    assert len(chunks) >= 3, f"Run-on Whisper blob was not split: {len(chunks)}"
+    assert all(len(c["text"]) <= 18 for c in chunks), f"Chunk still too long: {[len(c['text']) for c in chunks]}"
+
+    # 3) Zero-overlap & zero-word-OOB post-invariants + local-floor trim of reverb-bleed 22s line!
+    db = np.full(300, -70.0, dtype=np.float32)  # 30s @ 0.1s/step
+    db[20:55] = -14.0    # strong real singing 2.0s..5.5s
+    db[55:240] = -42.0   # soft reverb/crowd bleed (above global thr ~ -53 dB, but 28 dB below singing!)
+    db[245:280] = -15.0  # next verse singing 24.5s..28.0s
+    bad_lines = [
+        {"start": 2.0, "end": 24.0, "text": "很想花光氣力捉緊你", "words": [{"word": "很", "start": 1.8, "end": 3.0}, {"word": "你", "start": 3.0, "end": 24.5}]},
+        {"start": 24.4, "end": 24.75, "text": "開始感激", "words": [{"word": "開", "start": 24.4, "end": 24.9}]},
+        {"start": 24.70, "end": 28.0, "text": "過活太好", "words": [{"word": "過", "start": 24.70, "end": 28.2}]},
+    ]
+    clean = lw.refine_alignment_with_acoustics(bad_lines, db, 0.1, 30.0, 0.0)
+    assert (clean[0]["end"] - clean[0]["start"]) < 7.0, f"22s reverb-bleed ghost line not trimmed: {clean[0]}"
+    for i in range(len(clean)):
+        if i + 1 < len(clean):
+            assert clean[i]["end"] <= clean[i + 1]["start"] + 1e-6, f"Overlap at {i}: {clean[i]} vs {clean[i+1]}"
+        for w in clean[i]["words"]:
+            assert clean[i]["start"] - 1e-6 <= w["start"] <= w["end"] <= clean[i]["end"] + 1e-6, f"WORD_OOB at {i}: {w} vs {clean[i]}"
+    print("[PASS] Multi-timestamp LRC, Whisper run-on splitting, reverb-bleed trim, zero-overlap & zero-WORD_OOB invariants")
+
+
 def test_sidecar_watcher_cp1252_safety() -> None:
     if not WATCHER.exists():
         print("[SKIP] watcher.py not installed")
@@ -438,6 +486,7 @@ def main() -> int:
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()
+    test_lrc_multi_timestamp_and_asr_splitting_and_invariants()
     test_sidecar_watcher_cp1252_safety()
     test_live_endpoints_if_running()
     print("\nALL REGRESSION TESTS PASSED!")
