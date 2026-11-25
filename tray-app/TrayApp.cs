@@ -196,10 +196,12 @@ namespace YtKaraokeTray
 
         // UI
         private Label _lblStatusPill;
+        private Button _btnCheckUpdate;
         private Button _btnToggleServer;
         private Button _btnManageInvites;
         private Button _btnAutoUpdateExt;
         private Button _btnYoutubeAuth;
+        private bool _updateInFlight = false;
         private Label _lblUsersNum;
         private Label _lblUsersSub;
         private Label _lblCacheNum;
@@ -274,7 +276,11 @@ namespace YtKaraokeTray
             this.Shown += async (s, e) =>
             {
                 await PollAllAsync();
-                if (!_backendOnline) StartBackend();
+                if (!_backendOnline)
+                {
+                    await AutoSyncOnStartupAsync();
+                    StartBackend();
+                }
             };
         }
 
@@ -348,6 +354,11 @@ namespace YtKaraokeTray
                 Location = new Point(S(pad), S(14)),
                 AutoSize = true
             });
+
+            _btnCheckUpdate = MakeButton("檢查 GitHub 更新", pad + w - 96 - 148, 16, 140, 30, BtnNeutral, TextPrimary);
+            _btnCheckUpdate.Font = new Font("Microsoft JhengHei UI", 9.2f, FontStyle.Bold);
+            _btnCheckUpdate.Click += async (s, e) => await CheckAndApplyGitHubUpdateAsync();
+            Controls.Add(_btnCheckUpdate);
 
             _lblStatusPill = new Label
             {
@@ -632,6 +643,7 @@ namespace YtKaraokeTray
             _trayMenu.Items.Add(_trayPauseItem);
 
             _trayMenu.Items.Add(new ToolStripMenuItem("一鍵自動更新 Chrome 插件", null, async (s, e) => await TriggerAutoReloadExtensionAsync()));
+            _trayMenu.Items.Add(new ToolStripMenuItem("從 GitHub 拉取更新並重啟", null, async (s, e) => await CheckAndApplyGitHubUpdateAsync()));
             _trayMenu.Items.Add(new ToolStripMenuItem("YouTube 登入驗證（專用 Firefox）", null, async (s, e) => await OpenYouTubeFirefoxAuthAsync()));
 
             _trayMenu.Items.Add(new ToolStripSeparator());
@@ -1133,6 +1145,259 @@ namespace YtKaraokeTray
             await Task.Delay(1500);
             _btnAutoUpdateExt.Text = "更新 Chrome 插件";
             _btnAutoUpdateExt.Enabled = true;
+        }
+
+        private string FindGitExe()
+        {
+            string[] candidates =
+            {
+                @"C:\Program Files\Git\cmd\git.exe",
+                @"C:\Program Files (x86)\Git\cmd\git.exe",
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Programs\Git\cmd\git.exe")
+            };
+            foreach (var c in candidates)
+            {
+                if (File.Exists(c)) return c;
+            }
+            return "git";
+        }
+
+        private bool RunGitCommand(string gitExe, string args, int timeoutMs, out string stdout, out string stderr)
+        {
+            stdout = "";
+            stderr = "";
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = gitExe,
+                    Arguments = args,
+                    WorkingDirectory = ProjectRoot,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8
+                };
+                psi.EnvironmentVariables["GIT_TERMINAL_PROMPT"] = "0";
+                using (var p = Process.Start(psi))
+                {
+                    if (p == null) return false;
+                    var outTask = p.StandardOutput.ReadToEndAsync();
+                    var errTask = p.StandardError.ReadToEndAsync();
+                    if (!p.WaitForExit(timeoutMs))
+                    {
+                        try { p.Kill(); } catch { }
+                        stderr = "git timed out";
+                        return false;
+                    }
+                    stdout = (outTask.Wait(1000) ? outTask.Result : "").Trim();
+                    stderr = (errTask.Wait(1000) ? errTask.Result : "").Trim();
+                    return p.ExitCode == 0;
+                }
+            }
+            catch (Exception ex)
+            {
+                stderr = ex.Message;
+                return false;
+            }
+        }
+
+        private sealed class GitSyncResult
+        {
+            public bool Ok;
+            public bool Updated;
+            public bool TrayAppChanged;
+            public string BeforeSha;
+            public string AfterSha;
+            public string Detail;
+        }
+
+        private Task<GitSyncResult> SyncRepoFromGitHubAsync()
+        {
+            return Task.Run(() =>
+            {
+                var res = new GitSyncResult();
+                try
+                {
+                    if (!Directory.Exists(Path.Combine(ProjectRoot, ".git")))
+                    {
+                        res.Detail = "非 Git 專案資料夾，略過自動更新";
+                        return res;
+                    }
+                    string gitExe = FindGitExe();
+                    string outTxt, errTxt;
+                    if (!RunGitCommand(gitExe, "rev-parse --short HEAD", 4000, out outTxt, out errTxt))
+                    {
+                        res.Detail = "搵唔到 git 或無法讀取版本：" + errTxt;
+                        return res;
+                    }
+                    res.BeforeSha = outTxt;
+
+                    if (!RunGitCommand(gitExe, "pull --ff-only origin main", 15000, out outTxt, out errTxt))
+                    {
+                        res.Detail = string.IsNullOrEmpty(errTxt) ? outTxt : errTxt;
+                        return res;
+                    }
+
+                    string afterSha, errAfter;
+                    RunGitCommand(gitExe, "rev-parse --short HEAD", 4000, out afterSha, out errAfter);
+                    res.AfterSha = afterSha;
+                    res.Ok = true;
+                    res.Updated = !string.IsNullOrEmpty(res.BeforeSha) && !string.IsNullOrEmpty(res.AfterSha)
+                                  && !string.Equals(res.BeforeSha, res.AfterSha, StringComparison.OrdinalIgnoreCase);
+                    res.Detail = outTxt;
+
+                    if (res.Updated)
+                    {
+                        string diffOut, diffErr;
+                        if (RunGitCommand(gitExe, "diff --name-only " + res.BeforeSha + " " + res.AfterSha, 4000, out diffOut, out diffErr))
+                        {
+                            res.TrayAppChanged = diffOut.IndexOf("tray-app/TrayApp.cs", StringComparison.OrdinalIgnoreCase) >= 0;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    res.Detail = ex.Message;
+                }
+                return res;
+            });
+        }
+
+        private async Task AutoSyncOnStartupAsync()
+        {
+            if (_updateInFlight) return;
+            _updateInFlight = true;
+            try
+            {
+                if (_lblStatusPill != null && !IsDisposed)
+                {
+                    _lblStatusPill.Text = "更新檢查";
+                    _lblStatusPill.BackColor = BtnNeutral;
+                }
+                if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Enabled = false;
+                AppendLog("[Update] Checking GitHub (origin/main) before starting backend...");
+                var res = await SyncRepoFromGitHubAsync();
+                if (res.Ok && res.Updated)
+                {
+                    AppendLog("[Update] Pulled latest GitHub commit (" + res.BeforeSha + " -> " + res.AfterSha + ").");
+                }
+                else if (res.Ok)
+                {
+                    AppendLog("[Update] Already up to date (" + res.AfterSha + ").");
+                }
+                else
+                {
+                    AppendLog("[Update] Skipped auto-update: " + res.Detail);
+                }
+            }
+            finally
+            {
+                _updateInFlight = false;
+                if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Enabled = true;
+            }
+        }
+
+        private async Task CheckAndApplyGitHubUpdateAsync()
+        {
+            if (_updateInFlight) return;
+            _updateInFlight = true;
+            if (_btnCheckUpdate != null && !IsDisposed)
+            {
+                _btnCheckUpdate.Enabled = false;
+                _btnCheckUpdate.Text = "拉取更新中...";
+            }
+            try
+            {
+                AppendLog("[Update] Pulling latest code from GitHub (origin/main)...");
+                var res = await SyncRepoFromGitHubAsync();
+                if (!res.Ok)
+                {
+                    AppendLog("[Update] Pull failed: " + res.Detail);
+                    if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Text = "更新失敗";
+                    MessageBox.Show("無法自動從 GitHub 拉取更新（可能冇網絡或本地有未提交改動）：\n\n" + res.Detail, "檢查更新", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                if (!res.Updated)
+                {
+                    AppendLog("[Update] Already on latest commit (" + res.AfterSha + ").");
+                    if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Text = "已是最新版 ✓";
+                    await Task.Delay(1800);
+                    return;
+                }
+
+                AppendLog("[Update] Updated local repo (" + res.BeforeSha + " -> " + res.AfterSha + ").");
+                bool shouldRestart = _backendOnline || _starting;
+                if (shouldRestart)
+                {
+                    // Respect active singing before restarting the local PC backend
+                    int activeSinging = 0;
+                    int queueCount = 0;
+                    try
+                    {
+                        string healthJson = await HttpRequestAsync("GET", "/api/health", null, 2000, false);
+                        if (!string.IsNullOrEmpty(healthJson))
+                        {
+                            var hd = _json.Deserialize<Dictionary<string, object>>(healthJson);
+                            if (hd != null)
+                            {
+                                activeSinging = GetInt(hd, "active_singing", 0);
+                                queueCount = GetInt(hd, "queue_count", 0);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (activeSinging > 0 || queueCount > 0)
+                    {
+                        var dr = MessageBox.Show(
+                            "已拉取最新版本 (" + res.AfterSha + ")！\n目前有 " + activeSinging + " 人唱緊 K / " + queueCount + " 首排隊中，要即時重啟後端定等唱完先？",
+                            "確認重啟後端",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question
+                        );
+                        if (dr != DialogResult.Yes)
+                        {
+                            if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Text = "已拉取・待重啟";
+                            await Task.Delay(2000);
+                            return;
+                        }
+                    }
+
+                    if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Text = "重啟後端中...";
+                    StopBackend();
+                    await Task.Delay(500);
+                    StartBackend();
+                    await Task.Delay(1800);
+                    await PollAllAsync();
+                    if (_backendOnline)
+                    {
+                        await HttpRequestAsync("POST", "/api/admin/reload-extension", "{}", 2500, true);
+                    }
+                }
+                else
+                {
+                    StartBackend();
+                }
+
+                if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Text = "已更新 ✓";
+                if (res.TrayAppChanged)
+                {
+                    MessageBox.Show("後端同插件已自動更新至 " + res.AfterSha + "！\n留意今次 TrayApp.cs 本身有改動，如有需要可再重編一次 .exe。", "更新完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                await Task.Delay(1800);
+            }
+            finally
+            {
+                _updateInFlight = false;
+                if (_btnCheckUpdate != null && !IsDisposed)
+                {
+                    _btnCheckUpdate.Text = "檢查 GitHub 更新";
+                    _btnCheckUpdate.Enabled = true;
+                }
+            }
         }
 
         private string FindFirefoxExe()
