@@ -66,11 +66,14 @@ async function refresh() {
       empty.textContent = "仲未有唱過嘅歌。去 YouTube 開首 MV 試吓啦！";
       songList.appendChild(empty);
     } else {
+      const validVidRe = /^[A-Za-z0-9_-]{11}$/;
       for (const item of items) {
+        if (!item || !validVidRe.test(String(item.video_id || ""))) continue;
         const link = document.createElement("a");
         link.className = "song-item";
         link.href = `https://www.youtube.com/watch?v=${encodeURIComponent(item.video_id)}`;
         link.target = "_blank";
+        link.rel = "noopener noreferrer";
 
         const title = document.createElement("span");
         title.className = "song-title";

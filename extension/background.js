@@ -1,6 +1,73 @@
 const API_BASE = "http://127.0.0.1:18765";
+const API_ORIGIN = new URL(API_BASE).origin;
 const IS_LOCAL_DEV = API_BASE.startsWith("http://127.0.0.1") || API_BASE.startsWith("http://localhost");
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 let lastReloadNonce = null;
+
+// Shared zero-spam catalog ID cache across all YouTube tabs (powers instant visual DB indicators)
+let _catalogCache = { ids: [], version: "", fetchedAt: 0, inFlight: null };
+
+function isSafeApiPath(path) {
+  if (typeof path !== "string" || !path.startsWith("/api/")) return false;
+  if (/[\s\\]|\/\/|\.\./.test(path)) return false;
+  if (path.startsWith("/api/admin/") || path.startsWith("/api/internal/")) return false;
+  try {
+    const resolved = new URL(path, API_BASE);
+    return resolved.origin === API_ORIGIN && resolved.pathname.startsWith("/api/");
+  } catch (_e) {
+    return false;
+  }
+}
+
+async function fetchCatalogVideoIds(force = false) {
+  const now = Date.now();
+  if (!force && _catalogCache.fetchedAt > 0 && now - _catalogCache.fetchedAt < 60000) {
+    return _catalogCache.ids;
+  }
+  if (_catalogCache.inFlight) {
+    return _catalogCache.inFlight;
+  }
+  _catalogCache.inFlight = (async () => {
+    const st = await getAuthState();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const headers = {};
+      if (st.token) headers["X-Karaoke-Token"] = st.token;
+      const res = await fetch(`${API_BASE}/api/cache?limit=0`, { headers, signal: ctrl.signal });
+      if (!res.ok) {
+        if (res.status === 401) {
+          await saveAuthToken("");
+          _catalogCache.ids = [];
+          _catalogCache.version = "";
+          _catalogCache.fetchedAt = 0;
+        }
+        return _catalogCache.ids;
+      }
+      const data = await res.json().catch(() => null);
+      if (data && Array.isArray(data.items)) {
+        const seen = new Set();
+        for (const it of data.items) {
+          if (it && (it.mode === "pure" || !it.mode) && VIDEO_ID_RE.test(String(it.video_id || ""))) {
+            seen.add(it.video_id);
+          }
+        }
+        _catalogCache.ids = Array.from(seen);
+        if (typeof data.catalog_version === "string" && data.catalog_version) {
+          _catalogCache.version = data.catalog_version;
+        }
+        _catalogCache.fetchedAt = Date.now();
+      }
+      return _catalogCache.ids;
+    } catch (_e) {
+      return _catalogCache.ids;
+    } finally {
+      clearTimeout(timer);
+      _catalogCache.inFlight = null;
+    }
+  })();
+  return _catalogCache.inFlight;
+}
 
 // Persist & cache the user's bound invite device token + stable device ID in chrome.storage.local
 let _cachedAuth = { loaded: false, token: "", deviceId: "" };
@@ -50,6 +117,11 @@ if (chrome.storage && chrome.storage.onChanged) {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === "local" && changes.ktv_access_token) {
       _cachedAuth.token = typeof changes.ktv_access_token.newValue === "string" ? changes.ktv_access_token.newValue : "";
+      if (!_cachedAuth.token) {
+        _catalogCache.ids = [];
+        _catalogCache.version = "";
+        _catalogCache.fetchedAt = 0;
+      }
     }
   });
 }
@@ -92,7 +164,8 @@ if (IS_LOCAL_DEV) {
   }, 30000);
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!sender || sender.id !== chrome.runtime.id) return false;
   if (!message || !message.type) return false;
 
   (async () => {
@@ -105,7 +178,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       if (message.type === "AUTH_CLEAR") {
         await saveAuthToken("");
+        _catalogCache = { ids: [], version: "", fetchedAt: 0, inFlight: null };
         sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "CATALOG_GET_IDS") {
+        const ids = await fetchCatalogVideoIds(!!message.force);
+        sendResponse({ ok: true, ids, version: _catalogCache.version });
+        return;
+      }
+
+      if (message.type === "CATALOG_ADD_ID") {
+        const vid = typeof message.videoId === "string" ? message.videoId : "";
+        if (VIDEO_ID_RE.test(vid) && !_catalogCache.ids.includes(vid)) {
+          _catalogCache.ids.push(vid);
+        }
+        sendResponse({ ok: true, ids: _catalogCache.ids });
         return;
       }
 
@@ -128,6 +217,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           const data = await res.json().catch(() => ({}));
           if (res.ok && data && data.token) {
             await saveAuthToken(data.token);
+            _catalogCache.fetchedAt = 0;
             sendResponse({ ok: true, status: res.status, data });
           } else {
             sendResponse({ ok: false, status: res.status, error: (data && data.detail) || "邀請碼啟用失敗", data });
@@ -140,7 +230,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       if (message.type === "API_REQUEST") {
         const { path, method = "GET", body = null, clientId = null } = message;
-        if (typeof path !== "string" || !path.startsWith("/api/")) {
+        const safeMethod = method === "POST" ? "POST" : "GET";
+        if (!isSafeApiPath(path)) {
           sendResponse({ ok: false, error: "Invalid API path" });
           return;
         }
@@ -148,17 +239,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 20000);
         const init = {
-          method,
+          method: safeMethod,
           headers: {},
           signal: ctrl.signal,
         };
-        if (clientId) {
-          init.headers["X-Karaoke-Client"] = clientId;
+        if (clientId && /^[A-Za-z0-9_-]{8,64}$/.test(String(clientId))) {
+          init.headers["X-Karaoke-Client"] = String(clientId);
         }
         if (st.token) {
           init.headers["X-Karaoke-Token"] = st.token;
         }
-        if (body !== null) {
+        if (body !== null && safeMethod === "POST") {
           init.headers["Content-Type"] = "application/json";
           init.body = JSON.stringify(body);
         }
@@ -167,6 +258,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           const data = await res.json().catch(() => ({}));
           if (res.status === 401 && data && data.auth_required) {
             await saveAuthToken("");
+          }
+          if (data && typeof data.catalog_version === "string" && data.catalog_version && data.catalog_version !== _catalogCache.version) {
+            _catalogCache.version = data.catalog_version;
+            _catalogCache.fetchedAt = 0;
           }
           if (data && typeof data.extension_reload_nonce === "number") {
             checkReloadNonce(data.extension_reload_nonce);
@@ -189,6 +284,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 // Stream audio binary over a long-lived Port in 256KB chunks (immune to sendMessage size limits)
 chrome.runtime.onConnect.addListener((port) => {
+  if (!port.sender || port.sender.id !== chrome.runtime.id) {
+    try { port.disconnect(); } catch (_e) {}
+    return;
+  }
   if (port.name !== "AUDIO_STREAM") return;
   let activeCtrl = null;
   let disconnected = false;
@@ -201,7 +300,7 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 
   port.onMessage.addListener(async (msg) => {
-    if (!msg || typeof msg.path !== "string" || !msg.path.startsWith("/api/")) return;
+    if (!msg || !isSafeApiPath(msg.path) || !/^\/api\/audio\/[A-Za-z0-9_-]{11}\/pure\/(instrumental|vocals)$/.test(msg.path)) return;
     const st = await getAuthState();
     const ctrl = new AbortController();
     activeCtrl = ctrl;

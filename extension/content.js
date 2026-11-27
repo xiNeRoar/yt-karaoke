@@ -2,7 +2,13 @@
   "use strict";
 
   const API_BASE = "http://127.0.0.1:18765";
-  const CLIENT_ID = `yt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+  const AUDIO_PATH_RE = /^\/api\/audio\/[A-Za-z0-9_-]{11}\/pure\/(instrumental|vocals)$/;
+  const CLIENT_ID = (() => {
+    const b = new Uint8Array(6);
+    crypto.getRandomValues(b);
+    return `yt_${Date.now().toString(36)}_${Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("")}`;
+  })();
 
   // Trusted-Types-safe inline SVG icon factory (minimalist Lucide stroke icons)
   function svgIcon(paths, size = 14) {
@@ -29,8 +35,9 @@
     mic: () => svgIcon(["M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z", "M19 10v2a7 7 0 0 1-14 0v-2", "M12 19v3", "M8 22h8"], 15),
     sliders: () => svgIcon(["M4 21v-7", "M4 10V3", "M12 21v-9", "M12 8V3", "M20 21v-5", "M20 12V3", "M1 14h6", "M9 8h6", "M17 16h6"], 13),
     music: () => svgIcon(["M9 18V5l12-2v13", "M6 18a3 3 0 1 0 0 .01", "M18 16a3 3 0 1 0 0 .01"], 13),
-    clock: () => svgIcon(["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z", "M12 6v6l4 2"], 13),
     captions: () => svgIcon(["M3 5h18a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z", "M7 15h4", "M15 15h2", "M7 11h2", "M13 11h4"], 13),
+    zap: (size = 13) => svgIcon(["M13 2L3 14h9l-1 8 10-12h-9l1-8z"], size),
+    sparkles: (size = 13) => svgIcon(["M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8L12 3z", "M19 15l.9 2.1L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.9L19 15z"], size),
   };
 
   // Helper to create DOM elements safely (100% Trusted Types compliant on YouTube)
@@ -105,6 +112,9 @@
   }
 
   async function fetchAudioArrayBuffer(path) {
+    if (typeof path !== "string" || !AUDIO_PATH_RE.test(path)) {
+      throw new Error("Invalid audio path");
+    }
     const token = await getAuthToken();
     const headers = token ? { "X-Karaoke-Token": token } : {};
     // 1) Direct HTTPS fetch with full-body timeout + 1 auto-retry (zero Base64 overhead!)
@@ -549,8 +559,8 @@
     deviceMode: "gpu",
     gpuName: "",
     cachedModes: [],
-    syncOffsetMs: 0,
-    syncExpanded: false,
+    cachedVideoIds: new Set(),
+    catalogLoaded: false,
     pollTimer: null,
     syncTimer: null,
     attachedVideo: null,
@@ -573,7 +583,24 @@
   function getYouTubeVideoId() {
     if (!location.pathname.startsWith("/watch")) return null;
     const params = new URLSearchParams(location.search);
-    return params.get("v");
+    const v = params.get("v");
+    return v && VIDEO_ID_RE.test(v) ? v : null;
+  }
+
+  function extractVideoIdFromHref(href) {
+    if (!href || typeof href !== "string") return null;
+    try {
+      const u = new URL(href, location.origin);
+      if (u.pathname === "/watch") {
+        const v = u.searchParams.get("v");
+        return v && VIDEO_ID_RE.test(v) ? v : null;
+      }
+      if (u.pathname.startsWith("/shorts/")) {
+        const seg = u.pathname.slice(8).split("/")[0];
+        return seg && VIDEO_ID_RE.test(seg) ? seg : null;
+      }
+    } catch (_e) {}
+    return null;
   }
 
   function getVideoElement() {
@@ -604,11 +631,29 @@
     ui.panel.classList.toggle("ktv-active", state.active);
     ui.dot.classList.toggle("online", state.backendOnline);
 
-    const isCurrentModeCached = state.cachedModes.includes("pure");
-    ui.cacheBadge.style.display = isCurrentModeCached ? "inline-block" : "none";
+    const isCurrentModeCached =
+      state.cachedModes.includes("pure") || (state.videoId ? state.cachedVideoIds.has(state.videoId) : false);
 
     const needInvite = state.backendOnline && state.authRequired && !state.authenticated;
     const gpuRestingForNewSong = state.backendOnline && !needInvite && !state.gpuOnline && !isCurrentModeCached && !state.active;
+
+    // Pure visual DB-status indicator (zero text): emerald bolt = already in DB (instant), dashed sparkles = needs AI gen
+    if (ui.dbVisual) {
+      if (!state.backendOnline || needInvite) {
+        ui.dbVisual.className = "ktv-db-visual";
+        ui.dbVisual.title = "";
+      } else if (isCurrentModeCached) {
+        ui.dbVisual.className = "ktv-db-visual in-db";
+        ui.dbVisual.title = "歌庫已有伴奏 · 免生成即唱";
+        ui.dbVisualZap.style.display = "inline-flex";
+        ui.dbVisualSparkles.style.display = "none";
+      } else {
+        ui.dbVisual.className = "ktv-db-visual needs-gen";
+        ui.dbVisual.title = "新歌 · 需 AI 生成伴奏";
+        ui.dbVisualZap.style.display = "none";
+        ui.dbVisualSparkles.style.display = "inline-flex";
+      }
+    }
 
     if (!state.backendOnline) {
       ui.deviceBadge.textContent = "服務未連線";
@@ -630,16 +675,17 @@
     ui.toggleBtn.style.display = needInvite ? "none" : "inline-flex";
     ui.toggleBtn.disabled = state.busy || !state.backendOnline || gpuRestingForNewSong || needInvite;
     ui.toggleBtn.classList.toggle("active", state.active);
+    const showBtnVisual = !state.busy && !state.active && !gpuRestingForNewSong && state.backendOnline && !needInvite;
+    ui.toggleBtnZap.style.display = showBtnVisual && isCurrentModeCached ? "inline-flex" : "none";
+    ui.toggleBtnSparkles.style.display = showBtnVisual && !isCurrentModeCached ? "inline-flex" : "none";
     if (state.busy) {
-      ui.toggleBtn.textContent = "準備伴奏中...";
+      ui.toggleBtnLabel.textContent = "準備伴奏中...";
     } else if (state.active) {
-      ui.toggleBtn.textContent = "關閉唱K";
-    } else if (isCurrentModeCached) {
-      ui.toggleBtn.textContent = "立即開唱";
+      ui.toggleBtnLabel.textContent = "關閉唱K";
     } else if (gpuRestingForNewSong) {
-      ui.toggleBtn.textContent = "AI 休息中";
+      ui.toggleBtnLabel.textContent = "AI 休息中";
     } else {
-      ui.toggleBtn.textContent = "開始唱K";
+      ui.toggleBtnLabel.textContent = "開始唱K";
     }
 
     ui.mixerRow.classList.toggle("visible", state.active);
@@ -655,14 +701,6 @@
     ui.preset0.classList.toggle("active-preset", pct === 0);
     ui.preset25.classList.toggle("active-preset", pct === 25);
     ui.preset100.classList.toggle("active-preset", pct === 100);
-
-    // Sync offset display & header chip visibility
-    ui.syncChip.classList.toggle("visible", state.active);
-    ui.syncVal.textContent =
-      state.syncOffsetMs === 0 ? "0ms" : state.syncOffsetMs > 0 ? `+${state.syncOffsetMs}ms` : `${state.syncOffsetMs}ms`;
-    ui.syncToggleBtn.textContent = state.syncOffsetMs === 0 ? "同步" : ui.syncVal.textContent;
-    ui.syncToggleBtn.classList.toggle("active-preset", state.syncExpanded || state.syncOffsetMs !== 0);
-    ui.syncStepper.style.display = state.syncExpanded ? "inline-flex" : "none";
 
     // Lyrics toggle & fine-tune controls
     ui.lyricsToggleBtn.classList.toggle("active-preset", state.lyricsEnabled);
@@ -711,7 +749,7 @@
       return;
     }
 
-    const targetTime = Math.max(0, video.currentTime + state.syncOffsetMs / 1000);
+    const targetTime = Math.max(0, video.currentTime);
     const rate = video.playbackRate || 1.0;
 
     if (!engine.isPlaying || forceRestart || engine.playbackRate !== rate) {
@@ -967,12 +1005,25 @@
       return [head, ...splitLongCjkPiece(tail, charOffset + bestCut, charMap, maxUnits)];
     }
 
+    const stripQuestionMarks = (s) =>
+      String(s || "")
+        .replace(/(?<=[^\s])[?？]+(?=[^\s])/g, " ")
+        .replace(/[?？]+/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
     for (const line of rawLines) {
-      const text = (line && line.text ? String(line.text) : "").trim();
+      const text = stripQuestionMarks(line && line.text ? String(line.text) : "");
       if (!text) continue;
       const start = Number(line.start) || 0;
       const end = Math.max(start + 0.3, Number(line.end) || start + 3);
-      const words = Array.isArray(line.words) ? line.words : [];
+      const rawWords = Array.isArray(line.words) ? line.words : [];
+      const words = [];
+      for (const w of rawWords) {
+        const cleanW = stripQuestionMarks(w && w.word ? String(w.word) : "");
+        if (!cleanW) continue;
+        words.push({ ...w, word: cleanW });
+      }
       const cjk = isCjkText(text);
 
       let subTexts = [text];
@@ -1217,7 +1268,7 @@
     const video = getVideoElement();
     if (!video) return;
     // Lock lyrics clock to actual WebAudio playback position when karaoke audio is running
-    // (eliminates up to 140ms HTML5 video.currentTime quantization jitter & honors syncOffsetMs automatically!)
+    // (eliminates up to 140ms HTML5 video.currentTime quantization jitter!)
     const baseTime = state.active && engine.isPlaying ? engine.getCurrentPosition() : video.currentTime;
     const now = baseTime + state.lyricsOffsetSec;
 
@@ -1454,6 +1505,7 @@
 
         if (st.status === "ready") {
           stopPolling();
+          markVideoIdCached(targetVideoId);
           if (autoActivate) {
             try {
               await activateLoadedTracks(targetVideoId, targetMode);
@@ -1516,6 +1568,7 @@
       const job = res.data;
       if (job.status === "ready") {
         if (!state.cachedModes.includes(targetMode)) state.cachedModes.push(targetMode);
+        markVideoIdCached(targetVideoId);
         await activateLoadedTracks(targetVideoId, targetMode);
         return;
       }
@@ -1541,6 +1594,8 @@
       state.authenticated = health.data.authenticated !== false;
       if (state.authRequired && !state.authenticated) {
         state.cachedModes = [];
+        state.cachedVideoIds.clear();
+        annotateYouTubeThumbnails();
         setStatus("", false, null);
         updateUI();
         return;
@@ -1562,6 +1617,9 @@
       if (stRes.ok && stRes.data) {
         const st = stRes.data;
         state.cachedModes = st.cached_modes || [];
+        if (state.cachedModes.includes("pure")) {
+          markVideoIdCached(targetVideoId);
+        }
         if (
           st.status === "queued" ||
           st.status === "downloading" ||
@@ -1581,6 +1639,7 @@
     }
     updateUI();
     sendHeartbeat(false);
+    refreshCatalogAndThumbnails(false);
   }
 
   function handleModeSelect(newMode) {
@@ -1599,25 +1658,34 @@
   function buildPanel() {
     const dot = el("span", { className: "ktv-dot" });
     const deviceBadge = el("span", { className: "ktv-badge", textContent: "連線中..." });
-    const cacheBadge = el("span", {
-      className: "ktv-badge cached",
-      textContent: "已就緒",
-      style: "display:none",
-    });
 
-    const toggleBtn = el("button", {
-      className: "ktv-primary-btn",
-      type: "button",
-      textContent: "開始唱K",
-      onClick: () => {
-        if (state.active) {
-          deactivateKaraoke(true);
-          sendHeartbeat();
-        } else {
-          startKaraokeFlow();
-        }
+    // Pure visual DB-status indicator (zero text): emerald bolt = already in DB, dashed sparkles = needs AI gen
+    const dbVisualZap = el("span", { className: "ktv-btn-icon", style: "display:none" }, [ICONS.zap(12)]);
+    const dbVisualSparkles = el("span", { className: "ktv-btn-icon", style: "display:none" }, [ICONS.sparkles(12)]);
+    const dbVisual = el("span", { className: "ktv-db-visual", "aria-label": "歌庫狀態" }, [
+      dbVisualZap,
+      dbVisualSparkles,
+    ]);
+
+    const toggleBtnZap = el("span", { className: "ktv-btn-icon in-db", style: "display:none" }, [ICONS.zap(13)]);
+    const toggleBtnSparkles = el("span", { className: "ktv-btn-icon", style: "display:none" }, [ICONS.sparkles(13)]);
+    const toggleBtnLabel = el("span", { textContent: "開始唱K" });
+    const toggleBtn = el(
+      "button",
+      {
+        className: "ktv-primary-btn",
+        type: "button",
+        onClick: () => {
+          if (state.active) {
+            deactivateKaraoke(true);
+            sendHeartbeat();
+          } else {
+            startKaraokeFlow();
+          }
+        },
       },
-    });
+      [toggleBtnZap, toggleBtnSparkles, toggleBtnLabel]
+    );
 
     const progressFill = el("div", { className: "ktv-progress-bar-fill" });
     const statusText = el("div", { className: "ktv-status-text" });
@@ -1696,50 +1764,6 @@
       },
     });
 
-    // Collapsible header sync-offset chip (keeps main mixer strictly 3 aligned columns)
-    const syncVal = el("button", {
-      className: "ktv-mini-btn val-reset-btn",
-      type: "button",
-      title: "點擊重設回 0ms",
-      textContent: "0ms",
-      onClick: () => {
-        state.syncOffsetMs = 0;
-        syncAudioNow(true);
-        updateUI();
-      },
-    });
-    const adjustSync = (delta) => {
-      state.syncOffsetMs = Math.max(-300, Math.min(300, state.syncOffsetMs + delta));
-      syncAudioNow(true);
-      updateUI();
-    };
-    const syncToggleBtn = el("button", {
-      className: "ktv-mini-btn pill-standalone",
-      type: "button",
-      title: "微調伴奏與影片畫面同步",
-      textContent: "同步",
-      onClick: () => {
-        state.syncExpanded = !state.syncExpanded;
-        updateUI();
-      },
-    });
-    const syncStepper = el("div", { className: "ktv-seg", style: "display:none" }, [
-      el("button", {
-        className: "ktv-mini-btn",
-        type: "button",
-        textContent: "-25",
-        onClick: () => adjustSync(-25),
-      }),
-      syncVal,
-      el("button", {
-        className: "ktv-mini-btn",
-        type: "button",
-        textContent: "+25",
-        onClick: () => adjustSync(25),
-      }),
-    ]);
-    const syncChip = el("div", { className: "ktv-sync-chip" }, [syncToggleBtn, syncStepper]);
-
     // On-demand KTV Lyrics toggle + unified timing stepper + AI align
     const lyricsToggleBtn = el("button", {
       className: "ktv-mini-btn pill-standalone",
@@ -1816,13 +1840,10 @@
         dot,
         ICONS.mic(),
         el("span", { textContent: "唱K 去人聲" }),
+        dbVisual,
         deviceBadge,
-        cacheBadge,
       ]),
-      el("div", { className: "ktv-controls-group" }, [
-        syncChip,
-        toggleBtn,
-      ]),
+      el("div", { className: "ktv-controls-group" }, [toggleBtn]),
     ]);
 
     // Friends-only invite code activation row (auto-hidden once activated or on localhost)
@@ -1875,8 +1896,13 @@
       panel,
       dot,
       deviceBadge,
-      cacheBadge,
+      dbVisual,
+      dbVisualZap,
+      dbVisualSparkles,
       toggleBtn,
+      toggleBtnZap,
+      toggleBtnSparkles,
+      toggleBtnLabel,
       authRow,
       authInput,
       authMsg,
@@ -1890,10 +1916,6 @@
       preset25,
       preset100,
       pitchVal,
-      syncVal,
-      syncChip,
-      syncToggleBtn,
-      syncStepper,
       lyricsToggleBtn,
       lyricsExtraWrap,
       lyricsOffsetVal,
@@ -1901,6 +1923,130 @@
     };
 
     return panel;
+  }
+
+  // -------------------- Pure Visual DB-Cached Thumbnail Badges (All YouTube Pages) --------------------
+  let thumbScanTimer = null;
+
+  function markVideoIdCached(vid) {
+    if (!vid || !VIDEO_ID_RE.test(vid)) return;
+    if (!state.cachedVideoIds.has(vid)) {
+      state.cachedVideoIds.add(vid);
+      try {
+        chrome.runtime.sendMessage({ type: "CATALOG_ADD_ID", videoId: vid });
+      } catch (_e) {
+        // Ignore background disconnect
+      }
+    }
+    scheduleThumbnailScan();
+  }
+
+  function fetchCatalogIdsFromBg(force = false) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ type: "CATALOG_GET_IDS", force: !!force }, (resp) => {
+          if (chrome.runtime.lastError || !resp || !resp.ok || !Array.isArray(resp.ids)) {
+            resolve(null);
+          } else {
+            resolve(resp.ids);
+          }
+        });
+      } catch (_e) {
+        resolve(null);
+      }
+    });
+  }
+
+  async function refreshCatalogAndThumbnails(force = false) {
+    if (state.authRequired && !state.authenticated) {
+      state.cachedVideoIds.clear();
+      annotateYouTubeThumbnails();
+      return;
+    }
+    const ids = await fetchCatalogIdsFromBg(force);
+    if (ids === null) return;
+    const next = new Set();
+    for (const id of ids) {
+      if (typeof id === "string" && VIDEO_ID_RE.test(id)) {
+        next.add(id);
+      }
+    }
+    if (state.videoId && state.cachedModes.includes("pure")) {
+      next.add(state.videoId);
+    }
+    state.cachedVideoIds = next;
+    state.catalogLoaded = true;
+    updateUI();
+    annotateYouTubeThumbnails();
+  }
+
+  function annotateYouTubeThumbnails() {
+    const anchors = document.querySelectorAll(
+      "ytd-thumbnail a#thumbnail[href], a.yt-lockup-view-model__content-image[href], a.yt-lockup-view-model-wiz__content-image[href], ytd-playlist-thumbnail a[href]"
+    );
+    const hasCache = state.cachedVideoIds.size > 0;
+    for (const anchor of anchors) {
+      const existing = anchor.querySelector(":scope > .ktv-thumb-db-dot");
+      if (!hasCache) {
+        if (existing) existing.remove();
+        continue;
+      }
+      const vid = extractVideoIdFromHref(anchor.getAttribute("href"));
+      const inDb = !!(vid && state.cachedVideoIds.has(vid));
+      if (inDb) {
+        if (!existing) {
+          if (window.getComputedStyle(anchor).position === "static") {
+            anchor.classList.add("ktv-thumb-host");
+          }
+          const badge = el(
+            "span",
+            {
+              className: "ktv-thumb-db-dot",
+              title: "歌庫已有伴奏 · 免生成即唱",
+              "aria-hidden": "true",
+            },
+            [ICONS.zap(12)]
+          );
+          anchor.appendChild(badge);
+        }
+      } else if (existing) {
+        existing.remove();
+      }
+    }
+  }
+
+  function scheduleThumbnailScan() {
+    if (thumbScanTimer) return;
+    thumbScanTimer = setTimeout(() => {
+      thumbScanTimer = null;
+      annotateYouTubeThumbnails();
+    }, 260);
+  }
+
+  function startThumbnailObserver() {
+    if (!document.body || typeof MutationObserver !== "function") return;
+    const obs = new MutationObserver((mutations) => {
+      if (state.cachedVideoIds.size === 0) return;
+      for (const m of mutations) {
+        if (m.type === "childList" && m.addedNodes.length > 0) {
+          for (const node of m.addedNodes) {
+            if (node.nodeType === 1 && !node.classList.contains("ktv-thumb-db-dot")) {
+              scheduleThumbnailScan();
+              return;
+            }
+          }
+        } else if (m.type === "attributes" && m.attributeName === "href") {
+          scheduleThumbnailScan();
+          return;
+        }
+      }
+    });
+    obs.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href"],
+    });
   }
 
   function mountPanel() {
@@ -1932,7 +2078,6 @@
       engine.clearBuffers();
       engine.setSemitones(0);
       engine.setVocalVolume(0);
-      state.syncOffsetMs = 0;
       state.lyricsOffsetSec = 0;
       state.lyricsLines = [];
       state.lyricsSourceLabel = "";
@@ -1943,12 +2088,16 @@
       if (!newVideoId) {
         const existing = document.getElementById("yt-ai-ktv-panel");
         if (existing) existing.remove();
+        refreshCatalogAndThumbnails(false);
         return;
       }
       mountPanel();
       refreshBackendAndVideoStatus();
     } else if (newVideoId) {
       mountPanel();
+      scheduleThumbnailScan();
+    } else {
+      refreshCatalogAndThumbnails(false);
     }
   }
 
@@ -1966,8 +2115,16 @@
   // Instant cross-tab sync: if user enters/clears invite code in Popup, unlock/lock open YouTube tabs immediately!
   if (chrome.storage && chrome.storage.onChanged) {
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area === "local" && changes.ktv_access_token && state.videoId) {
-        refreshBackendAndVideoStatus();
+      if (area === "local" && changes.ktv_access_token) {
+        if (!changes.ktv_access_token.newValue) {
+          state.cachedVideoIds.clear();
+          annotateYouTubeThumbnails();
+        }
+        if (state.videoId) {
+          refreshBackendAndVideoStatus();
+        } else {
+          refreshCatalogAndThumbnails(true);
+        }
       }
     });
   }
@@ -1997,6 +2154,7 @@
     }
   }, 1500);
 
-  // Initial kick-off
+  // Initial kick-off (watch panel + visual DB thumbnail indicators across all YouTube pages)
+  startThumbnailObserver();
   setTimeout(onNavigate, 600);
 })();

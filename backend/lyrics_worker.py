@@ -344,6 +344,33 @@ def _is_instrumental_placeholder(s: str) -> bool:
     return low in ("", "純音樂請欣賞", "纯音乐请欣赏", "puremusic", "instrumental", "music", "音樂", "音乐")
 
 
+def _strip_lyric_question_marks(text: str) -> str:
+    """Remove half-width '?' and full-width '？' from KTV lyrics (mid-line becomes a single space)."""
+    if not text or ("?" not in text and "？" not in text):
+        return text
+    s = re.sub(r"(?<=[^\s])[?？]+(?=[^\s])", " ", text)
+    s = re.sub(r"[?？]+", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _sanitize_lyric_lines_output(lines: list[dict]) -> list[dict]:
+    """Enforce clean KTV display text on every emitted line & word across all exit paths (zero '?' / '？')."""
+    out: list[dict] = []
+    for ln in (lines or []):
+        clean_t = _strip_lyric_question_marks(str(ln.get("text") or ""))
+        if not clean_t:
+            continue
+        ws_in = ln.get("words") or []
+        ws_out = []
+        for w in ws_in:
+            wt = _strip_lyric_question_marks(str(w.get("word") or ""))
+            if not wt:
+                continue
+            ws_out.append({"start": w["start"], "end": w["end"], "word": wt})
+        out.append({**ln, "text": clean_t, "words": ws_out})
+    return out
+
+
 def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
     # Whole-song non-Chinese check so Japanese Kanji-only lines in Japanese songs are NEVER corrupted by OpenCC!
     is_non_zh = _is_non_chinese_cjk("\n".join(raw_lines or []))
@@ -354,7 +381,9 @@ def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
             continue
         if CREDIT_LINE_RE.match(s) or SECTION_HEADER_RE.match(s) or _is_instrumental_placeholder(s):
             continue
-        hk = s if is_non_zh else to_hk_traditional(s)
+        hk = _strip_lyric_question_marks(s if is_non_zh else to_hk_traditional(s))
+        if not hk:
+            continue
         out.extend(_split_long_official_line(hk))
     return out
 
@@ -435,8 +464,9 @@ def parse_lrc(lrc_text: str) -> list[dict]:
                     if _line_script_kind(g["text"]) in ("ja", "ko"):
                         chosen = g
                         break
-        clean_text = chosen["text"] if is_non_zh else to_hk_traditional(chosen["text"])
-        lines.append({"start": chosen["start"], "end": 0.0, "text": clean_text, "words": []})
+        clean_text = _strip_lyric_question_marks(chosen["text"] if is_non_zh else to_hk_traditional(chosen["text"]))
+        if clean_text:
+            lines.append({"start": chosen["start"], "end": 0.0, "text": clean_text, "words": []})
         i_d = j_d
 
     for i, item in enumerate(lines):
@@ -494,10 +524,12 @@ def parse_yrc(yrc_text: str) -> list[dict]:
         text = re.sub(r"\s+", " ", joined_raw).strip()
         if not text or CREDIT_LINE_RE.match(text) or SECTION_HEADER_RE.match(text) or _is_instrumental_placeholder(text):
             continue
-        clean_text = text if is_non_zh else to_hk_traditional(text)
+        clean_text = _strip_lyric_question_marks(text if is_non_zh else to_hk_traditional(text))
+        if not clean_text:
+            continue
         words_out: list[dict] = []
         for ws, we, wt_raw in toks:
-            wt = wt_raw.strip()
+            wt = _strip_lyric_question_marks(wt_raw.strip())
             if not wt:
                 continue
             # Keep punctuation attached to words, but skip standalone pure-punctuation spans from wipe weights
@@ -5296,7 +5328,7 @@ def main() -> int:
                     "title": title,
                     "source": "youtube_sub",
                     "source_label": "同步字幕",
-                    "lines": yt_lines,
+                    "lines": _sanitize_lyric_lines_output(yt_lines),
                     "created_at": time.time(),
                 }
                 out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -5336,7 +5368,7 @@ def main() -> int:
                         "title": title,
                         "source": "youtube_sub_ctc" if yt_eng == "ctc" else "youtube_sub_qwen3",
                         "source_label": "同步字幕",
-                        "lines": yt_ref,
+                        "lines": _sanitize_lyric_lines_output(yt_ref),
                         "created_at": time.time(),
                     }
                     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -5382,7 +5414,7 @@ def main() -> int:
                 "title": title,
                 "source": "lrclib_exact",
                 "source_label": "同步歌詞",
-                "lines": lrc_synced,
+                "lines": _sanitize_lyric_lines_output(lrc_synced),
                 "created_at": time.time(),
             }
             out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -5411,7 +5443,7 @@ def main() -> int:
                         "title": title,
                         "source": "netease_yrc_verified",
                         "source_label": "同步歌詞",
-                        "lines": verified_yrc,
+                        "lines": _sanitize_lyric_lines_output(verified_yrc),
                         "created_at": time.time(),
                     }
                     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -5472,7 +5504,7 @@ def main() -> int:
                         "title": title,
                         "source": "lrclib_ctc_align" if s2_eng == "ctc" else "lrclib_qwen3_align",
                         "source_label": "同步歌詞",
-                        "lines": s2_lines,
+                        "lines": _sanitize_lyric_lines_output(s2_lines),
                         "created_at": time.time(),
                     }
                     out_file.parent.mkdir(parents=True, exist_ok=True)
@@ -5589,7 +5621,7 @@ def main() -> int:
             "title": title,
             "source": src,
             "source_label": label,
-            "lines": ai_lines,
+            "lines": _sanitize_lyric_lines_output(ai_lines),
             "created_at": time.time(),
         }
         out_file.parent.mkdir(parents=True, exist_ok=True)

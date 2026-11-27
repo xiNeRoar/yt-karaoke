@@ -1111,6 +1111,71 @@ def test_tier0_yrc_and_stage2_ctc_invariants() -> None:
     print("[PASS] Tier 0 NetEase YRC (4-gate acoustic verification) & Stage 2 20ms CTC invariants")
 
 
+def test_question_mark_sanitization_ui_and_security_invariants() -> None:
+    """Verify structural removal of '?' / '？' in lyrics (backend + frontend), removal of redundant header sync chip,
+    pure-visual DB indicators (watch bar + YouTube thumbnails), and Extension/Worker security hardening.
+    """
+    import lyrics_worker as lw
+
+    # 1) Backend question-mark sanitization across single strings, LRC, YRC, clean_lyric_lines, and emitted word tokens
+    assert lw._strip_lyric_question_marks("你在哪裡？") == "你在哪裡"
+    assert lw._strip_lyric_question_marks("誰來救我? 還有誰？") == "誰來救我 還有誰"
+    assert lw._strip_lyric_question_marks("Why? Why not?") == "Why Why not"
+    assert lw._strip_lyric_question_marks("??? ？") == ""
+
+    san = lw._sanitize_lyric_lines_output([
+        {
+            "start": 1.0,
+            "end": 3.0,
+            "text": "你在哪裡？",
+            "words": [
+                {"word": "你", "start": 1.0, "end": 1.5},
+                {"word": "在", "start": 1.5, "end": 2.0},
+                {"word": "哪", "start": 2.0, "end": 2.5},
+                {"word": "裡？", "start": 2.5, "end": 2.9},
+                {"word": "?", "start": 2.9, "end": 3.0},
+            ],
+        },
+        {"start": 4.0, "end": 4.5, "text": "？？？", "words": [{"word": "？", "start": 4.0, "end": 4.5}]},
+    ])
+    assert len(san) == 1 and san[0]["text"] == "你在哪裡"
+    assert [w["word"] for w in san[0]["words"]] == ["你", "在", "哪", "裡"], f"Question marks survived in words: {san}"
+
+    parsed_lrc = lw.parse_lrc("[00:10.00]男人怎可以？\n[00:13.00]Why do you cry?\n")
+    assert all("?" not in x["text"] and "？" not in x["text"] for x in parsed_lrc), f"LRC kept '?': {parsed_lrc}"
+    parsed_yrc = lw.parse_yrc("[10000,1500](10000,500,0)你(10500,500,0)好(11000,500,0)嗎？\n")
+    assert parsed_yrc[0]["text"] == "你好嗎" and all("？" not in w["word"] for w in parsed_yrc[0]["words"])
+    cleaned_plain = lw.clean_lyric_lines(["誰明白我？", "Are you ready?"])
+    assert cleaned_plain == ["誰明白我", "Are you ready"], f"clean_lyric_lines kept '?': {cleaned_plain}"
+
+    # 2) Extension UI invariants: syncChip removed, zero-text visual DB indicators present, frontend '?' strip active
+    ext_dir = ROOT / "extension"
+    content_src = (ext_dir / "content.js").read_text(encoding="utf-8")
+    styles_src = (ext_dir / "styles.css").read_text(encoding="utf-8")
+    bg_src = (ext_dir / "background.js").read_text(encoding="utf-8")
+    popup_src = (ext_dir / "popup.js").read_text(encoding="utf-8")
+    manifest_data = json.loads((ext_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    assert "syncChip" not in content_src and "syncOffsetMs" not in content_src and "ktv-sync-chip" not in styles_src
+    assert '"已就緒"' not in content_src, "Text badge '已就緒' must be replaced by pure visual DB indicator!"
+    assert "ktv-db-visual" in content_src and "ktv-thumb-db-dot" in content_src
+    assert "stripQuestionMarks" in content_src and "CATALOG_GET_IDS" in content_src
+    assert "VIDEO_ID_RE" in content_src and "AUDIO_PATH_RE" in content_src and "crypto.getRandomValues" in content_src
+
+    # 3) Extension security invariants: zero DOM-XSS sinks, strict sender.id + path/method/origin guards, rel=noopener
+    for name, src in (("content.js", content_src), ("background.js", bg_src), ("popup.js", popup_src)):
+        for forbidden in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
+            assert forbidden not in src, f"Forbidden XSS sink {forbidden} found in {name}!"
+
+    assert bg_src.count("sender.id !== chrome.runtime.id") >= 2, "background.js must verify sender.id on both onMessage and onConnect!"
+    assert "isSafeApiPath" in bg_src and "/api/admin/" in bg_src and "/api/internal/" in bg_src
+    assert 'method === "POST" ? "POST" : "GET"' in bg_src and "CATALOG_GET_IDS" in bg_src
+    assert r"/^\/api\/audio\/[A-Za-z0-9_-]{11}\/pure\/(instrumental|vocals)$/" in bg_src
+    assert 'rel = "noopener noreferrer"' in popup_src and "validVidRe" in popup_src and "encodeURIComponent" in popup_src
+    assert manifest_data["version"] == "1.3.0"
+    print("[PASS] Question-mark sanitization (backend + frontend), sync-button removal, visual DB indicators & security hardening")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -1124,6 +1189,7 @@ def main() -> int:
     test_generic_alignment_recovery_and_qwen3_windows()
     test_line_overlap_hog_burst_and_cross_layer_fixes()
     test_tier0_yrc_and_stage2_ctc_invariants()
+    test_question_mark_sanitization_ui_and_security_invariants()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()
