@@ -320,7 +320,7 @@ chrome.runtime.onConnect.addListener((port) => {
       const buf = await res.arrayBuffer();
       if (disconnected) return;
       const bytes = new Uint8Array(buf);
-      const CHUNK = 262144;
+      const CHUNK = 524288;
       port.postMessage({ type: "meta", totalBytes: bytes.length });
 
       for (let off = 0; off < bytes.length; off += CHUNK) {

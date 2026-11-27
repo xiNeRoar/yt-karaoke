@@ -111,10 +111,58 @@
     });
   }
 
-  async function fetchAudioArrayBuffer(path) {
-    if (typeof path !== "string" || !AUDIO_PATH_RE.test(path)) {
-      throw new Error("Invalid audio path");
+  // Bounded browser Cache API store (max 12 recent songs = 24 stems) + hover prefetch map
+  // Strictly gated on authentication and wiped on AUTH_CLEAR/401 so revoked tokens never replay audio!
+  const AUDIO_CACHE_NAME = "yt-ai-ktv-audio-v1";
+  const AUDIO_CACHE_MAX_ENTRIES = 24;
+  const _audioPrefetchMap = new Map(); // path -> Promise<ArrayBuffer> (max 2 entries)
+
+  async function ktvAudioCacheClear() {
+    _audioPrefetchMap.clear();
+    if (typeof caches === "undefined") return;
+    try {
+      await caches.delete(AUDIO_CACHE_NAME);
+    } catch (_e) {}
+  }
+
+  async function ktvAudioCacheGet(path) {
+    if (typeof caches === "undefined") return null;
+    if (state.authRequired && !state.authenticated) return null;
+    try {
+      const cache = await caches.open(AUDIO_CACHE_NAME);
+      const match = await cache.match(`${API_BASE}${path}`);
+      if (!match) return null;
+      const buf = await match.arrayBuffer();
+      return buf && buf.byteLength > 8192 ? buf : null;
+    } catch (_e) {
+      return null;
     }
+  }
+
+  async function ktvAudioCachePut(path, bufCopy) {
+    if (typeof caches === "undefined" || !bufCopy || bufCopy.byteLength <= 8192) return;
+    if (state.authRequired && !state.authenticated) return;
+    try {
+      const cache = await caches.open(AUDIO_CACHE_NAME);
+      const reqUrl = `${API_BASE}${path}`;
+      await cache.put(
+        reqUrl,
+        new Response(bufCopy, {
+          status: 200,
+          headers: { "Content-Type": "audio/mpeg", "X-KTV-Cached-At": String(Date.now()) },
+        })
+      );
+      const keys = await cache.keys();
+      if (keys.length > AUDIO_CACHE_MAX_ENTRIES) {
+        const dropCount = keys.length - AUDIO_CACHE_MAX_ENTRIES;
+        for (let i = 0; i < dropCount; i++) {
+          await cache.delete(keys[i]);
+        }
+      }
+    } catch (_e) {}
+  }
+
+  async function _downloadAudioRaw(path) {
     const token = await getAuthToken();
     const headers = token ? { "X-Karaoke-Token": token } : {};
     // 1) Direct HTTPS fetch with full-body timeout + 1 auto-retry (zero Base64 overhead!)
@@ -125,6 +173,7 @@
         const res = await fetch(`${API_BASE}${path}`, { headers, signal: ctrl.signal });
         if (res.status === 401) {
           chrome.runtime.sendMessage({ type: "AUTH_CLEAR" });
+          ktvAudioCacheClear();
           state.authRequired = true;
           state.authenticated = false;
           updateUI();
@@ -190,6 +239,7 @@
           clearTimeout(timeout);
           try { port.disconnect(); } catch (_e) {}
           if (msg.status === 401) {
+            ktvAudioCacheClear();
             state.authRequired = true;
             state.authenticated = false;
             updateUI();
@@ -210,6 +260,49 @@
 
       port.postMessage({ path });
     });
+  }
+
+  function prefetchAudioPath(path) {
+    if (typeof path !== "string" || !AUDIO_PATH_RE.test(path)) return;
+    if (state.authRequired && !state.authenticated) return;
+    if (_audioPrefetchMap.has(path)) return;
+    while (_audioPrefetchMap.size >= 2) {
+      const oldest = _audioPrefetchMap.keys().next().value;
+      _audioPrefetchMap.delete(oldest);
+    }
+    const p = (async () => {
+      const cached = await ktvAudioCacheGet(path);
+      if (cached) return cached;
+      const fresh = await _downloadAudioRaw(path);
+      ktvAudioCachePut(path, fresh.slice(0));
+      return fresh;
+    })().catch(() => {
+      _audioPrefetchMap.delete(path);
+      return null;
+    });
+    _audioPrefetchMap.set(path, p);
+  }
+
+  async function fetchAudioArrayBuffer(path) {
+    if (typeof path !== "string" || !AUDIO_PATH_RE.test(path)) {
+      throw new Error("Invalid audio path");
+    }
+    // 0A) Consume hover-prefetched buffer if ready or in-flight (returns fresh clone so decodeAudioData never detaches shared copy!)
+    if (_audioPrefetchMap.has(path)) {
+      const p = _audioPrefetchMap.get(path);
+      _audioPrefetchMap.delete(path);
+      const preBuf = await p;
+      if (preBuf && preBuf.byteLength > 8192) {
+        return preBuf.slice(0);
+      }
+    }
+    // 0B) Instant local browser Cache API hit (< 40ms replay for last 12 songs!)
+    const cached = await ktvAudioCacheGet(path);
+    if (cached) return cached;
+
+    const fresh = await _downloadAudioRaw(path);
+    ktvAudioCachePut(path, fresh.slice(0));
+    return fresh;
   }
 
   // Fallback ScriptProcessor pitch shifter (identical algorithm) if AudioWorklet is blocked
@@ -416,28 +509,54 @@
       await this.ensureContext();
       if (seq !== this._loadSeq) return;
       const key = `${videoId}_${mode}`;
-      if (this.loadedKey === key && this.instBuffer && this.vocBuffer) {
+      if (this.loadedKey === key && this.instBuffer && (this.vocBuffer || this.vocalVolume <= 0.001)) {
         return;
       }
 
       if (onProgress) onProgress("載入伴奏中...", 95);
-      // Download instrumental & guide-vocal tracks in PARALLEL (2x faster!)
-      const [instRaw, vocRaw] = await Promise.all([
-        fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`),
-        fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`),
-      ]);
-      if (seq !== this._loadSeq) return;
+      // Pipeline download -> decode per stem independently (start decoding instrumental the instant IT finishes!)
+      const instBufP = fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`).then((raw) =>
+        this.ctx.decodeAudioData(raw)
+      );
+      const vocBufP = fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`).then((raw) =>
+        this.ctx.decodeAudioData(raw)
+      );
 
-      if (onProgress) onProgress("載入伴奏中...", 99);
-      const [instBuf, vocBuf] = await Promise.all([
-        this.ctx.decodeAudioData(instRaw),
-        this.ctx.decodeAudioData(vocRaw),
-      ]);
-      if (seq !== this._loadSeq) return;
+      if (this.vocalVolume > 0.001) {
+        const [instBuf, vocBuf] = await Promise.all([instBufP, vocBufP]);
+        if (seq !== this._loadSeq) return;
+        this.instBuffer = instBuf;
+        this.vocBuffer = vocBuf;
+        this.loadedKey = key;
+        return;
+      }
 
+      // Default KTV mode (guide vocal = 0%): start playing IMMEDIATELY as soon as instrumental is decoded!
+      // Guide vocals finish decoding silently in background & attach sample-accurately synced when ready.
+      const instBuf = await instBufP;
+      if (seq !== this._loadSeq) return;
       this.instBuffer = instBuf;
-      this.vocBuffer = vocBuf;
+      this.vocBuffer = null;
       this.loadedKey = key;
+
+      vocBufP
+        .then((vocBuf) => {
+          if (seq !== this._loadSeq || this.loadedKey !== key) return;
+          this.vocBuffer = vocBuf;
+          if (this.isPlaying && this.ctx && !this.vocSource) {
+            const curPos = Math.max(0, this.getCurrentPosition());
+            if (curPos < vocBuf.duration - 0.05) {
+              const vocSrc = this.ctx.createBufferSource();
+              vocSrc.buffer = vocBuf;
+              vocSrc.playbackRate.value = this.playbackRate;
+              vocSrc.connect(this.vocGain);
+              const tStart = this.ctx.currentTime + 0.01;
+              vocSrc.start(tStart, curPos + 0.01 * this.playbackRate);
+              this.vocSource = vocSrc;
+            }
+          }
+        })
+        .catch(() => {});
     }
 
     stopSources() {
@@ -464,10 +583,10 @@
     }
 
     startAt(offsetSec, playbackRate = 1.0) {
-      if (!this.ctx || !this.instBuffer || !this.vocBuffer) return;
+      if (!this.ctx || !this.instBuffer) return;
       this.stopSources();
 
-      const maxDur = Math.min(this.instBuffer.duration, this.vocBuffer.duration);
+      const maxDur = this.vocBuffer ? Math.min(this.instBuffer.duration, this.vocBuffer.duration) : this.instBuffer.duration;
       const safeOffset = Math.max(0, offsetSec);
       if (safeOffset >= maxDur - 0.05) {
         return;
@@ -483,14 +602,17 @@
       this._updateRouting();
 
       const instSrc = this.ctx.createBufferSource();
-      const vocSrc = this.ctx.createBufferSource();
       instSrc.buffer = this.instBuffer;
-      vocSrc.buffer = this.vocBuffer;
       instSrc.playbackRate.value = playbackRate;
-      vocSrc.playbackRate.value = playbackRate;
-
       instSrc.connect(this.instGain);
-      vocSrc.connect(this.vocGain);
+
+      let vocSrc = null;
+      if (this.vocBuffer) {
+        vocSrc = this.ctx.createBufferSource();
+        vocSrc.buffer = this.vocBuffer;
+        vocSrc.playbackRate.value = playbackRate;
+        vocSrc.connect(this.vocGain);
+      }
 
       const now = this.ctx.currentTime + 0.01;
       instSrc.onended = () => {
@@ -499,7 +621,7 @@
         }
       };
       instSrc.start(now, safeOffset);
-      vocSrc.start(now, safeOffset);
+      if (vocSrc) vocSrc.start(now, safeOffset);
 
       this.instSource = instSrc;
       this.vocSource = vocSrc;
@@ -1644,6 +1766,7 @@
       state.authRequired = !!health.data.auth_required;
       state.authenticated = health.data.authenticated !== false;
       if (state.authRequired && !state.authenticated) {
+        ktvAudioCacheClear();
         state.cachedModes = [];
         state.cachedVideoIds.clear();
         annotateYouTubeThumbnails();
@@ -1726,6 +1849,11 @@
       {
         className: "ktv-primary-btn",
         type: "button",
+        onPointerEnter: () => {
+          if (!state.active && !state.busy && state.videoId && state.cachedModes.includes(state.mode)) {
+            prefetchAudioPath(`/api/audio/${state.videoId}/${state.mode}/instrumental`);
+          }
+        },
         onClick: () => {
           if (state.active) {
             deactivateKaraoke(true);

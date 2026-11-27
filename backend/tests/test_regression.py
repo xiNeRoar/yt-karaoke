@@ -1424,10 +1424,42 @@ def test_cpu_thread_cap_hq_yield_and_credit_dedup() -> None:
         else:
             os.environ["KARAOKE_CPU_THREADS"] = old_env
 
-    # 2) Worker invariants: ONNXRuntime thread cap + --force-hq mid-song yield (rc=2, never grinds RoFormer on CPU!)
+    # 2) Worker invariants: ONNXRuntime thread cap, --force-hq mid-song yield, parallel VBR stem encoder & zero-wait upload
     wk_src = (BACKEND / "worker.py").read_text(encoding="utf-8")
+    sep_src = (BACKEND / "separator.py").read_text(encoding="utf-8")
+    gw_src = (ROOT / "gateway" / "main.py").read_text(encoding="utf-8")
+    ct_src = (ROOT / "extension" / "content.js").read_text(encoding="utf-8")
     assert "_CappedSessionOptions" in wk_src and "intra_op_num_threads = cpu_cap" in wk_src
     assert "class _HQYieldInterrupt" in wk_src and "except _HQYieldInterrupt" in wk_src
+    assert 'output_format="WAV"' in wk_src and "_encode_stems_parallel_vbr(" in wk_src and '"audio_profile": "mp3_v2_v4"' in wk_src
+    assert "def _bg_upload_and_cleanup(" in sep_src and "gdrive-up-" in sep_src
+    assert "os.replace(tmp, dest)" in gw_src and "_proxy_stream" in gw_src
+    assert 'AUDIO_CACHE_NAME = "yt-ai-ktv-audio-v1"' in ct_src and "ktvAudioCacheClear()" in ct_src
+    assert "prefetchAudioPath(" in ct_src and "preBuf.slice(0)" in ct_src and "this.vocalVolume <= 0.001" in ct_src
+
+    # 2B) Empirical _encode_stems_parallel_vbr test: encodes stereo WAV -> compact V2 inst + V4 voc MP3 in parallel!
+    import wave as _wave
+    import numpy as _np
+    with tempfile.TemporaryDirectory() as td_vbr:
+        td_p = Path(td_vbr)
+        sr_v = 44100
+        t_v = _np.arange(sr_v * 3, dtype=_np.float32) / sr_v
+        pcm_inst = (_np.sin(2.0 * _np.pi * 440.0 * t_v) * 16000.0).astype(_np.int16)
+        pcm_inst_st = _np.column_stack([pcm_inst, pcm_inst]).tobytes()
+        # Vocals: 1s tone + 2s pure silence (V4 VBR drops to 32k on silence!)
+        pcm_voc = _np.zeros(sr_v * 3, dtype=_np.int16)
+        pcm_voc[:sr_v] = (_np.sin(2.0 * _np.pi * 330.0 * t_v[:sr_v]) * 14000.0).astype(_np.int16)
+        pcm_voc_st = _np.column_stack([pcm_voc, pcm_voc]).tobytes()
+        for nm, raw_b in (("i.wav", pcm_inst_st), ("v.wav", pcm_voc_st)):
+            with _wave.open(str(td_p / nm), "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sr_v)
+                wf.writeframes(raw_b)
+        wk._encode_stems_parallel_vbr(td_p / "i.wav", td_p / "v.wav", td_p / "instrumental.mp3", td_p / "vocals.mp3", ffmpeg_dir=wk.find_ffmpeg_dir())
+        i_sz = (td_p / "instrumental.mp3").stat().st_size
+        v_sz = (td_p / "vocals.mp3").stat().st_size
+        assert i_sz > 8000 and v_sz > 4000 and v_sz < i_sz, f"Parallel VBR sizes unexpected: inst={i_sz}, voc={v_sz}"
 
     # 3) Credit-line filter catches prefixed instruments/studio roles without false-matching real lyrics
     bad_credits = [

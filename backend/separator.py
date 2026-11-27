@@ -795,8 +795,8 @@ class KaraokeSeparatorManager:
                     )
                     return
 
-                # If Google Drive storage is active, start lyrics generation IN PARALLEL with synchronous
-                # Drive upload (saves 10-20s perceived lyrics wait while keeping audio 'ready' atomic for NAS Gateway!)
+                # Zero-wait instant play: mark 'ready' immediately (serving straight from fast local NVMe SSD!)
+                # while uploading compact VBR stems to Google Drive & aligning lyrics IN PARALLEL in background!
                 pre_voc_hint: Optional[Path] = None
                 pre_inst_hint: Optional[Path] = None
                 pre_meta_hint: Optional[dict] = None
@@ -806,62 +806,89 @@ class KaraokeSeparatorManager:
                     meta = self.get_meta(video_id, mode)
                     pre_meta_hint = meta
                     upload_done_event = threading.Event()
-                    try:
-                        cur = self._read_job_status(video_id, mode) or {}
-                        cur.update({"status": "finalizing", "progress": 96, "stage_text": "最後整理中..."})
-                        _write_json_atomic(status_file, cur)
+                    with self._lock:
+                        upload_epoch = self._lyrics_upload_epoch
+                        upload_vid_gen = self._lyrics_upload_gen.get(video_id, 0)
 
-                        # Snapshot vocals & instrumental into private temp files so lyrics & Shazam start immediately!
-                        local_voc = local_song_dir / "vocals.mp3"
-                        local_inst = local_song_dir / "instrumental.mp3"
-                        if local_voc.exists():
-                            try:
-                                pre_voc_hint = TEMP_DIR / f"pre_voc_{video_id}_{int(time.time())}.mp3"
-                                shutil.copy2(local_voc, pre_voc_hint)
-                            except Exception:
-                                pre_voc_hint = None
-                        if local_inst.exists():
-                            try:
-                                pre_inst_hint = TEMP_DIR / f"pre_inst_{video_id}_{int(time.time())}.mp3"
-                                shutil.copy2(local_inst, pre_inst_hint)
-                            except Exception:
-                                pre_inst_hint = None
+                    # Snapshot vocals & instrumental into private temp files so lyrics & Shazam start immediately!
+                    local_voc = local_song_dir / "vocals.mp3"
+                    local_inst = local_song_dir / "instrumental.mp3"
+                    if local_voc.exists():
+                        try:
+                            pre_voc_hint = TEMP_DIR / f"pre_voc_{video_id}_{int(time.time())}.mp3"
+                            shutil.copy2(local_voc, pre_voc_hint)
+                        except Exception:
+                            pre_voc_hint = None
+                    if local_inst.exists():
+                        try:
+                            pre_inst_hint = TEMP_DIR / f"pre_inst_{video_id}_{int(time.time())}.mp3"
+                            shutil.copy2(local_inst, pre_inst_hint)
+                        except Exception:
+                            pre_inst_hint = None
 
-                        # Overlap lyrics alignment with Google Drive stem upload!
-                        if pre_voc_hint and pre_voc_hint.exists():
-                            try:
-                                self.start_lyrics_generation(
-                                    video_id, mode, force_ai=False,
-                                    local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
-                                    meta_hint=pre_meta_hint, upload_done_event=upload_done_event,
-                                )
-                                lyrics_started_early = True
-                                pre_voc_hint = None
-                                pre_inst_hint = None
-                            except Exception:
-                                lyrics_started_early = False
+                    # Flip to 'ready' IMMEDIATELY so browser plays from local NVMe with ZERO Drive-upload wait!
+                    cur = self._read_job_status(video_id, mode) or {}
+                    cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
+                    _write_json_atomic(status_file, cur)
 
-                        self.gdrive.upload_song(video_id, mode, local_song_dir, meta)
-                        shutil.rmtree(local_song_dir, ignore_errors=True)
-                        parent = self.cache_dir / video_id
-                        if parent.exists() and not any(parent.iterdir()):
-                            try:
-                                parent.rmdir()
-                            except Exception:
-                                pass
+                    # Start lyrics alignment in parallel (waits on upload_done_event only before pushing lyrics.json)
+                    if pre_voc_hint and pre_voc_hint.exists():
+                        try:
+                            self.start_lyrics_generation(
+                                video_id, mode, force_ai=False,
+                                local_vocals_hint=pre_voc_hint, local_inst_hint=pre_inst_hint,
+                                meta_hint=pre_meta_hint, upload_done_event=upload_done_event,
+                            )
+                            lyrics_started_early = True
+                            pre_voc_hint = None
+                            pre_inst_hint = None
+                        except Exception:
+                            lyrics_started_early = False
 
-                        cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
-                        _write_json_atomic(status_file, cur)
-                        self.log.info("GDrive", f"Uploaded {video_id} ({mode}) & freed local disk")
-                        self.log.trigger_sync_async()
-                    except Exception as gerr:
-                        self.log.error("GDrive", f"Upload fallback to local ({video_id}): {gerr}")
-                        self.enforce_cache_limit()
-                        cur = self._read_job_status(video_id, mode) or {}
-                        cur.update({"status": "ready", "progress": 100, "stage_text": "伴奏已就緒"})
-                        _write_json_atomic(status_file, cur)
-                    finally:
-                        upload_done_event.set()
+                    def _bg_upload_and_cleanup(
+                        vid: str = video_id,
+                        m: str = mode,
+                        ldir: Path = local_song_dir,
+                        mdata: dict = meta,
+                        ev: threading.Event = upload_done_event,
+                        ep: int = upload_epoch,
+                        vgen: int = upload_vid_gen,
+                    ) -> None:
+                        try:
+                            with self._lock:
+                                if ep != self._lyrics_upload_epoch or self._lyrics_upload_gen.get(vid, 0) != vgen:
+                                    return
+                            if not ldir.exists():
+                                return
+                            self.gdrive.upload_song(vid, m, ldir, mdata)
+                            ev.set()
+                            # Clean local disk once safely indexed in Google Drive (retry briefly if Windows FileResponse is mid-stream)
+                            for _attempt in range(6):
+                                if not ldir.exists():
+                                    break
+                                shutil.rmtree(ldir, ignore_errors=True)
+                                if not ldir.exists():
+                                    break
+                                time.sleep(3.0)
+                            parent = self.cache_dir / vid
+                            if parent.exists() and not any(parent.iterdir()):
+                                try:
+                                    parent.rmdir()
+                                except Exception:
+                                    pass
+                            self.log.info("GDrive", f"Uploaded {vid} ({m}) in background & freed local disk")
+                            self.log.trigger_sync_async()
+                        except Exception as gerr:
+                            self.log.error("GDrive", f"Background upload fallback to local ({vid}): {gerr}")
+                            self.enforce_cache_limit()
+                        finally:
+                            ev.set()
+
+                    threading.Thread(
+                        target=_bg_upload_and_cleanup,
+                        daemon=True,
+                        name=f"gdrive-up-{video_id}",
+                    ).start()
                 else:
                     pre_meta_hint = self.get_meta(video_id, mode)
                     self.enforce_cache_limit()

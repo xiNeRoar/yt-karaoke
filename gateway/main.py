@@ -1116,11 +1116,42 @@ def get_audio(video_id: str, mode: Literal["pure"], stem: Literal["instrumental"
             client.close()
             raise HTTPException(status_code=502, detail="Upstream audio unavailable")
 
+        dest = AUDIO_CACHE_DIR / f"{video_id}_{mode}_{stem}.mp3"
+        tmp = AUDIO_CACHE_DIR / f".proxy_{video_id}_{mode}_{stem}.{os.getpid()}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+
         def _proxy_stream():
+            fh = None
+            written = 0
+            completed = False
             try:
+                if MAX_NAS_CACHE_MB > 0:
+                    try:
+                        fh = open(tmp, "wb")
+                    except Exception:
+                        fh = None
                 for chunk in upstream.iter_bytes(65536):
+                    if fh is not None:
+                        try:
+                            fh.write(chunk)
+                        except Exception:
+                            pass
+                    written += len(chunk)
                     yield chunk
+                completed = written > 16384
             finally:
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                if completed and tmp.exists():
+                    try:
+                        os.replace(tmp, dest)
+                        threading.Thread(target=gw._enforce_nas_cache_limit, daemon=True).start()
+                    except Exception:
+                        tmp.unlink(missing_ok=True)
+                elif tmp.exists():
+                    tmp.unlink(missing_ok=True)
                 upstream.close()
                 client.close()
 
