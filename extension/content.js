@@ -1134,9 +1134,9 @@
         .replace(/\s+/g, " ")
         .trim();
 
-    // Backward-compatibility fallback for older cached duet lyrics that still have raw '男：'/'女：'/'合：' prefixes
+    // Backward-compatibility fallback for older cached duet lyrics that still have raw '男：'/'女：'/'合：' or '（男）'/'（女）'/'（合）' prefixes
     const hasExplicitSpeakerMeta = rawLines.some((l) => l && typeof l.speaker === "string" && l.speaker);
-    const LEGACY_SPK_RE = /^\s*[\(（]?\s*(男聲?|女聲?|合唱?|齊|男女合?|Male|Female|All|Both|Chorus)\s*[:：]\s*/i;
+    const LEGACY_SPK_RE = /^\s*(?:[\(（]?\s*(男聲?|女聲?|合唱?|齊|男女合?|Male|Female|All|Both|Chorus)\s*[:：]|[\(（\[【]\s*(男聲?|女聲?|合唱?|齊|男女合?|Male|Female|All|Both|Chorus)\s*[\)）\]】])\s*/i;
     const legacySpkRole = (lbl) => {
       const k = String(lbl || "").trim().toLowerCase();
       if (k.startsWith("男") && !k.includes("女")) return "male";
@@ -1167,12 +1167,12 @@
       if (enableLegacySpkClean) {
         const mSp = text.match(LEGACY_SPK_RE);
         if (mSp) {
-          const rSp = legacySpkRole(mSp[1]);
+          const rSp = legacySpkRole(mSp[1] || mSp[2]);
           speaker = rSp;
           if (duetTrack !== "counter") legacyCurSpeaker = rSp;
           const unwrapped = text.replace(/^\s*[\(（]\s*/, "").replace(/\s*[\)）]\s*$/, "");
-          text = unwrapped.replace(LEGACY_SPK_RE, "").trim() || text;
-          while (words.length > 0 && /[:：]$/.test(words[0].word || "")) {
+          text = text.replace(LEGACY_SPK_RE, "").trim() || unwrapped.replace(LEGACY_SPK_RE, "").trim() || text;
+          while (words.length > 0 && (/[:：]$/.test(words[0].word || "") || LEGACY_SPK_RE.test(words[0].word || ""))) {
             words.shift();
           }
         } else if (legacyCurSpeaker) {

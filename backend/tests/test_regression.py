@@ -1805,7 +1805,104 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     solo_only = [{"start": 1.0, "end": 3.0, "text": "愛你一萬年", "words": lw._even_words_for_line("愛你一萬年", 1.0, 3.0)}]
     solo_clean = lw._normalize_duet_speakers_and_clean_text(solo_only)
     assert "speaker" not in solo_clean[0] and solo_clean[0]["text"] == "愛你一萬年"
-    print("[PASS] Gate 5 YRC word quality, HK KTV speaker color-coding (incl. F0 named singers), M1 duet guard & Dual-Track Counterpoint")
+
+    # 5D) Parenthetical/bracketed canonical speaker tags ('（男）'/'（女）'/'（合）') MUST be skipped by CTC,
+    #     split mid-line cleanly, and mapped to HK KTV roles with zero leaked tags!
+    assert lw._tokenize_line_for_ctc("（男）沒有一聲再見 （女）沒有半聲嗟怨") == [
+        "沒", "有", "一", "聲", "再", "見", "沒", "有", "半", "聲", "嗟", "怨"
+    ]
+    paren_spk_lines = [
+        {"start": 10.0, "end": 13.0, "text": "（男）沒有一聲再見", "words": lw._even_words_for_line("沒有一聲再見", 10.0, 13.0)},
+        {"start": 13.2, "end": 16.0, "text": "淡淡去但無言", "words": lw._even_words_for_line("淡淡去但無言", 13.2, 16.0)},
+        {"start": 16.5, "end": 22.0, "text": "（女）你我相隔多麼遠 （男）你我相隔多麼遠", "words": lw._even_words_for_line("你我相隔多麼遠", 16.5, 19.0) + lw._even_words_for_line("你我相隔多麼遠", 19.2, 22.0)},
+        {"start": 22.2, "end": 26.0, "text": "（女）那處景可會 （合）改變", "words": lw._even_words_for_line("那處景可會", 22.2, 24.5) + lw._even_words_for_line("改變", 24.6, 26.0)},
+    ]
+    paren_clean = lw._normalize_duet_speakers_and_clean_text(paren_spk_lines)
+    assert [x["text"] for x in paren_clean] == [
+        "沒有一聲再見", "淡淡去但無言", "你我相隔多麼遠", "你我相隔多麼遠", "那處景可會", "改變",
+    ], f"Parenthetical speaker split failed: {paren_clean}"
+    assert [x.get("speaker") for x in paren_clean] == ["male", "male", "female", "male", "female", "all"], f"Parenthetical speaker roles wrong: {paren_clean}"
+
+    # 5E) Cross-song speaker isolation: tagged Song #1 ending on 'male' followed by >=18s break + >=6 untagged lines
+    #     of Song #2 MUST NOT leak 'male' across the inter-song break into Song #2!
+    medley_leak_test = [
+        {"start": 10.0, "end": 13.0, "text": "女：第一首女聲", "words": lw._even_words_for_line("第一首女聲", 10.0, 13.0)},
+        {"start": 13.5, "end": 16.0, "text": "男：第一首男聲結尾", "words": lw._even_words_for_line("第一首男聲結尾", 13.5, 16.0)},
+    ] + [
+        {"start": 40.0 + k * 4.0, "end": 43.0 + k * 4.0, "text": f"第二首歌無標記第{k}句", "words": lw._even_words_for_line(f"第二首歌無標記第{k}句", 40.0 + k * 4.0, 43.0 + k * 4.0)}
+        for k in range(6)
+    ]
+    medley_clean = lw._normalize_duet_speakers_and_clean_text(medley_leak_test)
+    assert medley_clean[0].get("speaker") == "female" and medley_clean[1].get("speaker") == "male"
+    assert all("speaker" not in x for x in medley_clean[2:]), f"Song #1 speaker leaked across 24s break into untagged Song #2: {medley_clean[2:]}"
+
+    # 5F) Unaccompanied concert MC banter filter: drops stage talk where band stopped (-20dB inst drop, +20dB voc/inst spike)
+    #     while preserving accompanied unknown medley songs AND a cappella concerts!
+    db_v_con = np.full(1200, -18.0, dtype=np.float32)  # 120s @ 0.1s
+    db_i_con = np.full(1200, -19.0, dtype=np.float32)
+    db_i_con[450:800] = -45.0  # 45..80s: band stopped for MC banter!
+    matched_s = [{"start": 5.0 + k * 4.0, "end": 8.0 + k * 4.0} for k in range(8)]
+    banter_cl = [{"start": 48.0 + k * 3.0, "end": 50.5 + k * 3.0} for k in range(6)]
+    song3_cl = [{"start": 85.0 + k * 3.0, "end": 87.5 + k * 3.0} for k in range(6)]
+    assert lw._is_unaccompanied_spoken_banter_cluster(banter_cl, matched_s, db_v_con, db_i_con, 0.1) is True
+    assert lw._is_unaccompanied_spoken_banter_cluster(song3_cl, matched_s, db_v_con, db_i_con, 0.1) is False
+    # A cappella protection: if matched singing ALSO has quiet inst (-48dB), never drop!
+    db_i_acap = np.full(1200, -48.0, dtype=np.float32)
+    assert lw._is_unaccompanied_spoken_banter_cluster(banter_cl, matched_s, db_v_con, db_i_acap, 0.1) is False
+
+    # 5G) Bracketed artist credit inside DB trackName ('10 [梅艳芳] 今夜只因你') MUST NEVER hijack another song by that artist!
+    sc_hijack = lw._track_matches_title("10 [梅艳芳] 今夜只因你", "梅艳芳", "缘分 张国荣 梅艳芳")
+    assert sc_hijack == 0.0, f"Bracketed artist name hijacked song title match: {sc_hijack}"
+    # Opening 'Title - Artist' & 'Artist1&Artist2' metadata headers stripped by clean_lyric_lines while preserving lyrics!
+    cl_hdr = lw.clean_lyric_lines([
+        "芳華絕代 - 梅艷芳 (Anita Mui)/張國榮 (Leslie Cheung)",
+        "張國榮&梅豔芳",
+        "（男）沒有一聲再見",
+        "你我相隔多麼遠",
+    ])
+    assert cl_hdr == ["（男）沒有一聲再見", "你我相隔多麼遠"], f"Opening credit header survived clean_lyric_lines: {cl_hdr}"
+
+    # 5H) Orphan 1-2 anchor low-sim noise run pruning: drops isolated 1-2 anchor banter blips (>=15s from strong run, max_sim<0.65)
+    #     while preserving genuine reprises (>=3 lines OR high sim>=0.65) and nearby lines (<15s)!
+    strong_run = [
+        {"start": 10.0 + k * 5.0, "end": 14.0 + k * 5.0, "text": f"L{k}", "sim": 0.85, "_pool": 0, "_idx": k}
+        for k in range(6)
+    ]  # spans 10..39s
+    orphan_blip = [{"start": 95.0, "end": 98.0, "text": "L15", "sim": 0.41, "_pool": 0, "_idx": 15}]
+    orphan_pair = [
+        {"start": 102.0, "end": 105.0, "text": "L14", "sim": 0.38, "_pool": 0, "_idx": 14},
+        {"start": 106.0, "end": 109.0, "text": "L15", "sim": 0.42, "_pool": 0, "_idx": 15},
+    ]
+    hi_reprise = [
+        {"start": 115.0, "end": 118.0, "text": "L0", "sim": 0.82, "_pool": 0, "_idx": 0},
+        {"start": 119.0, "end": 122.0, "text": "L1", "sim": 0.50, "_pool": 0, "_idx": 1},
+    ]
+    near_line = [{"start": 48.0, "end": 51.0, "text": "L6", "sim": 0.40, "_pool": 0, "_idx": 6}]
+    multi_reprise = [
+        {"start": 130.0, "end": 133.0, "text": "L1", "sim": 0.42, "_pool": 0, "_idx": 1},
+        {"start": 134.0, "end": 137.0, "text": "L2", "sim": 0.45, "_pool": 0, "_idx": 2},
+        {"start": 138.0, "end": 141.0, "text": "L3", "sim": 0.44, "_pool": 0, "_idx": 3},
+    ]
+    pruned_res = lw._prune_orphan_noise_runs([strong_run, near_line, orphan_blip, orphan_pair, hi_reprise, multi_reprise])
+    assert len(pruned_res) == 4 and orphan_blip not in pruned_res and orphan_pair not in pruned_res, f"Orphan noise run pruning failed: {pruned_res}"
+    assert near_line in pruned_res and hi_reprise in pruned_res and multi_reprise in pruned_res
+
+    # 5I) Shazam / duplicate-pool duet-tag preservation: an untagged duplicate pool MUST NEVER overwrite
+    #     an existing duet-tagged lyric pool of the exact same song, while genuinely new songs pass through!
+    duet_pool = [
+        "男：你想不想 吻一吻", "傾國傾城 是我大名",
+        "女：蒙羅麗莎 只是一幅畫", "如何艷壓天下",
+        "合：唯獨是天姿國色", "不可一世",
+    ]
+    untagged_dup = [
+        "你想不想 吻一吻", "傾國傾城 是我大名",
+        "蒙羅麗莎 只是一幅畫", "如何艷壓天下",
+        "唯獨是天姿國色", "不可一世",
+    ]
+    brand_new_song = ["沒有一聲再見", "沒有半聲嗟怨", "淡淡去但無言", "過去終於過去"]
+    merged_shz = lw._preserve_duet_tags_against_duplicates([untagged_dup, brand_new_song], [duet_pool])
+    assert merged_shz[0] == duet_pool and merged_shz[1] == brand_new_song, f"Duet pool downgraded by untagged duplicate: {merged_shz}"
+    print("[PASS] Gate 5 YRC word quality, HK KTV speaker color-coding (incl. F0/paren tags/cross-song isolation), MC banter filter & Dual-Track Counterpoint")
 
 
 def main() -> int:

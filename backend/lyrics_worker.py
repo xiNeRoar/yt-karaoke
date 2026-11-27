@@ -413,8 +413,14 @@ def _sanitize_lyric_lines_output(lines: list[dict]) -> list[dict]:
     return out
 
 
+_OPENING_TITLE_ARTIST_RE = re.compile(r"^.{1,36}\s[-—–]\s.{1,64}$")
+_OPENING_DUET_CREDIT_RE = re.compile(
+    r"^[\u4e00-\u9fffA-Za-z0-9\s.'-]{1,18}\s*[&＆×]\s*[\u4e00-\u9fffA-Za-z0-9\s.'-]{1,18}$"
+)
+
+
 def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
-    # Whole-song non-Chinese check so Japanese Kanji-only lines in Japanese songs are NEVER corrupted by OpenCC!
+    # Whole-song non-Chinese check so Japanese Kanji-only lines in Japanese songs are NEVER converted by OpenCC!
     is_non_zh = _is_non_chinese_cjk("\n".join(raw_lines or []))
     out = []
     for raw in raw_lines:
@@ -422,6 +428,8 @@ def clean_lyric_lines(raw_lines: list[str]) -> list[str]:
         if not s:
             continue
         if CREDIT_LINE_RE.match(s) or SECTION_HEADER_RE.match(s) or _is_instrumental_placeholder(s):
+            continue
+        if not out and (_OPENING_TITLE_ARTIST_RE.match(s) or _OPENING_DUET_CREDIT_RE.match(s)):
             continue
         hk = _strip_lyric_question_marks(s if is_non_zh else to_hk_traditional(s))
         if not hk:
@@ -522,16 +530,84 @@ def parse_lrc(lrc_text: str) -> list[dict]:
 YRC_LINE_RE = re.compile(r"^\[(\d+),(\d+)\](.*)$")
 YRC_WORD_RE = re.compile(r"\((\d+),(\d+)(?:,\d+)?\)(.*?)(?=\(\d+,\d+(?:,\d+)?\)|$)")
 BACKING_PAREN_LINE_RE = re.compile(r"^[\(（][^()（）]{1,28}[\)）]$")
-SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
-INLINE_SPEAKER_TAG_RE = re.compile(r"(?:^|(?<=[\s\(（\[【]))(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
-DUET_LEAD_SPEAKER_RE = re.compile(r"^\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：])\s*")
-DUET_INLINE_SPK_CAP_RE = re.compile(r"(?:^|(?<=[\s\(（\[【]))((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：])\s*")
+_CANON_BRACKET_SPK_PAT = (
+    r"[\(（\[【]\s*(?:男聲|男声|男|女聲|女声|女|合唱|男女合|男女|合|齊|齐|male|female|all|both|together|chorus|duet)\s*[\)）\]】]"
+)
+SPEAKER_PREFIX_RE = re.compile(
+    rf"^\s*(?:(?:[\u4e00-\u9fff]{{1,4}}|[A-Za-z]{{1,12}})\s*[:：]|{_CANON_BRACKET_SPK_PAT})\s*",
+    re.IGNORECASE,
+)
+INLINE_SPEAKER_TAG_RE = re.compile(
+    rf"(?:(?:^|(?<=[\s\(（\[【]))(?:[\u4e00-\u9fff]{{1,4}}|[A-Za-z]{{1,12}})\s*[:：]|{_CANON_BRACKET_SPK_PAT})\s*",
+    re.IGNORECASE,
+)
+DUET_LEAD_SPEAKER_RE = re.compile(
+    rf"^\s*((?:[\u4e00-\u9fff]{{1,4}}|[A-Za-z]{{1,12}})\s*[:：]|{_CANON_BRACKET_SPK_PAT})\s*",
+    re.IGNORECASE,
+)
+DUET_INLINE_SPK_CAP_RE = re.compile(
+    rf"(?:(?:^|(?<=[\s\(（\[【]))((?:[\u4e00-\u9fff]{{1,4}}|[A-Za-z]{{1,12}})\s*[:：])|({_CANON_BRACKET_SPK_PAT}))\s*",
+    re.IGNORECASE,
+)
 DUET_INLINE_COUNTERPOINT_RE = re.compile(
     r"^(.*?)[\(（]\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：][^()（）]{2,28})[\)）]\s*$"
 )
 DUET_PAREN_SPEAKER_LINE_RE = re.compile(
     r"^[\(（]\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：][^()（）]{2,28})[\)）]\s*$"
 )
+
+
+def _iter_duet_spk_matches(text: str) -> list[tuple[int, int, str]]:
+    """Return list of (start, end, raw_tag_label) for both colon tags ('男：') and bracketed canonical tags ('（男）')."""
+    out: list[tuple[int, int, str]] = []
+    for m in DUET_INLINE_SPK_CAP_RE.finditer(text or ""):
+        lbl = (m.group(1) or m.group(2) or "").strip()
+        if lbl:
+            out.append((m.start(), m.end(), lbl))
+    return out
+
+
+def _pool_duet_tag_count(lines: list[str]) -> int:
+    """Count lines carrying explicit speaker tags (colon or bracketed canonical role tags)."""
+    return sum(1 for ln in (lines or []) if _iter_duet_spk_matches(ln))
+
+
+def _pools_are_same_song(pool_a: list[str], pool_b: list[str]) -> bool:
+    """Return True if two lyric pools represent the same song (>=50% normalized line overlap, ignoring speaker tags)."""
+    a_set = {
+        _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))
+        for x in (pool_a or [])
+        if len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) >= 4
+    }
+    b_set = {
+        _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))
+        for x in (pool_b or [])
+        if len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) >= 4
+    }
+    if len(a_set) < 3 or not b_set:
+        return False
+    return (len(a_set & b_set) / max(1, min(len(a_set), len(b_set)))) >= 0.50
+
+
+def _preserve_duet_tags_against_duplicates(
+    candidate_pools: list[list[str]],
+    existing_pools: list[list[str]],
+) -> list[list[str]]:
+    """Never allow an untagged duplicate pool (e.g. from Shazam fallback) to downgrade an existing
+    duet-tagged lyric pool of the exact same song.
+    """
+    out: list[list[str]] = []
+    for cp in candidate_pools:
+        if _pool_duet_tag_count(cp) < 2:
+            better_ep = next(
+                (ep for ep in existing_pools if _pool_duet_tag_count(ep) >= 2 and _pools_are_same_song(cp, ep)),
+                None,
+            )
+            if better_ep is not None:
+                out.append(list(better_ep))
+                continue
+        out.append(cp)
+    return out
 
 
 def parse_yrc(yrc_text: str) -> list[dict]:
@@ -768,7 +844,7 @@ def _yrc_passes_word_quality_gate(
         txt = (ln.get("text") or "").strip()
         m_sp = DUET_LEAD_SPEAKER_RE.match(txt)
         if m_sp:
-            cur_spk = re.sub(r"[:：\s]+", "", m_sp.group(1))
+            cur_spk = _norm_speaker_key(m_sp.group(1))
 
         m_inl = DUET_INLINE_COUNTERPOINT_RE.match(txt)
         if m_inl:
@@ -1250,10 +1326,15 @@ def _track_matches_title(
     paren_aliases: list[str] = []
     for pm in re.findall(r"[\(\[（【［]([^()\[\]（）【】［］]{1,48})[\)\]）】］]", raw_track):
         ps = pm.strip()
-        if ps and not VERSION_TAG_RE.search(ps) and not re.search(
-            r"\b(?:feat\.?|ft\.?|ver\.?|version|edit|ost|mv|pv|m/v|official|music\s*video|lyric\s*video|lyrics?|video|audio|visualizer|hd|4k|hq|full|clip|stage|performance)\b",
-            ps,
-            re.IGNORECASE,
+        if (
+            ps
+            and not (artist_name and _artist_match_level(artist_name, ps) >= 0.50)
+            and not VERSION_TAG_RE.search(ps)
+            and not re.search(
+                r"\b(?:feat\.?|ft\.?|ver\.?|version|edit|ost|mv|pv|m/v|official|music\s*video|lyric\s*video|lyrics?|video|audio|visualizer|hd|4k|hq|full|clip|stage|performance)\b",
+                ps,
+                re.IGNORECASE,
+            )
         ):
             paren_aliases.append(ps)
 
@@ -1641,7 +1722,9 @@ def fetch_official_lyrics(
                 # Allow upgrading line-only LRCLIB LRC -> NetEase word-level YRC even when LRCLIB scored slightly
                 # higher due to bilingual titles (e.g. '抽 Inhale' vs '抽'), verified by lyric-content similarity!
                 can_upgrade_yrc = (not is_live_or_alt) and (not best_synced_is_yrc) and (sc >= max(1.0, best_score * 0.65))
-                if sc <= best_score and not can_upgrade_lrc and not can_upgrade_yrc:
+                # Allow upgrading untagged LRCLIB lyrics -> duet speaker-tagged NetEase lyrics of the exact same song!
+                can_upgrade_duet = (sc >= best_score - 0.15) and bool(best_lines) and (_pool_duet_tag_count(best_lines) < 2)
+                if sc <= best_score and not can_upgrade_lrc and not can_upgrade_yrc and not can_upgrade_duet:
                     break
                 try:
                     lr = client.get(
@@ -1694,7 +1777,15 @@ def fetch_official_lyrics(
                             and bool(best_lines)
                             and _unbalanced_paren_count(best_lines) > _unbalanced_paren_count(ne_clean_lines)
                         )
-                        if sc > best_score or prefer_cleaner_tie:
+                        prefer_duet_upgrade = (
+                            can_upgrade_duet
+                            and _pool_duet_tag_count(ne_clean_lines) >= 2
+                            and (
+                                _pools_are_same_song(best_lines, ne_clean_lines)
+                                or _lyric_similarity(" ".join(best_lines[:14]), " ".join(ne_clean_lines[:14])) >= 0.45
+                            )
+                        )
+                        if sc > best_score or prefer_cleaner_tie or prefer_duet_upgrade:
                             best_score = max(best_score, sc)
                             best_lines = ne_clean_lines
                             best_source = f"NetEase ({s.get('name') or ''})"
@@ -1957,10 +2048,11 @@ def shazam_scan_and_fetch_lyrics(
     return combined_lines, unique_tracks
 
 
-def search_official_lyrics_pools_by_sung_phrases(asr_segs: list[dict]) -> list[list[str]]:
+def search_official_lyrics_pools_by_sung_phrases(asr_segs: list[dict], artist_hint: str = "") -> list[list[str]]:
     """Identify unknown song(s) inside a Mashup / Live Cover / Acoustic Medley directly from sung lyric phrases!
     Parallelized across probes using shared httpx.Client; handles CJK, Japanese, Korean, and English safely,
-    and returns distinct per-song pools (`list[list[str]]`) so multi-song discoveries never smash together!
+    prefers artist-matched & duet-speaker-tagged originals over untagged solo covers, and returns distinct
+    per-song pools (`list[list[str]]`) so multi-song discoveries never smash together!
     """
     cands = []
     for s in asr_segs:
@@ -1991,13 +2083,13 @@ def search_official_lyrics_pools_by_sung_phrases(asr_segs: list[dict]) -> list[l
                 data={"s": qs, "type": 1006, "limit": 4},
                 headers=headers,
             )
-            return ((r.json().get("result") or {}).get("songs") or [])[:3]
+            return ((r.json().get("result") or {}).get("songs") or [])[:4]
         except Exception:
             return []
 
     seen_song_ids: set[int] = set()
-    seen_titles: set[str] = set()
-    rescued_pools: list[list[str]] = []
+    best_by_title: dict[str, tuple[float, int, str, str, list[str]]] = {}
+    title_order: list[str] = []
 
     with httpx.Client(timeout=7.0, follow_redirects=True) as client:
         with ThreadPoolExecutor(max_workers=min(6, len(probes))) as ex:
@@ -2007,8 +2099,8 @@ def search_official_lyrics_pools_by_sung_phrases(asr_segs: list[dict]) -> list[l
             for s in songs:
                 sid = s.get("id")
                 tr_name = s.get("name") or ""
-                base_t = _norm_lyrics_cmp(re.sub(r"[\(\[（【［].*?[\)\]）】］]", "", tr_name))
-                if not sid or sid in seen_song_ids or (base_t and base_t in seen_titles):
+                base_t = _norm_lyrics_cmp(re.sub(r"[\(\[（【［].*?[\)\]）】］]", "", tr_name)) or str(sid)
+                if not sid or sid in seen_song_ids:
                     continue
                 seen_song_ids.add(sid)
                 try:
@@ -2024,35 +2116,48 @@ def search_official_lyrics_pools_by_sung_phrases(asr_segs: list[dict]) -> list[l
                     lines = clean_lyric_lines([x["text"] for x in parsed])
                     if len(lines) < 6:
                         continue
-                    # Script-aware verification: CJK prefix check ONLY for CJK/JP lines; EN/KO require real word-level similarity!
+                    # Script-aware verification (strips unsung speaker tags like '（男）'/'男：' before matching!)
                     hit_lines = 0
+                    spk_tagged_cnt = 0
                     for ln in set(lines):
-                        nln = _norm_lyrics_cmp(ln)
+                        if _iter_duet_spk_matches(ln):
+                            spk_tagged_cnt += 1
+                        sung_ln = INLINE_SPEAKER_TAG_RE.sub("", ln).strip()
+                        nln = _norm_lyrics_cmp(sung_ln)
                         if len(nln) < 4:
                             continue
-                        is_cjk_ln = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", ln)) >= 4
+                        is_cjk_ln = len(re.findall(r"[\u4e00-\u9fff\u3040-\u30ff]", sung_ln)) >= 4
                         if (is_cjk_ln and nln[:4] in asr_blob) or any(
-                            _lyric_similarity(seg["text"], ln) >= (0.45 if is_cjk_ln else 0.52) for seg in asr_segs
+                            _lyric_similarity(seg["text"], sung_ln) >= (0.45 if is_cjk_ln else 0.52) for seg in asr_segs
                         ):
                             hit_lines += 1
                     if hit_lines >= 3:
-                        if base_t:
-                            seen_titles.add(base_t)
-                        artists = "/".join((a.get("name") or "") for a in (s.get("artists") or []))
-                        print(
-                            f"[Lyrics] Phrase-search rescued song: {artists} - {tr_name} (matched {hit_lines} lines)",
-                            flush=True,
-                        )
-                        rescued_pools.append(lines)
-                        break
+                        artists = "/".join((a.get("name") or "") for a in (s.get("ar") or s.get("artists") or []))
+                        ar_bonus = (3.5 * _artist_match_level(artists, artist_hint)) if artist_hint else 0.0
+                        duet_bonus = 2.0 if spk_tagged_cnt >= 2 else 0.0
+                        rank_sc = float(hit_lines) + ar_bonus + duet_bonus
+                        prev_best = best_by_title.get(base_t)
+                        if prev_best is None:
+                            title_order.append(base_t)
+                            best_by_title[base_t] = (rank_sc, hit_lines, artists, tr_name, lines)
+                        elif rank_sc > prev_best[0]:
+                            best_by_title[base_t] = (rank_sc, hit_lines, artists, tr_name, lines)
                 except Exception:
                     continue
 
+    rescued_pools: list[list[str]] = []
+    for bt in title_order:
+        _, hit_lines, artists, tr_name, lines = best_by_title[bt]
+        print(
+            f"[Lyrics] Phrase-search rescued song: {artists} - {tr_name} (matched {hit_lines} lines)",
+            flush=True,
+        )
+        rescued_pools.append(lines)
     return rescued_pools
 
 
-def search_official_lyrics_by_sung_phrases(asr_segs: list[dict]) -> list[str]:
-    pools = search_official_lyrics_pools_by_sung_phrases(asr_segs)
+def search_official_lyrics_by_sung_phrases(asr_segs: list[dict], artist_hint: str = "") -> list[str]:
+    pools = search_official_lyrics_pools_by_sung_phrases(asr_segs, artist_hint=artist_hint)
     return [ln for p in pools for ln in p]
 
 
@@ -3586,6 +3691,90 @@ def _build_qwen3_windows(
     return out
 
 
+def _is_unaccompanied_spoken_banter_cluster(
+    cluster: list[dict],
+    matched_lines: list[dict],
+    db_voc: np.ndarray,
+    db_inst: np.ndarray,
+    step_sec: float,
+) -> bool:
+    """First-principles acoustic detector for live concert MC banter / stage talk between songs.
+
+    Compares an unmatched raw-ASR cluster's accompaniment level & vocal-to-instrumental ratio
+    strictly against THIS SAME RECORDING's verified singing sections (self-calibrated, zero
+    keyword blacklists):
+      - Returns False for a cappella recordings (matched_inst_med <= -36 dB).
+      - Returns False for genuine accompanied unknown medley songs (band keeps playing).
+      - Returns True ONLY when the band stopped playing (inst dropped >= 10 dB AND voc-inst
+        ratio jumped >= +10 dB), proving stage talk / MC banter rather than singing!
+    """
+    if not cluster or len(matched_lines) < 4 or len(db_voc) == 0 or len(db_inst) == 0 or step_sec <= 0:
+        return False
+
+    def _collect_db(segs: list[dict], prof: np.ndarray) -> np.ndarray:
+        vals: list[np.ndarray] = []
+        n_p = len(prof)
+        for seg in segs:
+            i0 = max(0, int(float(seg["start"]) / step_sec))
+            i1 = min(n_p, max(i0 + 1, int(float(seg["end"]) / step_sec)))
+            if i1 > i0:
+                vals.append(prof[i0:i1])
+        return np.concatenate(vals) if vals else np.array([], dtype=np.float32)
+
+    m_voc = _collect_db(matched_lines, db_voc)
+    m_inst = _collect_db(matched_lines, db_inst)
+    c_voc = _collect_db(cluster, db_voc)
+    c_inst = _collect_db(cluster, db_inst)
+    if len(m_voc) < 20 or len(m_inst) < 20 or len(c_voc) < 10 or len(c_inst) < 10:
+        return False
+
+    m_voc_med = float(np.median(m_voc))
+    m_inst_med = float(np.median(m_inst))
+    c_voc_med = float(np.median(c_voc))
+    c_inst_med = float(np.median(c_inst))
+    if m_inst_med <= -36.0:
+        return False
+    inst_drop = m_inst_med - c_inst_med
+    ratio_jump = (c_voc_med - c_inst_med) - (m_voc_med - m_inst_med)
+    return inst_drop >= 10.0 and ratio_jump >= 10.0
+
+
+def _prune_orphan_noise_runs(song_runs: list[list[dict]]) -> list[list[dict]]:
+    """Prune isolated 1-2 anchor low-similarity blips far (>=15s) from a pool's strong verified run(s).
+
+    In live concerts with spoken MC banter or applause between songs, a spoken utterance can weakly
+    match a lyric line (sim < 0.65) and pull an adjacent lyric line via sequential bonus. Removing
+    such orphan low-similarity blips prevents gap recovery from hallucinating lines across speech,
+    while preserving genuine reprises/encores (>=3 lines, OR nearby <15s, OR high sim >= 0.65).
+    """
+    if len(song_runs) < 2:
+        return song_runs
+    strong_spans_by_pool: dict[int, list[tuple[float, float]]] = {}
+    for r in song_runs:
+        if len(r) >= 4:
+            pi = int(r[0].get("_pool", -1))
+            if pi >= 0:
+                strong_spans_by_pool.setdefault(pi, []).append((float(r[0]["start"]), float(r[-1]["end"])))
+    if not strong_spans_by_pool:
+        return song_runs
+    kept: list[list[dict]] = []
+    for r in song_runs:
+        if 1 <= len(r) <= 2:
+            pi = int(r[0].get("_pool", -1))
+            max_sim = max((float(it.get("sim") or 0.0) for it in r), default=0.0)
+            spans = strong_spans_by_pool.get(pi)
+            if spans and max_sim < 0.65:
+                rs, re_ = float(r[0]["start"]), float(r[-1]["end"])
+                min_dist = min(
+                    0.0 if (rs <= se and re_ >= ss) else min(abs(rs - se), abs(ss - re_))
+                    for ss, se in spans
+                )
+                if min_dist >= 15.0:
+                    continue
+        kept.append(r)
+    return kept or song_runs
+
+
 def _live_section_anchored_align(
     model,
     vocals_path: Path,
@@ -3599,6 +3788,7 @@ def _live_section_anchored_align(
     inst_path: Optional[Path] = None,
     shazam_already_tried: bool = False,
     initial_song_pools: Optional[list[list[str]]] = None,
+    title_hint: str = "",
 ) -> list[dict]:
     """Live/Concert/Medley-aware alignment:
     1. Transcribes active vocal regions (using GPU BatchedInferencePipeline when available for 4-6x speed!)
@@ -3740,10 +3930,11 @@ def _live_section_anchored_align(
             for off in u_off:
                 if restrict_pool is not None and restrict_pool not in line_to_pools.get(off, set()):
                     continue
-                o_len = len(_norm_lyrics_cmp(off))
+                off_sung = INLINE_SPEAKER_TAG_RE.sub("", off).strip() or off
+                o_len = len(_norm_lyrics_cmp(off_sung))
                 if o_len == 0 or c_len > o_len * 2.1 or o_len > c_len * 2.6:
                     continue
-                sim = _lyric_similarity(text, off)
+                sim = _lyric_similarity(text, off_sung)
                 is_next = bool(prev_l and off in n_map.get(prev_l, set()))
                 bonus = 0.22 if (is_next and sim >= 0.22) else (0.12 if is_next else 0.0)
                 if cur_pool >= 0 and cur_pool in line_to_pools.get(off, set()) and sim >= 0.22:
@@ -3876,6 +4067,7 @@ def _live_section_anchored_align(
         )
         if shz_lines:
             shz_pools = [tr["official_lines"] for tr in shz_tracks if tr.get("official_lines")] or [list(shz_lines)]
+            shz_pools = _preserve_duet_tags_against_duplicates(shz_pools, song_pools)
             shz_combined = [ln for p in shz_pools for ln in p]
             m2, g2 = _match_against_pool(shz_combined, shz_pools)
             if (len(asr_segs) - len(g2)) > matched_asr_count:
@@ -3901,21 +4093,30 @@ def _live_section_anchored_align(
         min_hits = 4 if strict_multi else 3
         min_sim = 0.48 if strict_multi else 0.42
         hits = 0
+        sung_rescued = [INLINE_SPEAKER_TAG_RE.sub("", rl).strip() or rl for rl in rescued_lines]
         for g in cl:
             g_txt = g.get("text", "")
             if len(_norm_lyrics_cmp(g_txt)) < 3:
                 continue
-            best_s = max((_lyric_similarity(g_txt, rl) for rl in rescued_lines), default=0.0)
+            best_s = max((_lyric_similarity(g_txt, rl) for rl in sung_rescued), default=0.0)
             if best_s >= min_sim:
                 hits += 1
         return hits >= min_hits
 
     def _is_duplicate_pool(candidate_lines: list[str], existing_pools: list[list[str]]) -> bool:
-        c_set = {_norm_lyrics_cmp(x) for x in (candidate_lines or []) if len(_norm_lyrics_cmp(x)) >= 4}
+        c_set = {
+            _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))
+            for x in (candidate_lines or [])
+            if len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) >= 4
+        }
         if len(c_set) < 3:
             return True
         for ep in existing_pools:
-            e_set = {_norm_lyrics_cmp(x) for x in (ep or []) if len(_norm_lyrics_cmp(x)) >= 4}
+            e_set = {
+                _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))
+                for x in (ep or [])
+                if len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) >= 4
+            }
             if not e_set:
                 continue
             ov = len(c_set & e_set) / max(1, min(len(c_set), len(e_set)))
@@ -3928,7 +4129,7 @@ def _live_section_anchored_align(
         added_pool = False
         has_multi_title = bool(initial_song_pools and len(initial_song_pools) >= 2)
         for cl in extra_clusters[:3]:
-            rescued_pools = search_official_lyrics_pools_by_sung_phrases(cl)
+            rescued_pools = search_official_lyrics_pools_by_sung_phrases(cl, artist_hint=title_hint)
             for r_pool in rescued_pools:
                 if (
                     r_pool
@@ -4068,6 +4269,54 @@ def _live_section_anchored_align(
                 if sub_r:
                     song_runs.append([{**it, "_pool": pi} for it in sub_r])
 
+    # Load instrumental energy profile once (when available) to reject spoken concert MC banter BEFORE gap recovery!
+    db_inst_prof = np.array([], dtype=np.float32)
+    if inst_path and inst_path.exists():
+        try:
+            _, db_inst_prof, _, _ = detect_vocal_energy_profile(inst_path)
+        except Exception:
+            db_inst_prof = np.array([], dtype=np.float32)
+    ref_sing_items = [it for r in song_runs if len(r) >= 4 for it in r]
+    if len(db_inst_prof) > 0 and len(song_runs) >= 2 and len(ref_sing_items) >= 4:
+        strong_bounds = [(float(r[0]["start"]), float(r[-1]["end"])) for r in song_runs if len(r) >= 4]
+        pruned_runs: list[list[dict]] = []
+        for r in song_runs:
+            is_banter = len(r) <= 4 and _is_unaccompanied_spoken_banter_cluster(
+                r, ref_sing_items, db_profile, db_inst_prof, step_sec
+            )
+            if not is_banter and len(r) <= 2 and strong_bounds:
+                rs, re_ = float(r[0]["start"]), float(r[-1]["end"])
+                prev_end = max((se for ss, se in strong_bounds if se <= rs), default=0.0)
+                next_start = min((ss for ss, se in strong_bounds if ss >= re_), default=total_sec_est)
+                if (rs - prev_end) >= 10.0 and (next_start - re_) >= 10.0:
+                    ctx_s = max(prev_end + 3.0, rs - 12.0)
+                    ctx_e = min(next_start - 3.0, re_ + 12.0)
+                    if (ctx_e - ctx_s) >= 8.0 and _is_unaccompanied_spoken_banter_cluster(
+                        [{"start": ctx_s, "end": ctx_e}], ref_sing_items, db_profile, db_inst_prof, step_sec
+                    ):
+                        is_banter = True
+            if is_banter:
+                print(
+                    f"[Lyrics] Pruned spurious spoken-banter anchor run "
+                    f"({r[0]['start']:.1f}s-{r[-1]['end']:.1f}s, {len(r)} anchor(s)).",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            pruned_runs.append(r)
+        if pruned_runs:
+            song_runs = pruned_runs
+
+    before_orphan_n = len(song_runs)
+    song_runs = _prune_orphan_noise_runs(song_runs)
+    if len(song_runs) < before_orphan_n:
+        print(
+            f"[Lyrics] Pruned {before_orphan_n - len(song_runs)} isolated low-sim orphan anchor blip(s).",
+            file=sys.stderr,
+            flush=True,
+        )
+    ref_sing_items = [it for r in song_runs if len(r) >= 4 for it in r]
+
     # MACRO-BOUNDARY -> PER-SONG FULL SILENCE-COLLAPSED ALIGNMENT:
     # Coalesce contiguous runs of the same song pool (ignoring tiny <=2-line foreign noise blips or chorus-repeat splits!)
     # so sequential multi-song live sets (e.g. 2-song TV live / concert setlists) ALWAYS engage full per-song alignment!
@@ -4133,14 +4382,20 @@ def _live_section_anchored_align(
         macro_slices: list[tuple[float, float, int, list[dict]]] = []
         first_r = valid_pool_runs[0]
         lead_first_idx = max(0, int(first_r[0].get("_idx", 0)))
+        tight_s0 = max(0.0, float(first_r[0]["start"]) - 3.0)
         if lead_first_idx == 0:
-            start_0 = max(0.0, float(first_r[0]["start"]) - 3.0)
+            start_0 = tight_s0
         else:
             start_0 = max(0.0, float(first_r[0]["start"]) - max(10.0, lead_first_idx * 4.5 + 4.0))
             _, v_lead_s, _ = _contiguous_vocal_span(
                 db_profile, step_sec, gap_thr, start_0, float(first_r[0]["start"]), direction="backward", max_silent_gap=12.0
             )
             start_0 = max(start_0, v_lead_s - 2.0)
+            if start_0 < tight_s0 - 2.0 and _is_unaccompanied_spoken_banter_cluster(
+                [{"start": start_0, "end": float(first_r[0]["start"]) - 1.5}],
+                ref_sing_items, db_profile, db_inst_prof, step_sec,
+            ):
+                start_0 = tight_s0
         if start_0 < 4.0:
             start_0 = 0.0
         split_points: list[float] = [start_0]
@@ -4155,24 +4410,68 @@ def _live_section_anchored_align(
         last_r = valid_pool_runs[-1]
         pl_last = song_pools[last_r[0]["_pool"]]
         rem_last = max(0, len(pl_last) - 1 - int(last_r[-1].get("_idx", len(pl_last) - 1)))
+        tight_el = min(total_sec_est, float(last_r[-1]["end"]) + 3.0)
         if rem_last == 0:
-            end_last = min(total_sec_est, float(last_r[-1]["end"]) + 3.0)
+            end_last = tight_el
         else:
             end_last = min(total_sec_est, float(last_r[-1]["end"]) + max(10.0, rem_last * 4.5 + 4.0))
             _, _, v_trail_e = _contiguous_vocal_span(
                 db_profile, step_sec, gap_thr, float(last_r[-1]["end"]), end_last, direction="forward", max_silent_gap=12.0
             )
             end_last = min(end_last, v_trail_e + 2.0)
+            if end_last > tight_el + 2.0 and _is_unaccompanied_spoken_banter_cluster(
+                [{"start": float(last_r[-1]["end"]) + 1.5, "end": end_last}],
+                ref_sing_items, db_profile, db_inst_prof, step_sec,
+            ):
+                end_last = tight_el
         if total_sec_est - end_last < 4.0:
             end_last = total_sec_est
         split_points.append(end_last)
 
         # Verify each song looks like a full performance (not a tiny 30s abridged snippet!)
+        # Also tighten each interior slice boundary toward its verified anchors so long inter-song
+        # concert MC banter breaks are trimmed symmetrically just like leading/trailing host talk!
         all_full_songs = True
         for idx_r, r_cur in enumerate(valid_pool_runs):
             pi = r_cur[0]["_pool"]
             pl_cur = song_pools[pi]
             sl_s, sl_e = split_points[idx_r], split_points[idx_r + 1]
+            if idx_r > 0:
+                lead_cur = max(0, int(r_cur[0].get("_idx", 0)))
+                tight_s = max(sl_s, float(r_cur[0]["start"]) - 3.0)
+                if lead_cur == 0:
+                    sl_s = tight_s
+                else:
+                    cand_s = max(sl_s, float(r_cur[0]["start"]) - max(10.0, lead_cur * 4.5 + 4.0))
+                    _, v_lead_c, _ = _contiguous_vocal_span(
+                        db_profile, step_sec, gap_thr, cand_s, float(r_cur[0]["start"]), direction="backward", max_silent_gap=12.0
+                    )
+                    ext_s = max(cand_s, v_lead_c - 2.0)
+                    if ext_s < tight_s - 2.0 and _is_unaccompanied_spoken_banter_cluster(
+                        [{"start": ext_s, "end": float(r_cur[0]["start"]) - 1.5}],
+                        ref_sing_items, db_profile, db_inst_prof, step_sec,
+                    ):
+                        sl_s = tight_s
+                    else:
+                        sl_s = ext_s
+            if idx_r < len(valid_pool_runs) - 1:
+                rem_cur = max(0, len(pl_cur) - 1 - int(r_cur[-1].get("_idx", len(pl_cur) - 1)))
+                tight_e = min(sl_e, float(r_cur[-1]["end"]) + 3.0)
+                if rem_cur == 0:
+                    sl_e = tight_e
+                else:
+                    cand_e = min(sl_e, float(r_cur[-1]["end"]) + max(10.0, rem_cur * 4.5 + 4.0))
+                    _, _, v_trail_c = _contiguous_vocal_span(
+                        db_profile, step_sec, gap_thr, float(r_cur[-1]["end"]), cand_e, direction="forward", max_silent_gap=12.0
+                    )
+                    ext_e = min(cand_e, v_trail_c + 2.0)
+                    if ext_e > tight_e + 2.0 and _is_unaccompanied_spoken_banter_cluster(
+                        [{"start": float(r_cur[-1]["end"]) + 1.5, "end": ext_e}],
+                        ref_sing_items, db_profile, db_inst_prof, step_sec,
+                    ):
+                        sl_e = tight_e
+                    else:
+                        sl_e = ext_e
             idxs_r = [int(it.get("_idx", 0)) for it in r_cur if int(it.get("_idx", -1)) >= 0]
             span_cov = ((max(idxs_r) - min(idxs_r) + 1) / max(1, len(pl_cur))) if idxs_r else 0.0
             if (sl_e - sl_s) < 90.0 and span_cov < 0.55:
@@ -4266,7 +4565,7 @@ def _live_section_anchored_align(
         # 1) Leading lines recovery (0 .. first_idx - 1) walking BACKWARD across contiguous singing
         first_item = run[0]
         first_idx = first_item["_idx"]
-        if first_idx > 0 and first_item["start"] - prev_bound >= 1.2:
+        if first_idx > 0 and first_item["start"] - prev_bound >= 1.2 and (first_idx <= 2 or len(run) >= 3):
             lead_n = first_idx
             lead_weights = [max(1.0, estimate_syllable_units(pl[m_i])) for m_i in range(lead_n)]
             lead_syl = sum(lead_weights)
@@ -4278,7 +4577,9 @@ def _live_section_anchored_align(
             if act_sec >= max(0.7, 0.08 * lead_syl):
                 span_s = max(prev_bound, v_first)
                 span_e = first_item["start"]
-                if (span_e - span_s) >= max(0.60, 0.095 * lead_syl):
+                if (span_e - span_s) >= max(0.60, 0.095 * lead_syl) and not _is_unaccompanied_spoken_banter_cluster(
+                    [{"start": span_s, "end": span_e}], ref_sing_items, db_profile, db_inst_prof, step_sec
+                ):
                     acc = 0.0
                     for m_i, wt in enumerate(lead_weights):
                         s_m = span_s + (span_e - span_s) * (acc / lead_syl)
@@ -4315,8 +4616,9 @@ def _live_section_anchored_align(
         # 3) Trailing lines recovery (last_idx + 1 .. len(pl) - 1) walking FORWARD across contiguous singing
         last_item = run_work[-1]
         last_idx = last_item["_idx"]
-        if 0 <= last_idx < len(pl) - 1 and next_bound - last_item["end"] >= 1.2:
-            trail_n = len(pl) - 1 - last_idx
+        trail_n_chk = (len(pl) - 1 - last_idx) if 0 <= last_idx < len(pl) - 1 else 0
+        if trail_n_chk > 0 and next_bound - last_item["end"] >= 1.2 and (trail_n_chk <= 2 or len(run_work) >= 3):
+            trail_n = trail_n_chk
             trail_weights = [max(1.0, estimate_syllable_units(pl[last_idx + 1 + m_i])) for m_i in range(trail_n)]
             trail_syl = sum(trail_weights)
             max_trail_window = min(next_bound - last_item["end"], max(12.0, trail_n * 5.2))
@@ -4327,7 +4629,9 @@ def _live_section_anchored_align(
             if act_sec >= max(0.7, 0.08 * trail_syl):
                 span_s = last_item["end"]
                 span_e = min(next_bound, v_last)
-                if (span_e - span_s) >= max(0.60, 0.095 * trail_syl):
+                if (span_e - span_s) >= max(0.60, 0.095 * trail_syl) and not _is_unaccompanied_spoken_banter_cluster(
+                    [{"start": span_s, "end": span_e}], ref_sing_items, db_profile, db_inst_prof, step_sec
+                ):
                     acc = 0.0
                     for m_i, wt in enumerate(trail_weights):
                         s_m = span_s + (span_e - span_s) * (acc / trail_syl)
@@ -4350,8 +4654,17 @@ def _live_section_anchored_align(
         return False
 
     remaining_gaps = [g for g in unmatched_gaps if not _covered_by_matched(0.5 * (g["start"] + g["end"]))]
+    unmatched_clusters = _find_sustained_unmatched_clusters(remaining_gaps)
 
-    for cl in _find_sustained_unmatched_clusters(remaining_gaps):
+    for cl in unmatched_clusters:
+        if _is_unaccompanied_spoken_banter_cluster(cl, matched, db_profile, db_inst_prof, step_sec):
+            print(
+                f"[Lyrics] Filtered unaccompanied concert MC banter cluster "
+                f"({cl[0]['start']:.1f}s-{cl[-1]['end']:.1f}s, {len(cl)} spoken segments).",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
         for g in cl:
             matched.append({"start": g["start"], "end": g["end"], "text": g["text"], "sim": 0.5})
     matched.sort(key=lambda x: x["start"])
@@ -4769,7 +5082,8 @@ def _enforce_strict_monotonic_bounds(
     ceil_t = float(audio_dur) if audio_dur > 0 else 1e9
 
     def _is_spk_anchor(w: dict) -> bool:
-        return str(w.get("word") or "").rstrip().endswith((":", "："))
+        wd = str(w.get("word") or "").strip()
+        return wd.endswith((":", "：")) or bool(SPEAKER_PREFIX_RE.fullmatch(wd))
 
     def _repair_clamped_zero_words(ln: dict) -> None:
         ws = ln.get("words") or []
@@ -5463,18 +5777,22 @@ def _attach_ctc_speaker_anchors(
     ctc_words: list[dict],
     min_start: float = 0.0,
 ) -> list[dict]:
-    """Re-attach skipped leading & inline speaker tags (e.g. '男：', '女：', '合：', '陳蕾：', 'Chorus:')
+    """Re-attach skipped leading & inline speaker tags (e.g. '男：', '女：', '合：', '（男）', '（女）', 'Chorus:')
     as 0.02s visual-width anchors immediately before their following sung word so the frontend KTV
     clip-path sweep starts on the EXACT first sung character with zero 2-char lag (100% idempotent).
     """
     if not ctc_words:
         return ctc_words
-    if any(str(w.get("word") or "").rstrip().endswith((":", "：")) for w in ctc_words):
+    if any(
+        str(w.get("word") or "").rstrip().endswith((":", "："))
+        or bool(SPEAKER_PREFIX_RE.fullmatch(str(w.get("word") or "").strip()))
+        for w in ctc_words
+    ):
         return ctc_words
     tags: list[tuple[int, str]] = []
-    for m in DUET_INLINE_SPK_CAP_RE.finditer(text or ""):
-        prefix_toks = len(_tokenize_line_for_ctc((text or "")[: m.start()]))
-        lbl = re.sub(r"\s+", "", m.group(1))
+    for m_start, _, raw_lbl in _iter_duet_spk_matches(text or ""):
+        prefix_toks = len(_tokenize_line_for_ctc((text or "")[:m_start]))
+        lbl = re.sub(r"\s+", "", raw_lbl)
         if lbl:
             tags.append((prefix_toks, lbl))
     if not tags:
@@ -5786,7 +6104,7 @@ _DUET_ALL_KEYS = {"合", "合唱", "齊", "齐", "男女", "男女合", "all", "
 
 
 def _norm_speaker_key(raw_label: str) -> str:
-    return re.sub(r"[:：\s]+", "", str(raw_label or "")).strip().lower()
+    return re.sub(r"[:：\s\(\)（）\[\]【】]+", "", str(raw_label or "")).strip().lower()
 
 
 def _estimate_segment_pitch_hz(audio_16k: np.ndarray, start_s: float, end_s: float) -> Optional[float]:
@@ -5846,14 +6164,14 @@ def _normalize_duet_speakers_and_clean_text(
     if not lines:
         return lines
 
-    # Scan all speaker tags across lines
+    # Scan all speaker tags across lines (colon '男：' AND bracketed canonical '（男）'/'(Female)')
     seen_keys: list[str] = []
     explicit_role_lines = 0
     for ln in lines:
         txt = (ln.get("text") or "").strip()
         line_has_explicit = False
-        for m in DUET_INLINE_SPK_CAP_RE.finditer(txt):
-            k = _norm_speaker_key(m.group(1))
+        for _, _, raw_lbl in _iter_duet_spk_matches(txt):
+            k = _norm_speaker_key(raw_lbl)
             if not k:
                 continue
             if k not in seen_keys:
@@ -5910,10 +6228,35 @@ def _normalize_duet_speakers_and_clean_text(
             for idx_u, uk in enumerate(unknown_keys):
                 role_map[uk] = "male" if (idx_u % 2 == 0) else "female"
 
+    # Cross-song speaker isolation: partition lines on >=18.0s inter-song breaks; if an entire post-break
+    # section (>=6 lines) has ZERO explicit speaker tags of its own, NEVER leak Song #1's last speaker color
+    # across into an untagged Song #2!
+    untagged_section_starts: set[int] = set()
+    sec_starts = [0]
+    for idx_s in range(1, len(lines)):
+        prev_e_s = max(
+            float(lines[idx_s - 1]["end"]),
+            float(lines[idx_s - 2]["end"]) if (idx_s >= 2 and lines[idx_s - 1].get("duet_track") == "counter") else 0.0,
+        )
+        if (float(lines[idx_s]["start"]) - prev_e_s) >= 18.0:
+            sec_starts.append(idx_s)
+    sec_starts.append(len(lines))
+    for si in range(1, len(sec_starts) - 1):
+        s_lo, s_hi = sec_starts[si], sec_starts[si + 1]
+        if (s_hi - s_lo) >= 6:
+            sec_has_tag = any(
+                any(_norm_speaker_key(lbl) in role_map for _, _, lbl in _iter_duet_spk_matches((lines[k].get("text") or "").strip()))
+                for k in range(s_lo, s_hi)
+            )
+            if not sec_has_tag:
+                untagged_section_starts.add(s_lo)
+
     out_lines: list[dict] = []
     cur_speaker = ""
 
-    for ln in lines:
+    for idx_ln, ln in enumerate(lines):
+        if idx_ln in untagged_section_starts:
+            cur_speaker = ""
         raw_txt = (ln.get("text") or "").strip()
         if not raw_txt:
             continue
@@ -5921,16 +6264,19 @@ def _normalize_duet_speakers_and_clean_text(
         m_pw = DUET_PAREN_SPEAKER_LINE_RE.match(raw_txt)
         txt = m_pw.group(1).strip() if m_pw else raw_txt
 
-        # Locate all valid speaker tags on this line
+        # Locate all valid speaker tags on this line (colon '男：' AND bracketed canonical '（男）')
         matches = [
-            m for m in DUET_INLINE_SPK_CAP_RE.finditer(txt)
-            if _norm_speaker_key(m.group(1)) in role_map
+            (ms, me, lbl) for ms, me, lbl in _iter_duet_spk_matches(txt)
+            if _norm_speaker_key(lbl) in role_map
         ]
 
         # Pure sung words (strip any 0.02s speaker-tag visual anchors since tags are now removed from text!)
         sung_ws = [
             dict(w) for w in (ln.get("words") or [])
-            if not str(w.get("word") or "").rstrip().endswith((":", "："))
+            if not (
+                str(w.get("word") or "").rstrip().endswith((":", "："))
+                or bool(SPEAKER_PREFIX_RE.fullmatch(str(w.get("word") or "").strip()))
+            )
         ]
 
         # Build (explicit_role_or_None, clean_segment_text) chunks
@@ -5938,13 +6284,13 @@ def _normalize_duet_speakers_and_clean_text(
         if not matches:
             chunks.append((None, txt))
         else:
-            lead_before = txt[: matches[0].start()].strip()
+            lead_before = txt[: matches[0][0]].strip()
             if lead_before:
                 chunks.append((None, lead_before))
-            for mi, m in enumerate(matches):
-                role_m = role_map[_norm_speaker_key(m.group(1))]
-                seg_end = matches[mi + 1].start() if (mi + 1 < len(matches)) else len(txt)
-                seg_body = txt[m.end() : seg_end].strip()
+            for mi, (ms, me, lbl) in enumerate(matches):
+                role_m = role_map[_norm_speaker_key(lbl)]
+                seg_end = matches[mi + 1][0] if (mi + 1 < len(matches)) else len(txt)
+                seg_body = txt[me:seg_end].strip()
                 if seg_body:
                     chunks.append((role_m, seg_body))
 
@@ -6625,6 +6971,7 @@ def align_official_lyrics_with_stable_ts(
     sub_lang: str = "",
     meta_lang: str = "",
     lang_out: Optional[dict] = None,
+    title_hint: str = "",
 ) -> tuple[list[dict], str, bool]:
     """Force-align 100% REAL official lyrics text directly onto isolated vocals.mp3.
     Automatically detects mid-song starts, skipped/swapped concert verses, or encores and
@@ -6672,7 +7019,7 @@ def align_official_lyrics_with_stable_ts(
                 return _live_section_anchored_align(
                     model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
                     use_cuda=(used_dev == "cuda"), inst_path=inst_path, shazam_already_tried=shazam_already_tried,
-                    initial_song_pools=initial_song_pools,
+                    initial_song_pools=initial_song_pools, title_hint=title_hint,
                 )
             except Exception as e:
                 if used_dev == "cuda":
@@ -6684,7 +7031,7 @@ def align_official_lyrics_with_stable_ts(
                     return _live_section_anchored_align(
                         model, vocals_path, audio_16k, db_profile, step_sec, official_lines, lang, first_onset,
                         use_cuda=False, inst_path=inst_path, shazam_already_tried=shazam_already_tried,
-                        initial_song_pools=initial_song_pools,
+                        initial_song_pools=initial_song_pools, title_hint=title_hint,
                     )
                 raise
 
@@ -7301,6 +7648,7 @@ def main() -> int:
                 inst_path=inst_path, shazam_already_tried=(shazam_tried or len(multi_song_pools) >= 2),
                 initial_song_pools=(multi_song_pools if multi_song_pools else None),
                 sub_lang=yt_lang, meta_lang=yt_video_lang, lang_out=lang_out,
+                title_hint=f"{title} {yt_artist}".strip(),
             )
             s2_eng = ""
             if ai_lines:
@@ -7321,7 +7669,11 @@ def main() -> int:
             # Layer 3B: Fast 48s vocal probe -> Phrase Rescue BEFORE ever paying for full-song CPU free transcription!
             update("running", 45, "辨識歌曲中...")
             probe_segs = fast_probe_transcribe_for_rescue(audio_16k, first_onset, args.device_mode, title_hint=title)
-            rescued_pools = search_official_lyrics_pools_by_sung_phrases(probe_segs) if len(probe_segs) >= 2 else []
+            rescued_pools = (
+                search_official_lyrics_pools_by_sung_phrases(probe_segs, artist_hint=f"{title} {yt_artist}".strip())
+                if len(probe_segs) >= 2
+                else []
+            )
             fallback_ai_lines: list[dict] = []
             if not rescued_pools:
                 update("running", 55, "辨識歌詞中...")
@@ -7329,7 +7681,11 @@ def main() -> int:
                     vocals_path, args.device_mode, db_profile, step_sec, first_onset,
                     title_hint=title, audio_16k=audio_16k,
                 )
-                rescued_pools = search_official_lyrics_pools_by_sung_phrases(fallback_ai_lines) if len(fallback_ai_lines) >= 4 else []
+                rescued_pools = (
+                    search_official_lyrics_pools_by_sung_phrases(fallback_ai_lines, artist_hint=f"{title} {yt_artist}".strip())
+                    if len(fallback_ai_lines) >= 4
+                    else []
+                )
             rescued_lines = [ln for p in rescued_pools for ln in p]
             ai_lines = []
             if rescued_lines:
