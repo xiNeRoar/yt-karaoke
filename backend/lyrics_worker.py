@@ -735,8 +735,8 @@ def _yrc_passes_word_quality_gate(
     thr20: float,
 ) -> tuple[bool, dict]:
     """Gate 5 (YRC Internal Word-Timing Integrity Gate):
-    Rejects fan-tapped / auto-split / compressed-duet NetEase YRCs that pass global span checks
-    but contain broken syllable timing, routing them cleanly to 20ms Dual-Track CTC instead:
+    Rejects fan-tapped / auto-split / late-drifted / compressed-duet NetEase YRCs that pass global
+    span checks but contain broken syllable timing, routing them cleanly to 20ms Dual-Track CTC instead:
       1. Inline or adjacent compressed opposite-speaker duet lines (>=3): single-track YRC
          cannot sweep overlapping singers simultaneously.
       2. Fake uniform auto-split lines (>=3 lines of >=5 sung words with duration std < 8ms).
@@ -745,17 +745,23 @@ def _yrc_passes_word_quality_gate(
          vocals OR >=2.2s gap touching a <=80ms crushed word).
       5. Silent-head premature starts (>=2 lines starting in >=1.0s pure silence, or >=1 combined
          with any word-timing defect).
+      6. Late-head missed vocal onsets (symmetric to silent-head: >=3 lines starting >=0.40s late
+         past >=0.32s of isolated post-silence active singing, OR >=2 severe >=0.85s late heads,
+         OR >=1 severe + >=2 total — catches speaker-tag duration theft & sloppy manual tapping!).
     """
     crushed = 0
     total_w = 0
     unif_lines = 0
     active_dead_gaps = 0
     silent_heads = 0
+    late_heads = 0
+    severe_late_heads = 0
     inline_duets = 0
     adjacent_duets = 0
 
     n_lines = len(yrc_lines)
     n_db20 = len(db20)
+    soft_thr20 = thr20 + 1.0
     cur_spk = ""
 
     for idx, ln in enumerate(yrc_lines):
@@ -822,10 +828,49 @@ def _yrc_passes_word_quality_gate(
                 active_dead_gaps += 1
 
         if ws and n_db20 > 0:
-            s0 = max(0, int((float(ws[0]["start"]) + shift_sec) / 0.02))
+            ws0_s = float(ws[0]["start"]) + shift_sec
+            s0 = max(0, int(ws0_s / 0.02))
             s1 = min(n_db20, s0 + 50)  # First 1.0s of shifted line
             if s1 - s0 >= 25 and float(np.max(db20[s0:s1])) < thr20:
                 silent_heads += 1
+
+            # Late-head onset check: detect uncovered sustained active vocals immediately preceding ws[0].start
+            # after a clean silent separation from the previous line's end (never blames prev line's held tail!).
+            prev_e = (float(yrc_lines[idx - 1]["end"]) + shift_sec) if idx > 0 else 0.0
+            if (ws0_s - prev_e) >= 0.35:
+                f_ls = min(n_db20 - 1, s0)
+                f_prev = max(0, int(prev_e / 0.02))
+                if f_ls > f_prev + 10:
+                    seg_pre = db20[f_prev:f_ls]
+                    if idx == 0:
+                        after_sil = 0
+                    else:
+                        after_sil = -1
+                        sil_run = 0
+                        for k_f in range(len(seg_pre)):
+                            if seg_pre[k_f] <= thr20:
+                                sil_run += 1
+                                if sil_run >= 4:
+                                    after_sil = k_f + 1
+                                    break
+                            else:
+                                sil_run = 0
+                    if after_sil >= 0:
+                        sub_pre = seg_pre[after_sil:]
+                        if int(np.sum(sub_pre > soft_thr20)) >= 12:
+                            first_act = -1
+                            for k_f in range(max(0, len(sub_pre) - 4)):
+                                if sub_pre[k_f] > soft_thr20 and int(np.sum(sub_pre[k_f : k_f + 5] > soft_thr20)) >= 4:
+                                    first_act = k_f
+                                    break
+                            if first_act >= 0:
+                                t_real = (f_prev + after_sil + first_act) * 0.02
+                                late_s = ws0_s - t_real
+                                act_s = float(np.sum(sub_pre[first_act:] > thr20)) * 0.02
+                                if late_s >= 0.40 and act_s >= 0.32:
+                                    late_heads += 1
+                                    if late_s >= 0.85 and act_s >= 0.60:
+                                        severe_late_heads += 1
 
     duet_cnt = inline_duets + adjacent_duets
     crushed_ratio = crushed / max(1, total_w)
@@ -836,6 +881,9 @@ def _yrc_passes_word_quality_gate(
         or active_dead_gaps >= 3
         or silent_heads >= 2
         or (silent_heads >= 1 and (unif_lines >= 1 or active_dead_gaps >= 1 or crushed >= 10))
+        or late_heads >= 3
+        or severe_late_heads >= 2
+        or (severe_late_heads >= 1 and late_heads >= 2)
     )
     stats = {
         "crushed": crushed,
@@ -844,6 +892,8 @@ def _yrc_passes_word_quality_gate(
         "unif": unif_lines,
         "dead_gaps": active_dead_gaps,
         "silent_heads": silent_heads,
+        "late_heads": late_heads,
+        "severe_late_heads": severe_late_heads,
         "duets": duet_cnt,
     }
     return (not bad), stats
@@ -1004,7 +1054,8 @@ def _verify_and_shift_yrc_against_vocals(
             f"[Lyrics] NetEase YRC rejected by Gate 5 word-quality check (shift={best_shift:+.2f}s, "
             f"crushed={g5_stats['crushed']}/{g5_stats['total_w']} [{g5_stats['crushed_pct']}%], "
             f"unif={g5_stats['unif']}, dead_gaps={g5_stats['dead_gaps']}, "
-            f"silent_heads={g5_stats['silent_heads']}, duets={g5_stats['duets']})",
+            f"silent_heads={g5_stats['silent_heads']}, late_heads={g5_stats['late_heads']}[sev={g5_stats['severe_late_heads']}], "
+            f"duets={g5_stats['duets']})",
             file=sys.stderr,
             flush=True,
         )
@@ -4632,7 +4683,26 @@ def _build_ctc_blocks(
             re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", txt or "")
         )
 
-    backing_flags = [bool(BACKING_PAREN_LINE_RE.match((ln.get("text") or "").strip())) for ln in lines]
+    n_lines = len(lines)
+    backing_flags: list[bool] = []
+    solo_duet_paren_flags: list[bool] = []
+    for idx, ln in enumerate(lines):
+        txt_s = (ln.get("text") or "").strip()
+        is_paren = bool(BACKING_PAREN_LINE_RE.match(txt_s))
+        is_duet_paren = bool(DUET_PAREN_SPEAKER_LINE_RE.match(txt_s))
+        is_adj_backing = False
+        is_solo_duet_p = False
+        if is_paren:
+            prev_gap = (float(ln["start"]) - float(lines[idx - 1]["end"])) if idx > 0 else 999.0
+            next_gap = (float(lines[idx + 1]["start"]) - float(ln["end"])) if (idx + 1 < n_lines) else 999.0
+            if (prev_gap < 1.2) or (next_gap < 1.2):
+                is_adj_backing = True
+            elif is_duet_paren:
+                # Standalone opposite-speaker paren line: keep in its own non-backing block so monotonic CTC
+                # never fuses it with the preceding lead line's tail, while still granting full normal padding!
+                is_solo_duet_p = True
+        backing_flags.append(is_adj_backing)
+        solo_duet_paren_flags.append(is_solo_duet_p)
     # Only treat parenthetical lines as simultaneous backing vocals if they are a minority of the song
     if sum(backing_flags) >= max(4, int(len(lines) * 0.40)):
         backing_flags = [False] * len(lines)
@@ -4645,6 +4715,12 @@ def _build_ctc_blocks(
                 blocks.append((cur, False))
                 cur = []
             blocks.append(([idx], True))
+            continue
+        if solo_duet_paren_flags[idx]:
+            if cur:
+                blocks.append((cur, False))
+                cur = []
+            blocks.append(([idx], False))
             continue
 
         if not cur:
@@ -5526,7 +5602,7 @@ def _expand_and_align_duet_counterpoint(
                     w_e = min(nxt_b, float(ln["end"]) + 0.20)
                     res_a = align_text_fn(lead_txt, w_s, w_e, nxt_b)
                     if res_a is not None:
-                        la_sung, _ = res_a
+                        la_sung = res_a[0]
                         n_a = len(la_sung)
                         n_b = len(b_toks)
                         if n_b / max(1, n_a) >= 0.72:
@@ -5540,7 +5616,7 @@ def _expand_and_align_duet_counterpoint(
                                 b_s = max(w_s, w_e - 0.50)
                         res_b = align_text_fn(cnt_txt, b_s, w_e, nxt_b)
                         if res_b is not None:
-                            lb_sung, _ = res_b
+                            lb_sung = res_b[0]
                             wa = _attach_ctc_speaker_anchors(lead_txt, la_sung, min_start=prev_end)
                             la_start = round(wa[0]["start"], 2)
                             la_end = round(min(nxt_b, max(la_start + 0.15, wa[-1]["end"])), 2)
@@ -5565,7 +5641,7 @@ def _expand_and_align_duet_counterpoint(
                             i += 1
                             continue
 
-        # Pattern B: Adjacent compressed opposite-speaker counterpoint pair (Lead + "（Speaker2：Counter）")
+        # Pattern B: Adjacent opposite-speaker counterpoint pair (Lead + "（Speaker2：Counter）")
         if i + 1 < n:
             nxt = lines[i + 1]
             m_p2 = DUET_PAREN_SPEAKER_LINE_RE.match((nxt.get("text") or "").strip())
@@ -5578,21 +5654,22 @@ def _expand_and_align_duet_counterpoint(
                 comb_dur = float(nxt["end"]) - float(ln["start"])
                 gap_ab = float(nxt["start"]) - float(ln["end"])
                 pace_thr = min(0.30, solo_pace * 0.72)
-                if (
+                is_compressed_b1 = (
                     cnt_sp
                     and cnt_sp != cur_speaker
                     and (syl_b / max(1.0, syl_a)) >= 0.65
                     and gap_ab <= 0.8
                     and (comb_dur / max(1.0, syl_a + syl_b)) < pace_thr
-                ):
+                )
+                if is_compressed_b1:
                     nxt_b = float(lines[i + 2]["start"]) if i + 2 < n else audio_dur
                     w_s = max(prev_end, float(ln["start"]) - 0.12)
                     w_e = min(nxt_b, float(nxt["end"]) + 0.20)
                     res_a = align_text_fn(txt, w_s, w_e, nxt_b)
                     res_b = align_text_fn(cnt_txt, w_s, w_e, nxt_b)
                     if res_a is not None and res_b is not None:
-                        la_sung, _ = res_a
-                        lb_sung, _ = res_b
+                        la_sung = res_a[0]
+                        lb_sung = res_b[0]
                         wa = _attach_ctc_speaker_anchors(txt, la_sung, min_start=prev_end)
                         la_start = round(wa[0]["start"], 2)
                         la_end = round(min(nxt_b, max(la_start + 0.15, wa[-1]["end"])), 2)
@@ -5616,6 +5693,81 @@ def _expand_and_align_duet_counterpoint(
                         duet_pairs += 1
                         i += 2
                         continue
+
+                # Pattern B2 (Acoustic Phoneme Likelihood Ratio Test — First-Principles Recovery):
+                # Catches simultaneous counterpoint lines displaced into an interlude or wordless outro hum
+                # (where LRC/YRC didn't compress the bar): ONLY triggers when own-window joint phoneme
+                # likelihood (`gmean`) is low (<0.055) AND overlapping `Lead` yields >=2.0x higher joint
+                # phoneme likelihood (`>=0.065`) and >=1.8x arithmetic score (`>=0.085`)!
+                if cnt_sp and cnt_sp != cur_speaker and syl_a >= 3.0 and syl_b >= 2.0:
+                    la_existing = [
+                        dict(w) for w in (ln.get("words") or [])
+                        if not str(w.get("word") or "").rstrip().endswith((":", "："))
+                    ]
+                    if len(la_existing) >= 3:
+                        nxt_b = float(lines[i + 2]["start"]) if i + 2 < n else audio_dur
+                        lead_e = float(ln["end"])
+                        own_s = max(lead_e, float(nxt["start"]) - 0.10)
+                        own_e = min(nxt_b, float(nxt["end"]) + 0.15)
+                        res_own = align_text_fn(cnt_txt, own_s, own_e, nxt_b) if (own_e - own_s) >= 0.35 else None
+                        if res_own is not None and len(res_own) >= 3:
+                            own_amean = float(res_own[1])
+                            own_gmean = float(res_own[2])
+                            if own_gmean < 0.055:
+                                n_a_tok = len(la_existing)
+                                n_b_tok = max(1, len(_tokenize_line_for_ctc(cnt_txt)))
+                                overlap_e = min(nxt_b, lead_e + 0.10)
+                                min_cand_dur = max(0.50, 0.16 * n_b_tok)
+                                max_k = min(n_a_tok - 2, max(2, n_a_tok - n_b_tok + 2))
+                                best_cand = None
+                                best_key = (-1.0, 0.0)
+                                for k_tok in range(0, max_k + 1):
+                                    cand_s = float(la_existing[k_tok]["start"])
+                                    if (overlap_e - cand_s) < min_cand_dur:
+                                        break
+                                    res_c = align_text_fn(cnt_txt, cand_s, overlap_e, overlap_e)
+                                    if res_c is None or len(res_c) < 3:
+                                        continue
+                                    c_ws, c_am, c_gm = res_c[0], float(res_c[1]), float(res_c[2])
+                                    c_max_step = max(
+                                        (float(c_ws[m + 1]["start"]) - float(c_ws[m]["start"]) for m in range(len(c_ws) - 1)),
+                                        default=0.0,
+                                    )
+                                    # Penalize false-early grabs that latch onto the other singer then freeze >0.70s!
+                                    cohesion = float(np.exp(-0.8 * max(0.0, c_max_step - 0.70)))
+                                    key = (c_gm * cohesion, -c_max_step)
+                                    if key > best_key:
+                                        best_key = key
+                                        best_cand = (c_ws, c_am, c_gm)
+                                if (
+                                    best_cand is not None
+                                    and best_cand[2] >= max(0.065, own_gmean * 2.0)
+                                    and best_cand[1] >= max(0.085, own_amean * 1.8)
+                                ):
+                                    lb_sung = best_cand[0]
+                                    wa = _attach_ctc_speaker_anchors(txt, la_existing, min_start=prev_end)
+                                    la_start = round(wa[0]["start"], 2)
+                                    la_end = round(min(nxt_b, max(la_start + 0.15, float(ln["end"]))), 2)
+                                    wb = _attach_ctc_speaker_anchors(cnt_txt, lb_sung, min_start=la_start)
+                                    lb_start = round(max(la_start, wb[0]["start"]), 2)
+                                    lb_end = round(min(overlap_e, max(lb_start + 0.15, wb[-1]["end"])), 2)
+                                    final_lines.append({
+                                        "start": la_start,
+                                        "end": la_end,
+                                        "text": txt,
+                                        "words": wa,
+                                        "duet_track": "lead",
+                                    })
+                                    final_lines.append({
+                                        "start": lb_start,
+                                        "end": lb_end,
+                                        "text": cnt_txt,
+                                        "words": wb,
+                                        "duet_track": "counter",
+                                    })
+                                    duet_pairs += 1
+                                    i += 2
+                                    continue
 
         # Normal solo / non-counterpoint line: attach speaker visual-width anchors cleanly!
         ws_att = _attach_ctc_speaker_anchors(txt, list(ln.get("words") or []), min_start=prev_end)
@@ -6025,7 +6177,12 @@ def refine_lines_with_ctc(
                 })
                 scores_by_line.setdefault(bw["li"], []).append(bw["score"])
             mean_scores = {li: float(np.mean(vs)) for li, vs in scores_by_line.items() if vs}
-            return by_line, mean_scores
+            geom_scores = {
+                li: float(np.exp(np.mean(np.log(np.maximum(1e-4, np.asarray(vs, dtype=np.float64))))))
+                for li, vs in scores_by_line.items()
+                if vs
+            }
+            return by_line, mean_scores, geom_scores
 
         out_lines = [dict(ln) for ln in lines]
         line_ctc_scores = [0.0 for _ in out_lines]
@@ -6052,6 +6209,24 @@ def refine_lines_with_ctc(
                 left_pad = 0.25 if prev_is_backing else 2.0
                 right_pad = 0.25 if nxt_is_backing else 2.5
                 b_s = max(prev_e, float(lines[blk[0]]["start"]) - left_pad)
+                # Active-phrase head walk: if a late LRC/YRC scaffold placed b_s mid-phrase inside active vocals,
+                # walk backward across that contiguous vocal island (up to 3.5s, bounded by prev_e) so CTC
+                # receives the unbroken opening syllables!
+                if (not prev_is_backing) and b_s > prev_e + 0.05 and len(db20) > 0:
+                    f_cur = min(len(db20) - 1, int(b_s / 0.02))
+                    if db20[f_cur] > global_thr:
+                        f_lim = max(0, int(max(prev_e, b_s - 3.5) / 0.02))
+                        sil_cnt = 0
+                        f_best = f_cur
+                        for f_walk in range(f_cur, f_lim - 1, -1):
+                            if db20[f_walk] > global_thr:
+                                sil_cnt = 0
+                                f_best = f_walk
+                            else:
+                                sil_cnt += 1
+                                if sil_cnt >= 12:  # 0.24s clean silence stops the walk
+                                    break
+                        b_s = max(prev_e, f_best * 0.02 - 0.12)
                 b_e = min(nxt_s, float(lines[blk[-1]]["end"]) + right_pad)
                 next_bound = b_e if nxt_is_backing else nxt_s
 
@@ -6061,7 +6236,7 @@ def refine_lines_with_ctc(
             seg_res = _align_segment_ctc(seg, b_s, blk, next_bound)
             if not seg_res:
                 continue
-            by_line, seg_scores = seg_res
+            by_line, seg_scores, _ = seg_res
 
             block_ok = False
             for li in blk:
@@ -6149,7 +6324,7 @@ def refine_lines_with_ctc(
         )
 
         # M4: Speaker-tag visual anchors + Dual-Track Simultaneous Counterpoint Duet Alignment
-        def _align_text_local(text_str: str, win_s: float, win_e: float, next_bound_s: float) -> Optional[tuple[list[dict], float]]:
+        def _align_text_local(text_str: str, win_s: float, win_e: float, next_bound_s: float) -> Optional[tuple[list[dict], float, float]]:
             ws_cl = max(0.0, float(win_s))
             we_cl = min(audio_dur, float(win_e))
             if we_cl - ws_cl < 0.35:
@@ -6161,7 +6336,7 @@ def refine_lines_with_ctc(
             lws = r_loc[0].get(0) or []
             if not lws:
                 return None
-            return lws, r_loc[1].get(0, 0.0)
+            return lws, r_loc[1].get(0, 0.0), r_loc[2].get(0, 0.0)
 
         out_lines, duet_pairs = _expand_and_align_duet_counterpoint(
             out_lines, audio_dur, first_onset, _align_text_local

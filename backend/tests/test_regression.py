@@ -1606,6 +1606,41 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     ok_du, st_du = lw._yrc_passes_word_quality_gate(duet_inline_yrc, 0.0, db20_sing, thr20)
     assert not ok_du and st_du["duets"] >= 3, f"Inline duet YRC not routed to Dual-Track CTC: {st_du}"
 
+    # 1F) Late-head onset gate (symmetric to silent_heads): catches speaker-tag duration theft / late-tapped YRCs
+    #     while strictly protecting clean YRCs with 0 or 1 isolated pre-chorus ad-lib!
+    db20_clean_gaps = np.full(4000, -70.0, dtype=np.float32)  # 80s @ 20ms, silent between lines
+    for ln in clean_yrc:
+        db20_clean_gaps[int(ln["start"] / 0.02) : int(ln["end"] / 0.02)] = -16.0
+    ok_cg, st_cg = lw._yrc_passes_word_quality_gate(clean_yrc, 0.0, db20_clean_gaps, thr20)
+    assert ok_cg and st_cg["late_heads"] == 0, f"Clean YRC with clean gaps falsely flagged: {st_cg}"
+
+    # Single isolated 1.0s pre-line ad-lib (like a guitar-solo vocal 'Whoa~') MUST STILL PASS!
+    db20_adlib1 = db20_clean_gaps.copy()
+    # Line 2 starts at 10.0s (prev line 1 ends at 9.3s); shift line 2+3+4+5 to have clean 2s gaps
+    spaced_yrc = [_mk_varied(4.0 + i * 5.0, "我會的都試過") for i in range(6)]
+    db20_sp = np.full(4000, -70.0, dtype=np.float32)
+    for ln in spaced_yrc:
+        db20_sp[int(ln["start"] / 0.02) : int(ln["end"] / 0.02)] = -16.0
+    db20_one_late = db20_sp.copy()
+    db20_one_late[int(13.0 / 0.02) : int(14.0 / 0.02)] = -16.0  # 1.0s vocal before line 2 (14.0s)
+    ok_1l, st_1l = lw._yrc_passes_word_quality_gate(spaced_yrc, 0.0, db20_one_late, thr20)
+    assert ok_1l and st_1l["late_heads"] == 1 and st_1l["severe_late_heads"] == 1, f"Single ad-lib falsely rejected: {st_1l}"
+
+    # Severe + moderate late heads (1.5s late + 0.55s late, matching 相愛很難 pattern!) MUST BE REJECTED!
+    db20_2late = db20_sp.copy()
+    db20_2late[int(12.5 / 0.02) : int(14.0 / 0.02)] = -16.0   # +1.50s late on line 2
+    db20_2late[int(18.45 / 0.02) : int(19.0 / 0.02)] = -16.0  # +0.55s late on line 3
+    ok_2l, st_2l = lw._yrc_passes_word_quality_gate(spaced_yrc, 0.0, db20_2late, thr20)
+    assert not ok_2l and st_2l["late_heads"] == 2 and st_2l["severe_late_heads"] == 1, f"Late-head YRC not rejected: {st_2l}"
+
+    # 1G) _build_ctc_blocks standalone paren guard: isolated >=1.2s silence paren line MUST NOT be handcuffed as backing!
+    standalone_paren_lines = [
+        {"start": 10.0, "end": 13.0, "text": "女：情太狠毀我一生"},
+        {"start": 15.5, "end": 18.0, "text": "（男：不想你也失陷）"},
+    ]
+    sp_blks = lw._build_ctc_blocks(standalone_paren_lines)
+    assert sp_blks == [([0], False), ([1], False)], f"Standalone paren line wrongly marked isolated backing: {sp_blks}"
+
     # 2) _attach_ctc_speaker_anchors: leading, inline, parenthetical & 100% idempotent
     w_lead = [{"word": "我", "start": 14.29, "end": 14.75}, {"word": "會", "start": 14.75, "end": 15.13}]
     att1 = lw._attach_ctc_speaker_anchors("男：我會", w_lead, min_start=0.0)
@@ -1637,16 +1672,25 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     m1_duet_out, m1_duet_rem = lw._strip_repeated_chorus_overlay_parens(solo_c + duet_c, db20_sing, thr20)
     assert m1_duet_rem == 0 and "（女：愛戀本這樣暗）" in m1_duet_out[4]["text"], f"M1 stripped duet counterpoint: {m1_duet_out}"
 
-    # 4) _expand_and_align_duet_counterpoint: Pattern A simultaneous + Pattern A sequential + Pattern B adjacent
+    # 4) _expand_and_align_duet_counterpoint: Pattern A simultaneous + Pattern A sequential + Pattern B1 compressed + Pattern B2 acoustic likelihood ratio
     def _mock_align(txt: str, ws_s: float, ws_e: float, nxt_b: float):
         toks = lw._tokenize_line_for_ctc(txt)
         if not toks:
             return None
         step_d = (ws_e - ws_s) / len(toks)
-        return [
+        ws_out = [
             {"word": tk, "start": round(ws_s + k * step_d, 3), "end": round(ws_s + (k + 1) * step_d, 3)}
             for k, tk in enumerate(toks)
-        ], 0.20
+        ]
+        # Simulate Pattern B2: '不想你也失陷' displaced onto wordless outro (51.5..54.0s) gets weak score,
+        # while overlapping Lead (44.0..49.0s) peaks at entry token k=2 (~45.0s)!
+        if "不想你也失陷" in txt:
+            if ws_s >= 50.0:
+                return ws_out, 0.035, 0.018
+            if 44.9 <= ws_s <= 45.3:
+                return ws_out, 0.115, 0.082
+            return ws_out, 0.095, 0.058
+        return ws_out, 0.20, 0.18
 
     duet_in = [
         # Solo calibration lines (~0.40s/syl)
@@ -1666,14 +1710,27 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
                 {"word": "天", "start": 29.65, "end": 30.20},
             ],
         },
-        # Pattern B adjacent compressed opposite-speaker pair (16 syl crammed into 3.2s = 0.20s/syl < 0.29s!)
+        # Pattern B1 adjacent compressed opposite-speaker pair (16 syl crammed into 3.2s = 0.20s/syl < 0.29s!)
         {"start": 35.0, "end": 36.4, "text": "女：不必再試着重建我", "words": lw._even_words_for_line("不必再試着重建我", 35.0, 36.4)},
         {"start": 36.5, "end": 38.2, "text": "（男：三番四次地重建我）", "words": lw._even_words_for_line("三番四次地重建我", 36.5, 38.2)},
-        {"start": 38.25, "end": 41.0, "text": "女：情太狠毀我一生", "words": lw._even_words_for_line("情太狠毀我一生", 38.25, 41.0)},
+        # Genuine sequential opposite-speaker parenthetical line (normal 2.4s pace + high own_gmean=0.18 -> MUST NOT merge!)
+        {"start": 38.25, "end": 41.0, "text": "女：情太狠毀我一生前奏", "words": lw._even_words_for_line("情太狠毀我一生前奏", 38.25, 41.0)},
+        {"start": 41.2, "end": 43.6, "text": "（男：真正獨立一句）", "words": lw._even_words_for_line("真正獨立一句", 41.2, 43.6)},
+        # Pattern B2 displaced outro simultaneous counterpoint (low own_gmean=0.018 on hum outro vs 0.082 on Lead!)
+        {
+            "start": 44.0, "end": 49.0, "text": "女：情太狠毀我一生",
+            "words": [
+                {"word": "情", "start": 44.0, "end": 44.5}, {"word": "太", "start": 44.5, "end": 45.0},
+                {"word": "狠", "start": 45.0, "end": 45.5}, {"word": "毀", "start": 45.5, "end": 46.0},
+                {"word": "我", "start": 46.0, "end": 46.5}, {"word": "一", "start": 46.5, "end": 47.2},
+                {"word": "生", "start": 47.2, "end": 49.0},
+            ],
+        },
+        {"start": 51.5, "end": 54.0, "text": "（男：不想你也失陷）", "words": lw._even_words_for_line("不想你也失陷", 51.5, 54.0)},
     ]
     exp_out, n_pairs = lw._expand_and_align_duet_counterpoint(duet_in, 60.0, 0.0, _mock_align)
     exp_out = lw._enforce_strict_monotonic_bounds(exp_out, 0.0, 60.0)
-    assert n_pairs == 2, f"Expected 2 simultaneous duet pairs (Pattern A + Pattern B), got {n_pairs}: {exp_out}"
+    assert n_pairs == 3, f"Expected 3 simultaneous duet pairs (Pattern A + B1 + B2), got {n_pairs}: {exp_out}"
     # Pattern A simultaneous pair: tail-anchored Counter starts AFTER Lead start & overlaps Lead!
     lead_a = next(x for x in exp_out if x["text"] == "女：沒靈魂沒有心")
     cnt_a = next(x for x in exp_out if x["text"] == "男：空心")
@@ -1684,13 +1741,21 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     seq_a = next(x for x in exp_out if x["text"] == "男：你好嗎今天")
     seq_b = next(x for x in exp_out if x["text"] == "女：我很好今天")
     assert not seq_a.get("duet_track") and seq_b["start"] >= seq_a["end"], f"Sequential call-and-response wrongly overlapped: {seq_a}, {seq_b}"
-    # Pattern B simultaneous pair: both span full 35..38.25s bar AND never cross next line at 38.25!
+    # Pattern B1 simultaneous pair: both span full 35..38.25s bar AND never cross next line at 38.25!
     lead_b = next(x for x in exp_out if x["text"] == "女：不必再試着重建我")
     cnt_b = next(x for x in exp_out if x["text"] == "男：三番四次地重建我")
-    nxt_after_b = next(x for x in exp_out if x["text"] == "女：情太狠毀我一生")
+    nxt_after_b = next(x for x in exp_out if x["text"] == "女：情太狠毀我一生前奏")
     assert lead_b.get("duet_track") == "lead" and cnt_b.get("duet_track") == "counter"
     assert cnt_b["start"] >= lead_b["start"] and cnt_b["start"] < lead_b["end"]
     assert max(lead_b["end"], cnt_b["end"]) <= nxt_after_b["start"] + 1e-6
+    # Genuine sequential paren line with strong own_gmean MUST NOT be falsely merged!
+    seq_paren = next(x for x in exp_out if "真正獨立一句" in x["text"])
+    assert not seq_paren.get("duet_track") and seq_paren["start"] >= nxt_after_b["end"] - 0.05
+    # Pattern B2 displaced outro counterpoint MUST be rescued onto Lead at optimal entry token (~45.0s)!
+    lead_b2 = next(x for x in exp_out if x["text"] == "女：情太狠毀我一生")
+    cnt_b2 = next(x for x in exp_out if x["text"] == "男：不想你也失陷")
+    assert lead_b2.get("duet_track") == "lead" and cnt_b2.get("duet_track") == "counter"
+    assert 44.90 <= cnt_b2["start"] <= 45.20 and cnt_b2["end"] <= lead_b2["end"] + 0.15, f"Pattern B2 entry wrong: {lead_b2}, {cnt_b2}"
 
     # 5) Authentic HK KTV speaker cleaning & color-role extraction (zero '男：'/'女：'/'合：'/'克：'/'容：' on screen!)
     hk_raw = [
