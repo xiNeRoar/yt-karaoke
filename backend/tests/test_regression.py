@@ -995,13 +995,19 @@ def test_tier0_yrc_and_stage2_ctc_invariants() -> None:
     assert len(parsed_jp) == 2 and parsed_jp[1]["text"] == "永遠", f"JP Kanji in YRC corrupted: {parsed_jp}"
 
     # 2) _verify_and_shift_yrc_against_vocals:
-    #    Build a synthetic 45s vocal waveform matching an 8-line YRC shifted by +4.20s (MV intro logo!)
+    #    Build a synthetic 45s vocal waveform matching an 8-line studio YRC (realistic human syllable variance)
+    #    shifted by +4.20s (MV intro logo!)
     sr = 16000
     t_grid = np.arange(sr * 45, dtype=np.float32) / sr
     yrc_synth = []
+    syl_durs = [0.28, 0.36, 0.46, 0.26, 0.40, 0.64]  # sum = 2.40s, realistic natural human rhythm
     for k in range(8):
         ls = 6.0 + k * 3.5
-        ws = [{"word": f"字", "start": round(ls + j * 0.4, 3), "end": round(ls + (j + 1) * 0.4, 3)} for j in range(6)]
+        cur_t = ls
+        ws = []
+        for d_s in syl_durs:
+            ws.append({"word": "字", "start": round(cur_t, 3), "end": round(cur_t + d_s, 3)})
+            cur_t += d_s
         yrc_synth.append({"start": round(ls, 2), "end": round(ls + 2.4, 2), "text": "字字字字字字", "words": ws})
 
     def _make_vocal_audio(lines_src: list[dict], shift_s: float, mid_cut_extra: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
@@ -1479,6 +1485,178 @@ def test_cpu_thread_cap_hq_yield_and_credit_dedup() -> None:
     print("[PASS] CPU thread cap (PyTorch+ONNX+Whisper), HQ mid-song yield, credit filter, dedup, 1-char specificity & YRC duet speaker-tag snap")
 
 
+def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
+    """Verify Gate 5 YRC word-timing integrity (rejects fake uniform / crushed / active dead-freeze /
+    silent-head / compressed duet YRCs while accepting clean studio YRCs), CTC speaker-tag visual anchors,
+    M1 duet-paren protection, Dual-Track Counterpoint expansion (simultaneous + sequential + adjacent),
+    and duet-aware monotonic bounds.
+    """
+    import lyrics_worker as lw
+    import numpy as np
+
+    db20_sing = np.full(4000, -16.0, dtype=np.float32)  # 80s active singing @ 20ms
+    thr20 = -40.0
+
+    def _mk_varied(ls: float, txt: str) -> dict:
+        durs = [0.24, 0.38, 0.48, 0.28, 0.34, 0.58]
+        t = ls
+        ws = []
+        for ch, d in zip(txt, durs * 3):
+            ws.append({"word": ch, "start": round(t, 3), "end": round(t + d, 3)})
+            t += d
+        return {"start": round(ls, 2), "end": round(t, 2), "text": txt, "words": ws}
+
+    # 1) Gate 5: clean studio YRC MUST PASS!
+    clean_yrc = [_mk_varied(4.0 + i * 3.0, "我會的都試過") for i in range(6)]
+    ok_clean, st_clean = lw._yrc_passes_word_quality_gate(clean_yrc, 0.0, db20_sing, thr20)
+    assert ok_clean, f"Clean studio YRC falsely rejected by Gate 5: {st_clean}"
+
+    # 1A) Fake uniform auto-split YRC (3+ lines with std < 8ms) MUST BE REJECTED!
+    unif_yrc = []
+    for i in range(6):
+        ls = 4.0 + i * 3.0
+        ws = [{"word": ch, "start": round(ls + j * 0.40, 3), "end": round(ls + (j + 1) * 0.40, 3)} for j, ch in enumerate("我會的都試過")]
+        unif_yrc.append({"start": ls, "end": ls + 2.4, "text": "我會的都試過", "words": ws})
+    ok_u, st_u = lw._yrc_passes_word_quality_gate(unif_yrc, 0.0, db20_sing, thr20)
+    assert not ok_u and st_u["unif"] >= 3, f"Fake uniform YRC not rejected: {st_u}"
+
+    # 1B) Crushed word-burst YRC (>=15 crushed <=65ms & >=6.5%) MUST BE REJECTED!
+    crush_yrc = []
+    for i in range(6):
+        ls = 4.0 + i * 3.0
+        durs = [0.04, 0.05, 0.04, 0.45, 0.52, 0.70]  # 3 crushed per line -> 18/36 = 50%
+        t = ls
+        ws = []
+        for ch, d in zip("我會的都試過", durs):
+            ws.append({"word": ch, "start": round(t, 3), "end": round(t + d, 3)})
+            t += d
+        crush_yrc.append({"start": ls, "end": round(t, 2), "text": "我會的都試過", "words": ws})
+    ok_c, st_c = lw._yrc_passes_word_quality_gate(crush_yrc, 0.0, db20_sing, thr20)
+    assert not ok_c and st_c["crushed"] >= 15, f"Crushed-burst YRC not rejected: {st_c}"
+
+    # 1C) Active-singing internal dead-freeze YRC (>=3 lines with >=1.2s gap while singing) MUST BE REJECTED!
+    dead_yrc = [dict(x) for x in clean_yrc]
+    for i in range(3):
+        ls = 4.0 + i * 5.0
+        dead_yrc[i] = {
+            "start": ls, "end": ls + 4.2, "text": "抑鬱症也越強大",
+            "words": [
+                {"word": "抑", "start": ls, "end": ls + 0.30},
+                {"word": "鬱", "start": ls + 0.30, "end": ls + 0.36},
+                {"word": "症", "start": ls + 0.36, "end": ls + 0.42},
+                {"word": "也", "start": ls + 2.20, "end": ls + 2.65},  # 1.78s dead freeze during active vocals!
+                {"word": "越", "start": ls + 2.65, "end": ls + 3.10},
+                {"word": "強", "start": ls + 3.10, "end": ls + 3.60},
+                {"word": "大", "start": ls + 3.60, "end": ls + 4.20},
+            ],
+        }
+    ok_d, st_d = lw._yrc_passes_word_quality_gate(dead_yrc, 0.0, db20_sing, thr20)
+    assert not ok_d and st_d["dead_gaps"] >= 3, f"Active dead-freeze YRC not rejected: {st_d}"
+
+    # 1D) Silent-head premature YRC (>=2 lines starting in >=1.0s silence) MUST BE REJECTED!
+    db20_sil = db20_sing.copy()
+    db20_sil[180:280] = -70.0   # silence at 3.6s..5.6s (line 0 starts at 4.0s!)
+    db20_sil[330:430] = -70.0   # silence at 6.6s..8.6s (line 1 starts at 7.0s!)
+    ok_sh, st_sh = lw._yrc_passes_word_quality_gate(clean_yrc, 0.0, db20_sil, thr20)
+    assert not ok_sh and st_sh["silent_heads"] >= 2, f"Silent-head premature YRC not rejected: {st_sh}"
+
+    # 1E) Compressed inline duet YRC (>=3 inline speaker-tagged counterpoint lines) MUST BE REJECTED to route to Dual-Track CTC!
+    duet_inline_yrc = [
+        _mk_varied(4.0, "女：一碰已經熄了燈（男：沒神韻）"),
+        _mk_varied(8.0, "沒靈魂沒有心（男：空心）"),
+        _mk_varied(12.0, "這空殼已經不懂再熱吻（男：勞煩別吻）"),
+    ] + clean_yrc[3:]
+    ok_du, st_du = lw._yrc_passes_word_quality_gate(duet_inline_yrc, 0.0, db20_sing, thr20)
+    assert not ok_du and st_du["duets"] >= 3, f"Inline duet YRC not routed to Dual-Track CTC: {st_du}"
+
+    # 2) _attach_ctc_speaker_anchors: leading, inline, parenthetical & 100% idempotent
+    w_lead = [{"word": "我", "start": 14.29, "end": 14.75}, {"word": "會", "start": 14.75, "end": 15.13}]
+    att1 = lw._attach_ctc_speaker_anchors("男：我會", w_lead, min_start=0.0)
+    assert [w["word"] for w in att1] == ["男：", "我", "會"] and abs(att1[0]["start"] - 14.27) < 1e-3 and abs(att1[0]["end"] - 14.29) < 1e-3
+    att1_again = lw._attach_ctc_speaker_anchors("男：我會", att1, min_start=0.0)
+    assert att1_again == att1, "Speaker anchor attachment must be strictly idempotent!"
+
+    w_inl = [
+        {"word": "人", "start": 55.96, "end": 56.40}, {"word": "造", "start": 56.40, "end": 57.28},
+        {"word": "破", "start": 64.08, "end": 64.54}, {"word": "解", "start": 64.54, "end": 67.14},
+    ]
+    att2 = lw._attach_ctc_speaker_anchors("男：人造 合：破解", w_inl, min_start=0.0)
+    assert [w["word"] for w in att2] == ["男：", "人", "造", "合：", "破", "解"]
+    assert abs(att2[3]["end"] - 64.08) < 1e-3
+
+    # 3) M1 duet protection: repeated chorus with explicit speaker-tagged counterpoint MUST NOT be stripped!
+    solo_c = [
+        {"start": 10.0, "end": 12.5, "text": "重啓不了人生", "words": []},
+        {"start": 12.6, "end": 15.0, "text": "畫面永遠黑暗", "words": []},
+        {"start": 15.1, "end": 17.5, "text": "損毀了的我試圖微笑", "words": []},
+        {"start": 17.6, "end": 20.0, "text": "一碰已經熄了燈", "words": []},
+    ]
+    duet_c = [
+        {"start": 40.0, "end": 42.5, "text": "男：重啓不了人生（女：愛戀本這樣暗）", "words": []},
+        {"start": 42.6, "end": 45.0, "text": "畫面永遠黑暗（女：不需要再不忿）", "words": []},
+        {"start": 45.1, "end": 47.5, "text": "損毀了的我試圖微笑", "words": []},
+        {"start": 47.6, "end": 50.0, "text": "女：一碰已經熄了燈（男：沒神韻）", "words": []},
+    ]
+    m1_duet_out, m1_duet_rem = lw._strip_repeated_chorus_overlay_parens(solo_c + duet_c, db20_sing, thr20)
+    assert m1_duet_rem == 0 and "（女：愛戀本這樣暗）" in m1_duet_out[4]["text"], f"M1 stripped duet counterpoint: {m1_duet_out}"
+
+    # 4) _expand_and_align_duet_counterpoint: Pattern A simultaneous + Pattern A sequential + Pattern B adjacent
+    def _mock_align(txt: str, ws_s: float, ws_e: float, nxt_b: float):
+        toks = lw._tokenize_line_for_ctc(txt)
+        if not toks:
+            return None
+        step_d = (ws_e - ws_s) / len(toks)
+        return [
+            {"word": tk, "start": round(ws_s + k * step_d, 3), "end": round(ws_s + (k + 1) * step_d, 3)}
+            for k, tk in enumerate(toks)
+        ], 0.20
+
+    duet_in = [
+        # Solo calibration lines (~0.40s/syl)
+        {"start": 10.0, "end": 12.4, "text": "男：我會的都試過", "words": lw._even_words_for_line("我會的都試過", 10.0, 12.4)},
+        {"start": 12.6, "end": 15.0, "text": "這搶救證實完敗", "words": lw._even_words_for_line("這搶救證實完敗", 12.6, 15.0)},
+        # Pattern A simultaneous inline counterpoint (short tail 2 vs 6 -> tail-syllable anchored!)
+        {"start": 20.0, "end": 22.8, "text": "女：沒靈魂沒有心（男：空心）", "words": lw._even_words_for_line("沒靈魂沒有心空心", 20.0, 22.8)},
+        # Pattern A true sequential call-and-response (0.6s silent gap + 0.45s/syl -> MUST NOT overlap!)
+        {
+            "start": 25.0, "end": 30.2, "text": "男：你好嗎今天（女：我很好今天）",
+            "words": [
+                {"word": "你", "start": 25.0, "end": 25.45}, {"word": "好", "start": 25.45, "end": 25.90},
+                {"word": "嗎", "start": 25.90, "end": 26.35}, {"word": "今", "start": 26.35, "end": 26.80},
+                {"word": "天", "start": 26.80, "end": 27.25},
+                {"word": "我", "start": 27.85, "end": 28.30}, {"word": "很", "start": 28.30, "end": 28.75},
+                {"word": "好", "start": 28.75, "end": 29.20}, {"word": "今", "start": 29.20, "end": 29.65},
+                {"word": "天", "start": 29.65, "end": 30.20},
+            ],
+        },
+        # Pattern B adjacent compressed opposite-speaker pair (16 syl crammed into 3.2s = 0.20s/syl < 0.29s!)
+        {"start": 35.0, "end": 36.4, "text": "女：不必再試着重建我", "words": lw._even_words_for_line("不必再試着重建我", 35.0, 36.4)},
+        {"start": 36.5, "end": 38.2, "text": "（男：三番四次地重建我）", "words": lw._even_words_for_line("三番四次地重建我", 36.5, 38.2)},
+        {"start": 38.25, "end": 41.0, "text": "女：情太狠毀我一生", "words": lw._even_words_for_line("情太狠毀我一生", 38.25, 41.0)},
+    ]
+    exp_out, n_pairs = lw._expand_and_align_duet_counterpoint(duet_in, 60.0, 0.0, _mock_align)
+    exp_out = lw._enforce_strict_monotonic_bounds(exp_out, 0.0, 60.0)
+    assert n_pairs == 2, f"Expected 2 simultaneous duet pairs (Pattern A + Pattern B), got {n_pairs}: {exp_out}"
+    # Pattern A simultaneous pair: tail-anchored Counter starts AFTER Lead start & overlaps Lead!
+    lead_a = next(x for x in exp_out if x["text"] == "女：沒靈魂沒有心")
+    cnt_a = next(x for x in exp_out if x["text"] == "男：空心")
+    assert lead_a.get("duet_track") == "lead" and cnt_a.get("duet_track") == "counter"
+    assert lead_a["start"] < cnt_a["start"] < lead_a["end"], f"Tail counterpoint did not overlap lead tail: {lead_a}, {cnt_a}"
+    assert lead_a["words"][0]["word"] == "女：" and (lead_a["words"][0]["end"] - lead_a["words"][0]["start"]) <= 0.025
+    # Pattern A sequential pair: clean non-overlapping split!
+    seq_a = next(x for x in exp_out if x["text"] == "男：你好嗎今天")
+    seq_b = next(x for x in exp_out if x["text"] == "女：我很好今天")
+    assert not seq_a.get("duet_track") and seq_b["start"] >= seq_a["end"], f"Sequential call-and-response wrongly overlapped: {seq_a}, {seq_b}"
+    # Pattern B simultaneous pair: both span full 35..38.25s bar AND never cross next line at 38.25!
+    lead_b = next(x for x in exp_out if x["text"] == "女：不必再試着重建我")
+    cnt_b = next(x for x in exp_out if x["text"] == "男：三番四次地重建我")
+    nxt_after_b = next(x for x in exp_out if x["text"] == "女：情太狠毀我一生")
+    assert lead_b.get("duet_track") == "lead" and cnt_b.get("duet_track") == "counter"
+    assert cnt_b["start"] >= lead_b["start"] and cnt_b["start"] < lead_b["end"]
+    assert max(lead_b["end"], cnt_b["end"]) <= nxt_after_b["start"] + 1e-6
+    print("[PASS] Gate 5 YRC word quality, CTC speaker anchors, M1 duet guard, Dual-Track Counterpoint & duet-aware monotonic bounds")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -1495,6 +1673,7 @@ def main() -> int:
     test_cross_chorus_overlay_paren_and_safeguard_invariants()
     test_batched_clip_timestamps_and_vram_guard()
     test_cpu_thread_cap_hq_yield_and_credit_dedup()
+    test_gate5_yrc_quality_and_dual_track_duet_invariants()
     test_question_mark_sanitization_ui_and_security_invariants()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()

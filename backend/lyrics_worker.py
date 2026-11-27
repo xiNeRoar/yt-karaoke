@@ -519,6 +519,16 @@ def parse_lrc(lrc_text: str) -> list[dict]:
 YRC_LINE_RE = re.compile(r"^\[(\d+),(\d+)\](.*)$")
 YRC_WORD_RE = re.compile(r"\((\d+),(\d+)(?:,\d+)?\)(.*?)(?=\(\d+,\d+(?:,\d+)?\)|$)")
 BACKING_PAREN_LINE_RE = re.compile(r"^[\(（][^()（）]{1,28}[\)）]$")
+SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
+INLINE_SPEAKER_TAG_RE = re.compile(r"(?:^|(?<=[\s\(（\[【]))(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
+DUET_LEAD_SPEAKER_RE = re.compile(r"^\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：])\s*")
+DUET_INLINE_SPK_CAP_RE = re.compile(r"(?:^|(?<=[\s\(（\[【]))((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：])\s*")
+DUET_INLINE_COUNTERPOINT_RE = re.compile(
+    r"^(.*?)[\(（]\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：][^()（）]{2,28})[\)）]\s*$"
+)
+DUET_PAREN_SPEAKER_LINE_RE = re.compile(
+    r"^[\(（]\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：][^()（）]{2,28})[\)）]\s*$"
+)
 
 
 def parse_yrc(yrc_text: str) -> list[dict]:
@@ -715,6 +725,127 @@ def _compute_db_profile_20ms(audio_16k: np.ndarray, step_sec: float = 0.02) -> n
     return (20.0 * np.log10(rms + 1e-9)).astype(np.float32)
 
 
+def _yrc_passes_word_quality_gate(
+    yrc_lines: list[dict],
+    shift_sec: float,
+    db20: np.ndarray,
+    thr20: float,
+) -> tuple[bool, dict]:
+    """Gate 5 (YRC Internal Word-Timing Integrity Gate):
+    Rejects fan-tapped / auto-split / compressed-duet NetEase YRCs that pass global span checks
+    but contain broken syllable timing, routing them cleanly to 20ms Dual-Track CTC instead:
+      1. Inline or adjacent compressed opposite-speaker duet lines (>=3): single-track YRC
+         cannot sweep overlapping singers simultaneously.
+      2. Fake uniform auto-split lines (>=3 lines of >=5 sung words with duration std < 8ms).
+      3. Crushed word-burst corruption (>=15 sung words <=65ms AND >=6.5% of total sung words).
+      4. Active-singing internal dead-freeze gaps (>=3 lines with >=1.2s internal gap during active
+         vocals OR >=2.2s gap touching a <=80ms crushed word).
+      5. Silent-head premature starts (>=2 lines starting in >=1.0s pure silence, or >=1 combined
+         with any word-timing defect).
+    """
+    crushed = 0
+    total_w = 0
+    unif_lines = 0
+    active_dead_gaps = 0
+    silent_heads = 0
+    inline_duets = 0
+    adjacent_duets = 0
+
+    n_lines = len(yrc_lines)
+    n_db20 = len(db20)
+    cur_spk = ""
+
+    for idx, ln in enumerate(yrc_lines):
+        txt = (ln.get("text") or "").strip()
+        m_sp = DUET_LEAD_SPEAKER_RE.match(txt)
+        if m_sp:
+            cur_spk = re.sub(r"[:：\s]+", "", m_sp.group(1))
+
+        m_inl = DUET_INLINE_COUNTERPOINT_RE.match(txt)
+        if m_inl:
+            lead_syl = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", m_inl.group(1).strip()))
+            cnt_syl = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", m_inl.group(2).strip()))
+            if lead_syl >= 3.0 and cnt_syl >= 2.0:
+                inline_duets += 1
+
+        if idx + 1 < n_lines:
+            nxt = yrc_lines[idx + 1]
+            m_p2 = DUET_PAREN_SPEAKER_LINE_RE.match((nxt.get("text") or "").strip())
+            if m_p2 and not DUET_PAREN_SPEAKER_LINE_RE.match(txt):
+                cnt_txt = m_p2.group(1).strip()
+                m_csp = DUET_LEAD_SPEAKER_RE.match(cnt_txt)
+                cnt_sp = re.sub(r"[:：\s]+", "", m_csp.group(1)) if m_csp else ""
+                syl_a = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", txt))
+                syl_b = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", cnt_txt))
+                comb_dur = float(nxt["end"]) - float(ln["start"])
+                gap_ab = float(nxt["start"]) - float(ln["end"])
+                if (
+                    cnt_sp
+                    and cnt_sp != cur_spk
+                    and (syl_b / max(1.0, syl_a)) >= 0.65
+                    and gap_ab <= 0.8
+                    and (comb_dur / max(1.0, syl_a + syl_b)) < 0.28
+                ):
+                    adjacent_duets += 1
+
+        ws = [
+            w for w in (ln.get("words") or [])
+            if not str(w.get("word") or "").rstrip().endswith((":", "："))
+        ]
+        total_w += len(ws)
+        if len(ws) >= 4:
+            ds = [max(0.0, float(w["end"]) - float(w["start"])) for w in ws]
+            crushed += sum(1 for x in ds if x <= 0.065)
+            if len(ds) >= 5 and float(np.std(ds)) < 0.008:
+                unif_lines += 1
+
+            has_dead_gap = False
+            for k in range(len(ws) - 1):
+                g_s = float(ws[k]["end"]) + shift_sec
+                g_e = float(ws[k + 1]["start"]) + shift_sec
+                g_dur = g_e - g_s
+                if g_dur >= 1.2:
+                    touching_crush = (ds[k] <= 0.08) or (ds[k + 1] <= 0.08)
+                    if g_dur >= 2.2 and touching_crush:
+                        has_dead_gap = True
+                        break
+                    if n_db20 > 0:
+                        f0 = max(0, int(g_s / 0.02))
+                        f1 = min(n_db20, int(g_e / 0.02))
+                        if f1 - f0 >= 20 and float(np.mean(db20[f0:f1] > thr20)) >= 0.45:
+                            has_dead_gap = True
+                            break
+            if has_dead_gap:
+                active_dead_gaps += 1
+
+        if ws and n_db20 > 0:
+            s0 = max(0, int((float(ws[0]["start"]) + shift_sec) / 0.02))
+            s1 = min(n_db20, s0 + 50)  # First 1.0s of shifted line
+            if s1 - s0 >= 25 and float(np.max(db20[s0:s1])) < thr20:
+                silent_heads += 1
+
+    duet_cnt = inline_duets + adjacent_duets
+    crushed_ratio = crushed / max(1, total_w)
+    bad = (
+        duet_cnt >= 3
+        or unif_lines >= 3
+        or (crushed >= 15 and crushed_ratio >= 0.065)
+        or active_dead_gaps >= 3
+        or silent_heads >= 2
+        or (silent_heads >= 1 and (unif_lines >= 1 or active_dead_gaps >= 1 or crushed >= 10))
+    )
+    stats = {
+        "crushed": crushed,
+        "total_w": total_w,
+        "crushed_pct": round(100.0 * crushed_ratio, 1),
+        "unif": unif_lines,
+        "dead_gaps": active_dead_gaps,
+        "silent_heads": silent_heads,
+        "duets": duet_cnt,
+    }
+    return (not bad), stats
+
+
 def _verify_and_shift_yrc_against_vocals(
     yrc_lines: list[dict],
     audio_16k: np.ndarray,
@@ -862,7 +993,21 @@ def _verify_and_shift_yrc_against_vocals(
         )
         return None
 
-    # All 4 strict gates PASSED -> emit shifted studio word-level YRC!
+    # Gate 5: Internal word-timing integrity & simultaneous duet check (blocks fan-tapped / fake-uniform /
+    # dead-freeze / silent-head / compressed-duet YRCs so they route cleanly to 20ms Dual-Track CTC!)
+    g5_ok, g5_stats = _yrc_passes_word_quality_gate(yrc_lines, best_shift, db20, thr20)
+    if not g5_ok:
+        print(
+            f"[Lyrics] NetEase YRC rejected by Gate 5 word-quality check (shift={best_shift:+.2f}s, "
+            f"crushed={g5_stats['crushed']}/{g5_stats['total_w']} [{g5_stats['crushed_pct']}%], "
+            f"unif={g5_stats['unif']}, dead_gaps={g5_stats['dead_gaps']}, "
+            f"silent_heads={g5_stats['silent_heads']}, duets={g5_stats['duets']})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+    # All 5 strict gates PASSED -> emit shifted studio word-level YRC!
     out_lines: list[dict] = []
     for ln in yrc_lines:
         ns = round(max(0.0, float(ln["start"]) + best_shift), 2)
@@ -4349,8 +4494,6 @@ def _detect_cantonese_vs_mandarin_audio(
     return "zh"
 
 
-SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
-INLINE_SPEAKER_TAG_RE = re.compile(r"(?:^|(?<=[\s\(（\[【]))(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
 _CTC_TOKEN_RE = re.compile(
     r"[\u3040-\u30ff][\u3041\u3043\u3045\u3047\u3049\u3083\u3085\u3087\u30a1\u30a3\u30a5\u30a7\u30a9\u30e3\u30e5\u30e7\u30fc]*"
     r"|[\u4e00-\u9fff\u3400-\u4dbf]"
@@ -4535,13 +4678,17 @@ def _enforce_strict_monotonic_bounds(
     audio_dur: float,
 ) -> list[dict]:
     """Enforce strictly monotonic, non-overlapping line & word bounds WITHOUT distorting healthy CTC timing.
-    Preserves exact 20ms CTC word onsets and peak-decay vocal tails untouched, while mathematically
-    guaranteeing ZERO degenerate 0.00s boundary-clamped words if two adjacent blocks ever touch.
+    Preserves exact 20ms CTC word onsets, intentional 0.02s speaker-tag visual anchors, and explicit
+    simultaneous duet pairs (`duet_track == 'lead'` + `'counter'`), while guaranteeing ZERO non-pair
+    overlaps and ZERO degenerate 0.00s boundary-clamped sung words.
     """
     if not lines:
         return lines
     floor_t = max(0.0, float(first_onset))
     ceil_t = float(audio_dur) if audio_dur > 0 else 1e9
+
+    def _is_spk_anchor(w: dict) -> bool:
+        return str(w.get("word") or "").rstrip().endswith((":", "："))
 
     def _repair_clamped_zero_words(ln: dict) -> None:
         ws = ln.get("words") or []
@@ -4560,25 +4707,28 @@ def _enforce_strict_monotonic_bounds(
             w["start"] = round(ws_i, 3)
             w["end"] = round(we_i, 3)
             prev_we = we_i
-        # If boundary clamping squeezed any words to degenerate <=0.021s, redistribute ONLY the collapsed run
-        # (borrowing minimal room from its single touching clamped neighbor if run_span is 0.00s) so healthy words stay untouched!
-        min_w = min(0.04, span / max(1, n))
+        # If boundary clamping squeezed any real SUNG words to degenerate <=0.021s, redistribute ONLY the collapsed run
+        # (never stretching intentional 0.02s speaker-tag anchors like '男：' into real singing time!).
+        sung_cnt = max(1, sum(1 for w in ws if not _is_spk_anchor(w)))
+        min_w = min(0.04, span / sung_cnt)
         i_w = 0
         while i_w < n:
-            if (ws[i_w]["end"] - ws[i_w]["start"]) <= 0.021 and min_w > 0.021:
+            if (not _is_spk_anchor(ws[i_w])) and (ws[i_w]["end"] - ws[i_w]["start"]) <= 0.021 and min_w > 0.021:
                 j_w = i_w + 1
-                while j_w < n and (ws[j_w]["end"] - ws[j_w]["start"]) <= 0.021:
+                while j_w < n and (not _is_spk_anchor(ws[j_w])) and (ws[j_w]["end"] - ws[j_w]["start"]) <= 0.021:
                     j_w += 1
                 r_s, r_e = i_w, j_w
-                # Expand minimally into touching neighbors until the run has at least min_w per word
+                # Expand minimally into touching non-anchor neighbors until the run has at least min_w per word
                 while ((le if r_e == n else ws[r_e]["start"]) - (ls if r_s == 0 else ws[r_s - 1]["end"])) < (min_w * (r_e - r_s)) - 1e-4:
-                    if r_s == 0 and r_e == n:
+                    can_l = r_s > 0 and not _is_spk_anchor(ws[r_s - 1])
+                    can_r = r_e < n and not _is_spk_anchor(ws[r_e])
+                    if not can_l and not can_r:
                         break
-                    left_d = (ws[r_s - 1]["end"] - ws[r_s - 1]["start"]) if r_s > 0 else -1.0
-                    right_d = (ws[r_e]["end"] - ws[r_e]["start"]) if r_e < n else -1.0
-                    if r_s > 0 and (r_e == n or left_d >= right_d):
+                    left_d = (ws[r_s - 1]["end"] - ws[r_s - 1]["start"]) if can_l else -1.0
+                    right_d = (ws[r_e]["end"] - ws[r_e]["start"]) if can_r else -1.0
+                    if can_l and (not can_r or left_d >= right_d):
                         r_s -= 1
-                    elif r_e < n:
+                    elif can_r:
                         r_e += 1
                 seg_s = ls if r_s == 0 else ws[r_s - 1]["end"]
                 seg_e = le if r_e == n else ws[r_e]["start"]
@@ -4599,14 +4749,33 @@ def _enforce_strict_monotonic_bounds(
     for i, ln in enumerate(lines):
         ls = max(floor_t, min(ceil_t, float(ln["start"])))
         le = max(ls + 0.15, min(ceil_t, float(ln["end"])))
-        if i > 0:
-            prev_end = float(lines[i - 1]["end"])
-            if ls < prev_end:
-                if ls >= float(lines[i - 1]["start"]) + 0.20:
-                    lines[i - 1]["end"] = round(ls, 2)
-                    _repair_clamped_zero_words(lines[i - 1])
+        is_counter_pair = (
+            i > 0
+            and ln.get("duet_track") == "counter"
+            and lines[i - 1].get("duet_track") == "lead"
+        )
+        if is_counter_pair:
+            # Simultaneous duet counter line: NEVER start before lead (keeps content.js linear scan deterministic),
+            # while intentionally preserving genuine overlapping [ls, le] counterpoint!
+            lead_s = float(lines[i - 1]["start"])
+            if ls < lead_s:
+                ls = lead_s
+                le = max(ls + 0.15, le)
+        elif i > 0:
+            prev_idxs = (
+                [i - 2, i - 1]
+                if (i >= 2 and lines[i - 1].get("duet_track") == "counter" and lines[i - 2].get("duet_track") == "lead")
+                else [i - 1]
+            )
+            prev_max_end = max(float(lines[pi]["end"]) for pi in prev_idxs)
+            if ls < prev_max_end:
+                overlapping_pis = [pi for pi in prev_idxs if float(lines[pi]["end"]) > ls]
+                if overlapping_pis and all(ls >= float(lines[pi]["start"]) + 0.20 for pi in overlapping_pis):
+                    for pi in overlapping_pis:
+                        lines[pi]["end"] = round(ls, 2)
+                        _repair_clamped_zero_words(lines[pi])
                 else:
-                    ls = prev_end
+                    ls = prev_max_end
                     le = max(ls + 0.15, le)
         ln["start"] = round(ls, 2)
         ln["end"] = round(le, 2)
@@ -4674,6 +4843,12 @@ def _strip_repeated_chorus_overlay_parens(
                             cpos = j
                             break
                 if cpos != -1:
+                    inner = s[i + 1 : cpos].strip()
+                    # NEVER strip explicit speaker-tagged duet counterpoint (e.g. '（男：...）', '（女：...）')!
+                    if DUET_LEAD_SPEAKER_RE.match(inner):
+                        out_ch.append(s[i : cpos + 1])
+                        i = cpos + 1
+                        continue
                     had_p = True
                     i = cpos + 1
                     continue
@@ -5202,6 +5377,252 @@ def _apply_single_line_acoustic_safeguards(
     return out, fixes
 
 
+def _attach_ctc_speaker_anchors(
+    text: str,
+    ctc_words: list[dict],
+    min_start: float = 0.0,
+) -> list[dict]:
+    """Re-attach skipped leading & inline speaker tags (e.g. '男：', '女：', '合：', '陳蕾：', 'Chorus:')
+    as 0.02s visual-width anchors immediately before their following sung word so the frontend KTV
+    clip-path sweep starts on the EXACT first sung character with zero 2-char lag (100% idempotent).
+    """
+    if not ctc_words:
+        return ctc_words
+    if any(str(w.get("word") or "").rstrip().endswith((":", "：")) for w in ctc_words):
+        return ctc_words
+    tags: list[tuple[int, str]] = []
+    for m in DUET_INLINE_SPK_CAP_RE.finditer(text or ""):
+        prefix_toks = len(_tokenize_line_for_ctc((text or "")[: m.start()]))
+        lbl = re.sub(r"\s+", "", m.group(1))
+        if lbl:
+            tags.append((prefix_toks, lbl))
+    if not tags:
+        return ctc_words
+    out: list[dict] = []
+    t_i = 0
+    floor_s = max(0.0, float(min_start))
+    for wi, w in enumerate(ctc_words):
+        while t_i < len(tags) and tags[t_i][0] <= wi:
+            prev_e = float(out[-1]["end"]) if out else floor_s
+            nxt_s = float(w["start"])
+            ts = max(prev_e, max(floor_s, nxt_s - 0.02))
+            te = max(ts, nxt_s)
+            out.append({"word": tags[t_i][1], "start": round(ts, 3), "end": round(te, 3)})
+            t_i += 1
+        out.append(w)
+    return out
+
+
+def _expand_and_align_duet_counterpoint(
+    lines: list[dict],
+    audio_dur: float,
+    first_onset: float,
+    align_text_fn,
+) -> tuple[list[dict], int]:
+    """Structural Dual-Track Simultaneous Counterpoint Duet Aligner:
+    Splits & independently aligns overlapping dual-singer bars onto simultaneous (lead, counter)
+    line pairs that sweep concurrently across top/bottom KTV slots:
+      - Pattern A (Inline speaker-tagged counterpoint): `Lead（Speaker2：Counter）`
+        Distinguishes true sequential call-and-response (silent gap >= 0.25s, normal pace, 0 crushed
+        tokens -> clean non-overlapping 2-line split) from simultaneous counterpoint (independent CTC
+        on Lead + tail-syllable-anchored CTC on Counter when shorter than Lead, or full-window CTC when
+        comparable length).
+      - Pattern B (Adjacent compressed opposite-speaker pair): `Lead` + `（Speaker2：Counter）`
+        Triggered when opposite speakers share a single compressed musical bar (< 0.72x this song's
+        own median solo syllable pace) -> aligns BOTH singers independently across their shared bar!
+    Zero false triggers on solo songs (requires explicit opposite speaker tags).
+    """
+    if not lines:
+        return lines, 0
+
+    # Compute song-adaptive median solo syllable pace (0 magic-number tempo assumptions!)
+    solo_paces: list[float] = []
+    for ln in lines:
+        txt = (ln.get("text") or "").strip()
+        if not DUET_INLINE_COUNTERPOINT_RE.match(txt) and not DUET_PAREN_SPEAKER_LINE_RE.match(txt):
+            syl = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", txt))
+            dur = float(ln["end"]) - float(ln["start"])
+            if syl >= 4.0 and dur >= 0.5:
+                solo_paces.append(dur / syl)
+    solo_pace = float(np.median(solo_paces)) if solo_paces else 0.40
+
+    final_lines: list[dict] = []
+    n = len(lines)
+    i = 0
+    cur_speaker = ""
+    duet_pairs = 0
+
+    def _prev_max_end() -> float:
+        if not final_lines:
+            return max(0.0, float(first_onset))
+        if (
+            len(final_lines) >= 2
+            and final_lines[-1].get("duet_track") == "counter"
+            and final_lines[-2].get("duet_track") == "lead"
+        ):
+            return max(float(final_lines[-1]["end"]), float(final_lines[-2]["end"]))
+        return float(final_lines[-1]["end"])
+
+    while i < n:
+        ln = dict(lines[i])
+        txt = (ln.get("text") or "").strip()
+        m_sp = DUET_LEAD_SPEAKER_RE.match(txt)
+        if m_sp:
+            cur_speaker = re.sub(r"[:：\s]+", "", m_sp.group(1))
+        prev_end = _prev_max_end()
+
+        # Pattern A: Inline speaker-tagged counterpoint "Lead（Speaker2：Counter）"
+        m_inl = DUET_INLINE_COUNTERPOINT_RE.match(txt)
+        if m_inl:
+            lead_txt = m_inl.group(1).strip()
+            cnt_txt = m_inl.group(2).strip()
+            syl_a = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", lead_txt))
+            syl_b = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", cnt_txt))
+            if syl_a >= 3.0 and syl_b >= 2.0:
+                a_toks = _tokenize_line_for_ctc(lead_txt)
+                b_toks = _tokenize_line_for_ctc(cnt_txt)
+                base_ws = [
+                    w for w in (ln.get("words") or [])
+                    if not str(w.get("word") or "").rstrip().endswith((":", "："))
+                ]
+                # Check if Pattern A is genuinely SEQUENTIAL call-and-response (real silence gap >= 0.25s + normal pace)
+                is_sequential = False
+                if len(base_ws) == len(a_toks) + len(b_toks) and a_toks and b_toks:
+                    ba = [dict(w) for w in base_ws[: len(a_toks)]]
+                    bb = [dict(w) for w in base_ws[len(a_toks) :]]
+                    seq_gap = float(bb[0]["start"]) - float(ba[-1]["end"])
+                    seq_dur = float(bb[-1]["end"]) - float(ba[0]["start"])
+                    seq_pace = seq_dur / max(1.0, syl_a + syl_b)
+                    seq_crushed = sum(1 for w in base_ws if (float(w["end"]) - float(w["start"])) <= 0.065)
+                    if seq_gap >= 0.25 and seq_pace >= solo_pace * 0.95 and seq_crushed == 0:
+                        is_sequential = True
+                        wa = _attach_ctc_speaker_anchors(lead_txt, ba, min_start=prev_end)
+                        la_seq = {
+                            "start": round(wa[0]["start"], 2),
+                            "end": round(max(wa[0]["start"] + 0.15, wa[-1]["end"]), 2),
+                            "text": lead_txt,
+                            "words": wa,
+                        }
+                        wb = _attach_ctc_speaker_anchors(cnt_txt, bb, min_start=la_seq["end"])
+                        lb_seq = {
+                            "start": round(wb[0]["start"], 2),
+                            "end": round(max(wb[0]["start"] + 0.15, wb[-1]["end"]), 2),
+                            "text": cnt_txt,
+                            "words": wb,
+                        }
+                        final_lines.append(la_seq)
+                        final_lines.append(lb_seq)
+                        i += 1
+                        continue
+
+                if not is_sequential:
+                    nxt_b = float(lines[i + 1]["start"]) if i + 1 < n else audio_dur
+                    w_s = max(prev_end, float(ln["start"]) - 0.12)
+                    w_e = min(nxt_b, float(ln["end"]) + 0.20)
+                    res_a = align_text_fn(lead_txt, w_s, w_e, nxt_b)
+                    if res_a is not None:
+                        la_sung, _ = res_a
+                        n_a = len(la_sung)
+                        n_b = len(b_toks)
+                        if n_b / max(1, n_a) >= 0.72:
+                            b_s = max(w_s, float(la_sung[0]["start"]) - 0.05)
+                        else:
+                            # First-principles tail-syllable anchor: shorter counterpoint aligns rhythmically
+                            # to the final `n_b` syllables of the lead phrase!
+                            tail_idx = max(0, n_a - n_b)
+                            b_s = max(w_s, float(la_sung[tail_idx]["start"]) - 0.15)
+                            if w_e - b_s < 0.35:
+                                b_s = max(w_s, w_e - 0.50)
+                        res_b = align_text_fn(cnt_txt, b_s, w_e, nxt_b)
+                        if res_b is not None:
+                            lb_sung, _ = res_b
+                            wa = _attach_ctc_speaker_anchors(lead_txt, la_sung, min_start=prev_end)
+                            la_start = round(wa[0]["start"], 2)
+                            la_end = round(min(nxt_b, max(la_start + 0.15, wa[-1]["end"])), 2)
+                            wb = _attach_ctc_speaker_anchors(cnt_txt, lb_sung, min_start=la_start)
+                            lb_start = round(max(la_start, wb[0]["start"]), 2)
+                            lb_end = round(min(nxt_b, max(lb_start + 0.15, wb[-1]["end"])), 2)
+                            final_lines.append({
+                                "start": la_start,
+                                "end": la_end,
+                                "text": lead_txt,
+                                "words": wa,
+                                "duet_track": "lead",
+                            })
+                            final_lines.append({
+                                "start": lb_start,
+                                "end": lb_end,
+                                "text": cnt_txt,
+                                "words": wb,
+                                "duet_track": "counter",
+                            })
+                            duet_pairs += 1
+                            i += 1
+                            continue
+
+        # Pattern B: Adjacent compressed opposite-speaker counterpoint pair (Lead + "（Speaker2：Counter）")
+        if i + 1 < n:
+            nxt = lines[i + 1]
+            m_p2 = DUET_PAREN_SPEAKER_LINE_RE.match((nxt.get("text") or "").strip())
+            if m_p2 and not DUET_PAREN_SPEAKER_LINE_RE.match(txt):
+                cnt_txt = m_p2.group(1).strip()
+                m_csp = DUET_LEAD_SPEAKER_RE.match(cnt_txt)
+                cnt_sp = re.sub(r"[:：\s]+", "", m_csp.group(1)) if m_csp else ""
+                syl_a = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", txt))
+                syl_b = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", cnt_txt))
+                comb_dur = float(nxt["end"]) - float(ln["start"])
+                gap_ab = float(nxt["start"]) - float(ln["end"])
+                pace_thr = min(0.30, solo_pace * 0.72)
+                if (
+                    cnt_sp
+                    and cnt_sp != cur_speaker
+                    and (syl_b / max(1.0, syl_a)) >= 0.65
+                    and gap_ab <= 0.8
+                    and (comb_dur / max(1.0, syl_a + syl_b)) < pace_thr
+                ):
+                    nxt_b = float(lines[i + 2]["start"]) if i + 2 < n else audio_dur
+                    w_s = max(prev_end, float(ln["start"]) - 0.12)
+                    w_e = min(nxt_b, float(nxt["end"]) + 0.20)
+                    res_a = align_text_fn(txt, w_s, w_e, nxt_b)
+                    res_b = align_text_fn(cnt_txt, w_s, w_e, nxt_b)
+                    if res_a is not None and res_b is not None:
+                        la_sung, _ = res_a
+                        lb_sung, _ = res_b
+                        wa = _attach_ctc_speaker_anchors(txt, la_sung, min_start=prev_end)
+                        la_start = round(wa[0]["start"], 2)
+                        la_end = round(min(nxt_b, max(la_start + 0.15, wa[-1]["end"])), 2)
+                        wb = _attach_ctc_speaker_anchors(cnt_txt, lb_sung, min_start=la_start)
+                        lb_start = round(max(la_start, wb[0]["start"]), 2)
+                        lb_end = round(min(nxt_b, max(lb_start + 0.15, wb[-1]["end"])), 2)
+                        final_lines.append({
+                            "start": la_start,
+                            "end": la_end,
+                            "text": txt,
+                            "words": wa,
+                            "duet_track": "lead",
+                        })
+                        final_lines.append({
+                            "start": lb_start,
+                            "end": lb_end,
+                            "text": cnt_txt,
+                            "words": wb,
+                            "duet_track": "counter",
+                        })
+                        duet_pairs += 1
+                        i += 2
+                        continue
+
+        # Normal solo / non-counterpoint line: attach speaker visual-width anchors cleanly!
+        ws_att = _attach_ctc_speaker_anchors(txt, list(ln.get("words") or []), min_start=prev_end)
+        if ws_att:
+            ln["words"] = ws_att
+            ln["start"] = round(min(float(ln["start"]), float(ws_att[0]["start"])), 2)
+        final_lines.append(ln)
+        i += 1
+
+    return final_lines, duet_pairs
+
+
 def refine_lines_with_ctc(
     lines: list[dict],
     audio_16k: np.ndarray,
@@ -5490,11 +5911,31 @@ def refine_lines_with_ctc(
         out_lines, single_fixes = _apply_single_line_acoustic_safeguards(
             out_lines, audio_dur, db20, global_thr, _align_single_local
         )
+
+        # M4: Speaker-tag visual anchors + Dual-Track Simultaneous Counterpoint Duet Alignment
+        def _align_text_local(text_str: str, win_s: float, win_e: float, next_bound_s: float) -> Optional[tuple[list[dict], float]]:
+            ws_cl = max(0.0, float(win_s))
+            we_cl = min(audio_dur, float(win_e))
+            if we_cl - ws_cl < 0.35:
+                return None
+            seg_loc = audio_16k[int(ws_cl * 16000) : int(we_cl * 16000)]
+            r_loc = _align_segment_ctc(seg_loc, ws_cl, [0], min(we_cl, float(next_bound_s)), text_override={0: text_str})
+            if not r_loc:
+                return None
+            lws = r_loc[0].get(0) or []
+            if not lws:
+                return None
+            return lws, r_loc[1].get(0, 0.0)
+
+        out_lines, duet_pairs = _expand_and_align_duet_counterpoint(
+            out_lines, audio_dur, first_onset, _align_text_local
+        )
         out_lines = _enforce_strict_monotonic_bounds(out_lines, first_onset, audio_dur)
 
         print(
             f"[Lyrics] MMS_FA 20ms CTC ({dev}) refined {refined_blocks}/{len(blocks)} blocks "
-            f"({refined_line_count}/{len(out_lines)} lines, chorus_rescue={rescued_choruses}, single_fixes={single_fixes})",
+            f"({refined_line_count}/{len(out_lines)} lines, chorus_rescue={rescued_choruses}, "
+            f"single_fixes={single_fixes}, duet_pairs={duet_pairs})",
             file=sys.stderr,
             flush=True,
         )
