@@ -29,7 +29,27 @@ if not WORKER_SECRET and WORKER_SECRET_FILE.exists():
     WORKER_SECRET = WORKER_SECRET_FILE.read_text(encoding="utf-8").strip()
 
 ALLOWED_ORIGINS = {"https://www.youtube.com"}
+EXTENSION_DIR = BASE_DIR.parent / "extension"
 EXTENSION_RELOAD_NONCE = 1
+
+
+def _get_extension_reload_nonce() -> int:
+    """Monotonic dev hot-reload nonce derived from latest extension/ file mtime (ms) + manual bumps.
+
+    Never resets to 1 across backend restarts, so local unpacked Chrome extensions reliably detect
+    any edited content.js / styles.css / background.js and hot-reload automatically.
+    """
+    latest_ms = 0
+    try:
+        if EXTENSION_DIR.exists():
+            for p in EXTENSION_DIR.iterdir():
+                if p.is_file():
+                    mt = int(p.stat().st_mtime * 1000)
+                    if mt > latest_ms:
+                        latest_ms = mt
+    except Exception:
+        latest_ms = 0
+    return max(EXTENSION_RELOAD_NONCE, latest_ms)
 
 
 def _is_allowed_origin(origin: Optional[str]) -> bool:
@@ -236,7 +256,7 @@ def health(request: Request, x_karaoke_client: Optional[str] = Header(default=No
         "max_queue_size": manager.max_queue_size,
         "rate_limit_per_10min": manager.rate_limit_per_10min,
         "max_clients": manager.max_clients,
-        "extension_reload_nonce": EXTENSION_RELOAD_NONCE,
+        "extension_reload_nonce": _get_extension_reload_nonce(),
         "migration_running": mig["running"],
         "migration_done": mig["done"],
         "migration_total": mig["total"],
@@ -255,7 +275,7 @@ def heartbeat(req: HeartbeatRequest, request: Request):
         allowed = clients.touch(req.client_id, ip, video_id=vid, singing=req.singing)
         if not allowed:
             raise HTTPException(status_code=503, detail="目前已達最大連線人數上限，請稍後再試。")
-    return {"status": "ok", **clients.snapshot(), "extension_reload_nonce": EXTENSION_RELOAD_NONCE}
+    return {"status": "ok", **clients.snapshot(), "extension_reload_nonce": _get_extension_reload_nonce()}
 
 
 @app.post("/api/settings")
@@ -292,7 +312,7 @@ def update_settings(req: SettingsRequest, x_admin_token: Optional[str] = Header(
 def trigger_extension_reload(x_admin_token: Optional[str] = Header(default=None)):
     global EXTENSION_RELOAD_NONCE
     _require_admin(x_admin_token)
-    EXTENSION_RELOAD_NONCE += 1
+    EXTENSION_RELOAD_NONCE = _get_extension_reload_nonce() + 1
     return {"status": "ok", "extension_reload_nonce": EXTENSION_RELOAD_NONCE}
 
 

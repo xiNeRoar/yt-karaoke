@@ -3,6 +3,8 @@ const API_ORIGIN = new URL(API_BASE).origin;
 const IS_LOCAL_DEV = API_BASE.startsWith("http://127.0.0.1") || API_BASE.startsWith("http://localhost");
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 let lastReloadNonce = null;
+let reloadNonceLoaded = false;
+let reloadTriggered = false;
 
 // Shared zero-spam catalog ID cache across all YouTube tabs (powers instant visual DB indicators)
 let _catalogCache = { ids: [], version: "", fetchedAt: 0, inFlight: null };
@@ -139,14 +141,26 @@ chrome.runtime.onInstalled.addListener((details) => {
   }
 });
 
-function checkReloadNonce(nonce) {
-  if (!IS_LOCAL_DEV || typeof nonce !== "number") return;
+async function checkReloadNonce(nonce) {
+  if (!IS_LOCAL_DEV || typeof nonce !== "number" || reloadTriggered) return;
+  if (!reloadNonceLoaded) {
+    reloadNonceLoaded = true;
+    try {
+      const stored = await chrome.storage.local.get(["ktv_dev_reload_nonce"]);
+      if (typeof stored.ktv_dev_reload_nonce === "number") {
+        lastReloadNonce = stored.ktv_dev_reload_nonce;
+      }
+    } catch (_e) {}
+  }
   if (lastReloadNonce === null) {
     lastReloadNonce = nonce;
+    try { await chrome.storage.local.set({ ktv_dev_reload_nonce: nonce }); } catch (_e) {}
     return;
   }
   if (nonce > lastReloadNonce) {
+    reloadTriggered = true;
     lastReloadNonce = nonce;
+    try { await chrome.storage.local.set({ ktv_dev_reload_nonce: nonce }); } catch (_e) {}
     chrome.runtime.reload();
   }
 }
