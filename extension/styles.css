@@ -594,7 +594,7 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
     0 4px 18px rgba(0, 0, 0, 0.5);
 }
 
-/* Sweep layer: clean, eye-friendly KTV Blue without glaring thick white border */
+/* Sweep layer: clean, eye-friendly KTV Blue (zero neon border or colored glow) */
 .ktv-layer-fill {
   position: absolute;
   left: 0;
@@ -606,29 +606,19 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
   -webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.82);
   paint-order: stroke fill;
   text-shadow:
-    0 2px 10px rgba(0, 0, 0, 0.9),
-    0 0 14px rgba(77, 163, 255, 0.3);
+    0 2px 8px rgba(0, 0, 0, 0.88),
+    0 4px 18px rgba(0, 0, 0, 0.5);
   clip-path: inset(0 100% 0 0);
   will-change: clip-path;
 }
 
-/* Authentic HK KTV (Neway / RedMR) Duet Color Coding — Zero '男：'/'女：' Clutter!
-   Waiting text = crisp white with speaker-colored outward stroke (instant singer cue before singing starts!)
-   Sweeping text = vivid HK KTV Blue (Male) / Rose-Pink (Female) / Gold (Chorus/All) */
+/* Clean HK KTV Duet Color Coding — Pure text-color change only (no colored borders or neon glow) */
 .ktv-sweep-wrap[data-speaker="male"] .ktv-layer-base {
-  color: #ffffff;
-  -webkit-text-stroke: 2.2px #1d6fe8;
-  text-shadow:
-    0 2px 8px rgba(0, 0, 0, 0.88),
-    0 0 11px rgba(29, 111, 232, 0.52);
+  color: rgba(232, 243, 255, 0.9);
 }
 
 .ktv-sweep-wrap[data-speaker="male"] .ktv-layer-fill {
   color: #4da3ff;
-  -webkit-text-stroke: 1.6px rgba(4, 18, 44, 0.92);
-  text-shadow:
-    0 2px 10px rgba(0, 0, 0, 0.92),
-    0 0 16px rgba(77, 163, 255, 0.48);
 }
 
 .ktv-countdown[data-speaker="male"] .ktv-cd-dot {
@@ -636,43 +626,27 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
 }
 
 .ktv-sweep-wrap[data-speaker="female"] .ktv-layer-base {
-  color: #ffffff;
-  -webkit-text-stroke: 2.2px #db2777;
-  text-shadow:
-    0 2px 8px rgba(0, 0, 0, 0.88),
-    0 0 11px rgba(219, 39, 119, 0.52);
+  color: rgba(255, 228, 240, 0.9);
 }
 
 .ktv-sweep-wrap[data-speaker="female"] .ktv-layer-fill {
-  color: #ff66b2;
-  -webkit-text-stroke: 1.6px rgba(48, 6, 28, 0.92);
-  text-shadow:
-    0 2px 10px rgba(0, 0, 0, 0.92),
-    0 0 16px rgba(255, 102, 178, 0.48);
+  color: #ff7eb6;
 }
 
 .ktv-countdown[data-speaker="female"] .ktv-cd-dot {
-  background: #ff66b2;
+  background: #ff7eb6;
 }
 
 .ktv-sweep-wrap[data-speaker="all"] .ktv-layer-base {
-  color: #ffffff;
-  -webkit-text-stroke: 2.2px #ca8a04;
-  text-shadow:
-    0 2px 8px rgba(0, 0, 0, 0.88),
-    0 0 11px rgba(202, 138, 4, 0.52);
+  color: rgba(255, 244, 214, 0.9);
 }
 
 .ktv-sweep-wrap[data-speaker="all"] .ktv-layer-fill {
-  color: #ffd43b;
-  -webkit-text-stroke: 1.6px rgba(38, 24, 2, 0.92);
-  text-shadow:
-    0 2px 10px rgba(0, 0, 0, 0.92),
-    0 0 16px rgba(255, 212, 59, 0.48);
+  color: #ffd95a;
 }
 
 .ktv-countdown[data-speaker="all"] .ktv-cd-dot {
-  background: #ffd43b;
+  background: #ffd95a;
 }
 
 .ktv-lyric-status {
