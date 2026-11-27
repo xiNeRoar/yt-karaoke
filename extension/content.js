@@ -403,6 +403,9 @@
       this.semitones = 0;
       this.masterVolume = 1.0;
       this.loadedKey = null; // `${videoId}_${mode}`
+      this._loadedVideoId = null;
+      this._loadedMode = null;
+      this._vocLoadingKey = null;
       this._loadSeq = 0;
     }
 
@@ -503,6 +506,42 @@
       }
     }
 
+    _attachVocalsBuffer(vocBuf, key, seq) {
+      if (seq !== this._loadSeq || this.loadedKey !== key) return;
+      this.vocBuffer = vocBuf;
+      if (this.isPlaying && this.ctx && !this.vocSource) {
+        const tStart = this.ctx.currentTime + 0.015;
+        const targetOff = this.startOffset + (tStart - this.startCtxTime) * this.playbackRate;
+        if (targetOff >= 0 && targetOff < vocBuf.duration - 0.05) {
+          const vocSrc = this.ctx.createBufferSource();
+          vocSrc.buffer = vocBuf;
+          vocSrc.playbackRate.value = this.playbackRate;
+          vocSrc.connect(this.vocGain);
+          vocSrc.start(tStart, targetOff);
+          this.vocSource = vocSrc;
+        }
+      }
+    }
+
+    ensureVocalsLoaded() {
+      if (!this.ctx || !this.loadedKey || this.vocBuffer) return;
+      if (!this._loadedVideoId || !this._loadedMode) return;
+      if (this._vocLoadingKey === this.loadedKey) return;
+      const key = this.loadedKey;
+      const seq = this._loadSeq;
+      const path = `/api/audio/${this._loadedVideoId}/${this._loadedMode}/vocals`;
+      this._vocLoadingKey = key;
+      fetchAudioArrayBuffer(path)
+        .then((raw) => this.ctx.decodeAudioData(raw))
+        .then((vocBuf) => {
+          if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+          this._attachVocalsBuffer(vocBuf, key, seq);
+        })
+        .catch(() => {
+          if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+        });
+    }
+
     async loadTracks(videoId, mode, onProgress) {
       const seq = ++this._loadSeq;
       if (onProgress) onProgress("載入伴奏中...", 94);
@@ -510,6 +549,7 @@
       if (seq !== this._loadSeq) return;
       const key = `${videoId}_${mode}`;
       if (this.loadedKey === key && this.instBuffer && (this.vocBuffer || this.vocalVolume <= 0.001)) {
+        if (!this.vocBuffer) this.ensureVocalsLoaded();
         return;
       }
 
@@ -518,45 +558,53 @@
       const instBufP = fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/instrumental`).then((raw) =>
         this.ctx.decodeAudioData(raw)
       );
+      this._vocLoadingKey = key;
       const vocBufP = fetchAudioArrayBuffer(`/api/audio/${videoId}/${mode}/vocals`).then((raw) =>
         this.ctx.decodeAudioData(raw)
       );
 
       if (this.vocalVolume > 0.001) {
-        const [instBuf, vocBuf] = await Promise.all([instBufP, vocBufP]);
-        if (seq !== this._loadSeq) return;
-        this.instBuffer = instBuf;
-        this.vocBuffer = vocBuf;
-        this.loadedKey = key;
+        try {
+          const [instBuf, vocBuf] = await Promise.all([instBufP, vocBufP]);
+          if (seq !== this._loadSeq) return;
+          this.instBuffer = instBuf;
+          this.vocBuffer = vocBuf;
+          this.loadedKey = key;
+          this._loadedVideoId = videoId;
+          this._loadedMode = mode;
+        } finally {
+          if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+        }
         return;
       }
 
       // Default KTV mode (guide vocal = 0%): start playing IMMEDIATELY as soon as instrumental is decoded!
-      // Guide vocals finish decoding silently in background & attach sample-accurately synced when ready.
-      const instBuf = await instBufP;
+      // Attach rejection guard BEFORE awaiting instBufP so fast vocals errors (or instBufP throw) never trigger unhandledrejection!
+      vocBufP.catch(() => {
+        if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+      });
+      let instBuf;
+      try {
+        instBuf = await instBufP;
+      } catch (err) {
+        if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+        throw err;
+      }
       if (seq !== this._loadSeq) return;
       this.instBuffer = instBuf;
       this.vocBuffer = null;
       this.loadedKey = key;
+      this._loadedVideoId = videoId;
+      this._loadedMode = mode;
 
       vocBufP
         .then((vocBuf) => {
-          if (seq !== this._loadSeq || this.loadedKey !== key) return;
-          this.vocBuffer = vocBuf;
-          if (this.isPlaying && this.ctx && !this.vocSource) {
-            const curPos = Math.max(0, this.getCurrentPosition());
-            if (curPos < vocBuf.duration - 0.05) {
-              const vocSrc = this.ctx.createBufferSource();
-              vocSrc.buffer = vocBuf;
-              vocSrc.playbackRate.value = this.playbackRate;
-              vocSrc.connect(this.vocGain);
-              const tStart = this.ctx.currentTime + 0.01;
-              vocSrc.start(tStart, curPos + 0.01 * this.playbackRate);
-              this.vocSource = vocSrc;
-            }
-          }
+          if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+          this._attachVocalsBuffer(vocBuf, key, seq);
         })
-        .catch(() => {});
+        .catch(() => {
+          if (this._vocLoadingKey === key) this._vocLoadingKey = null;
+        });
     }
 
     stopSources() {
@@ -640,6 +688,9 @@
       if (this.vocGain && this.ctx) {
         this.vocGain.gain.setTargetAtTime(this.vocalVolume, this.ctx.currentTime, 0.02);
       }
+      if (this.vocalVolume > 0.001 && this.loadedKey && !this.vocBuffer) {
+        this.ensureVocalsLoaded();
+      }
     }
 
     setMasterVolume(vol) {
@@ -663,6 +714,9 @@
       this.instBuffer = null;
       this.vocBuffer = null;
       this.loadedKey = null;
+      this._loadedVideoId = null;
+      this._loadedMode = null;
+      this._vocLoadingKey = null;
     }
   }
 
@@ -1642,7 +1696,13 @@
       if (state.videoId === videoId) setStatus(msg, false, pct);
     });
     if (state.videoId !== videoId || state.mode !== mode) return;
-    if (engine.loadedKey !== `${videoId}_${mode}` || !engine.instBuffer || !engine.vocBuffer) return;
+    const vocRequired = engine.vocalVolume > 0.001;
+    if (engine.loadedKey !== `${videoId}_${mode}` || !engine.instBuffer || (vocRequired && !engine.vocBuffer)) {
+      state.busy = false;
+      setStatus("音訊載入未完成，請重試", true, 0);
+      updateUI();
+      return;
+    }
     state.active = true;
     state.busy = false;
     attachVideoSync();
@@ -2296,6 +2356,7 @@
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === "local" && changes.ktv_access_token) {
         if (!changes.ktv_access_token.newValue) {
+          ktvAudioCacheClear();
           state.cachedVideoIds.clear();
           annotateYouTubeThumbnails();
         }

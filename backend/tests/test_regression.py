@@ -87,6 +87,21 @@ def test_extension_js_syntax() -> None:
         assert res.returncode == 0, f"JS syntax error in {jf}: {res.stderr}"
     print(f"[PASS] Extension JS syntax ({len(js_files)} files)")
 
+    lifecycle_test = Path(__file__).resolve().parent / "test_extension_lifecycle.mjs"
+    if lifecycle_test.exists():
+        lres = subprocess.run(
+            ["node", str(lifecycle_test)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        assert lres.returncode == 0, f"Extension runtime lifecycle test FAILED:\n{lres.stdout}\n{lres.stderr}"
+        for line in (lres.stdout or "").splitlines():
+            if line.strip().startswith("[PASS]"):
+                print(line.strip())
+
 
 def test_atomic_json_concurrency() -> None:
     from atomic_io import write_json_atomic

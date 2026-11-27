@@ -125,6 +125,8 @@ def _encode_stems_parallel_vbr(
         ffmpeg_exe, "-y", "-v", "error", "-threads", "2",
         "-i", str(voc_src), "-c:a", "libmp3lame", "-q:a", "4", str(voc_tmp),
     ]
+    p1 = None
+    p2 = None
     try:
         p1 = subprocess.Popen(cmd_inst, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=creation)
         p2 = subprocess.Popen(cmd_voc, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=creation)
@@ -137,6 +139,13 @@ def _encode_stems_parallel_vbr(
         os.replace(inst_tmp, inst_dst)
         os.replace(voc_tmp, voc_dst)
     finally:
+        for _p in (p1, p2):
+            if _p is not None and _p.poll() is None:
+                try:
+                    _p.kill()
+                    _p.wait(timeout=3)
+                except Exception:
+                    pass
         for _t in (inst_tmp, voc_tmp):
             try:
                 _t.unlink(missing_ok=True)
