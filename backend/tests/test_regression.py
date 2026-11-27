@@ -1072,7 +1072,8 @@ def test_tier0_yrc_and_stage2_ctc_invariants() -> None:
     tail_held = lw._local_vocal_tail_offset(2.00, 18.00, db20, g_thr)
     assert 5.90 <= tail_held <= 6.18, f"Local peak-decay tail wrong (expected ~6.0s): {tail_held}"
 
-    # 6) _enforce_strict_monotonic_bounds: zero overlaps, zero out-of-bounds words, untouched interior onsets
+    # 6) _enforce_strict_monotonic_bounds: zero overlaps, zero out-of-bounds words, untouched interior onsets,
+    #    AND zero degenerate 0.00s clamped words when adjacent blocks collide!
     raw_mono = [
         {"start": 10.00, "end": 12.60, "text": "第一句", "words": [{"word": "第", "start": 10.00, "end": 10.40}, {"word": "一", "start": 10.40, "end": 11.20}, {"word": "句", "start": 11.20, "end": 12.60}]},
         {"start": 12.40, "end": 15.00, "text": "第二句", "words": [{"word": "第", "start": 12.40, "end": 13.00}, {"word": "二", "start": 13.00, "end": 13.80}, {"word": "句", "start": 13.80, "end": 15.00}]},
@@ -1081,6 +1082,23 @@ def test_tier0_yrc_and_stage2_ctc_invariants() -> None:
     assert fixed_mono[0]["end"] <= fixed_mono[1]["start"]
     assert fixed_mono[0]["words"][1]["start"] == 10.40, "Interior CTC onset must NOT be distorted!"
     assert fixed_mono[0]["words"][-1]["end"] <= fixed_mono[0]["end"]
+
+    # Severe boundary squeeze (previously produced [0.0, 0.0, 0.0] clamped words!) must preserve healthy words & eliminate 0.00s collapses
+    squeezed = [
+        {"start": 72.00, "end": 73.40, "text": "與你有種牽引", "words": [
+            {"word": "與", "start": 72.00, "end": 72.44}, {"word": "你", "start": 72.44, "end": 72.70},
+            {"word": "有", "start": 72.70, "end": 72.95}, {"word": "種", "start": 72.95, "end": 73.15},
+            {"word": "牽", "start": 73.15, "end": 73.30}, {"word": "引", "start": 73.30, "end": 73.40},
+        ]},
+        {"start": 72.54, "end": 75.50, "text": "蝴蝶滿心飛", "words": [
+            {"word": "蝴", "start": 72.54, "end": 73.10}, {"word": "蝶", "start": 73.10, "end": 73.70},
+            {"word": "滿", "start": 73.70, "end": 74.30}, {"word": "心", "start": 74.30, "end": 74.90},
+            {"word": "飛", "start": 74.90, "end": 75.50},
+        ]},
+    ]
+    fixed_sq = lw._enforce_strict_monotonic_bounds(squeezed, first_onset=0.0, audio_dur=90.0)
+    assert fixed_sq[0]["end"] <= fixed_sq[1]["start"]
+    assert all((w["end"] - w["start"]) > 0.03 for ln in fixed_sq for w in ln["words"]), f"Degenerate 0.00s clamped words survived: {fixed_sq}"
     # 7) Boilerplate "(Official Music Video)" in a spam DB trackName MUST NEVER hijack another MV by the same artist!
     spam_sc = lw._track_matches_title(
         "MC 張天賦 - 老派約會之必要 A Gentleman's Guide to Old-Fashioned Dating (Official Music Video)",

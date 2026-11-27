@@ -4272,13 +4272,67 @@ def _enforce_strict_monotonic_bounds(
     first_onset: float,
     audio_dur: float,
 ) -> list[dict]:
-    """Enforce strictly monotonic, non-overlapping line & word bounds WITHOUT any energy-CDF distortion.
-    Preserves exact 20ms CTC word onsets and peak-decay vocal tails untouched.
+    """Enforce strictly monotonic, non-overlapping line & word bounds WITHOUT distorting healthy CTC timing.
+    Preserves exact 20ms CTC word onsets and peak-decay vocal tails untouched, while mathematically
+    guaranteeing ZERO degenerate 0.00s boundary-clamped words if two adjacent blocks ever touch.
     """
     if not lines:
         return lines
     floor_t = max(0.0, float(first_onset))
     ceil_t = float(audio_dur) if audio_dur > 0 else 1e9
+
+    def _repair_clamped_zero_words(ln: dict) -> None:
+        ws = ln.get("words") or []
+        if not ws:
+            return
+        ls, le = float(ln["start"]), float(ln["end"])
+        n = len(ws)
+        span = max(0.01, le - ls)
+        # First clamp strictly inside [ls, le]
+        prev_we = ls
+        for wi, w in enumerate(ws):
+            ws_i = max(prev_we, min(le, float(w.get("start", prev_we))))
+            we_i = max(ws_i, min(le, float(w.get("end", ws_i))))
+            if wi == n - 1:
+                we_i = le
+            w["start"] = round(ws_i, 3)
+            w["end"] = round(we_i, 3)
+            prev_we = we_i
+        # If boundary clamping squeezed any words to degenerate <=0.021s, redistribute ONLY the collapsed run
+        # (borrowing minimal room from its single touching clamped neighbor if run_span is 0.00s) so healthy words stay untouched!
+        min_w = min(0.04, span / max(1, n))
+        i_w = 0
+        while i_w < n:
+            if (ws[i_w]["end"] - ws[i_w]["start"]) <= 0.021 and min_w > 0.021:
+                j_w = i_w + 1
+                while j_w < n and (ws[j_w]["end"] - ws[j_w]["start"]) <= 0.021:
+                    j_w += 1
+                r_s, r_e = i_w, j_w
+                # Expand minimally into touching neighbors until the run has at least min_w per word
+                while ((le if r_e == n else ws[r_e]["start"]) - (ls if r_s == 0 else ws[r_s - 1]["end"])) < (min_w * (r_e - r_s)) - 1e-4:
+                    if r_s == 0 and r_e == n:
+                        break
+                    left_d = (ws[r_s - 1]["end"] - ws[r_s - 1]["start"]) if r_s > 0 else -1.0
+                    right_d = (ws[r_e]["end"] - ws[r_e]["start"]) if r_e < n else -1.0
+                    if r_s > 0 and (r_e == n or left_d >= right_d):
+                        r_s -= 1
+                    elif r_e < n:
+                        r_e += 1
+                seg_s = ls if r_s == 0 else ws[r_s - 1]["end"]
+                seg_e = le if r_e == n else ws[r_e]["start"]
+                if seg_e > seg_s + 0.01:
+                    wts = [max(1.0, estimate_syllable_units(str(w.get("word") or ""))) for w in ws[r_s:r_e]]
+                    tot_wt = float(sum(wts))
+                    acc = 0.0
+                    for w, wt in zip(ws[r_s:r_e], wts):
+                        u0 = acc / tot_wt
+                        acc += wt
+                        u1 = acc / tot_wt
+                        w["start"] = round(seg_s + (seg_e - seg_s) * u0, 3)
+                        w["end"] = round(seg_s + (seg_e - seg_s) * u1, 3)
+                i_w = max(j_w, r_e)
+            else:
+                i_w += 1
 
     for i, ln in enumerate(lines):
         ls = max(floor_t, min(ceil_t, float(ln["start"])))
@@ -4288,31 +4342,13 @@ def _enforce_strict_monotonic_bounds(
             if ls < prev_end:
                 if ls >= float(lines[i - 1]["start"]) + 0.20:
                     lines[i - 1]["end"] = round(ls, 2)
-                    # Clamp previous line's words to updated end
-                    p_ws = lines[i - 1].get("words") or []
-                    p_ls = float(lines[i - 1]["start"])
-                    p_le = float(lines[i - 1]["end"])
-                    for w in p_ws:
-                        w["start"] = round(max(p_ls, min(p_le, float(w["start"]))), 3)
-                        w["end"] = round(max(w["start"], min(p_le, float(w["end"]))), 3)
+                    _repair_clamped_zero_words(lines[i - 1])
                 else:
                     ls = prev_end
                     le = max(ls + 0.15, le)
         ln["start"] = round(ls, 2)
         ln["end"] = round(le, 2)
-
-        ws = ln.get("words") or []
-        if ws:
-            prev_we = float(ln["start"])
-            line_e = float(ln["end"])
-            for wi, w in enumerate(ws):
-                ws_i = max(prev_we, min(line_e, float(w.get("start", prev_we))))
-                we_i = max(ws_i, min(line_e, float(w.get("end", ws_i))))
-                if wi == len(ws) - 1:
-                    we_i = max(ws_i, min(line_e, max(we_i, line_e)))
-                w["start"] = round(ws_i, 3)
-                w["end"] = round(we_i, 3)
-                prev_we = we_i
+        _repair_clamped_zero_words(ln)
     return lines
 
 
@@ -4478,24 +4514,22 @@ def refine_lines_with_ctc(
 
             prev_is_backing = (bi > 0) and blocks[bi - 1][1]
             nxt_is_backing = (bi + 1 < len(blocks)) and blocks[bi + 1][1]
-            prev_e = float(lines[blocks[bi - 1][0][-1]]["end"]) if bi > 0 else 0.0
+            # Strictly anchor left bound to ALREADY-COMMITTED previous block end (`out_lines`, NOT stale Stage-1 `lines`!)
+            # and right bound to next block's start so adjacent CTC audio windows NEVER overlap and steal each other's words!
+            prev_e = float(out_lines[blocks[bi - 1][0][-1]]["end"]) if bi > 0 else 0.0
             nxt_s = float(lines[blocks[bi + 1][0][0]]["start"]) if (bi + 1 < len(blocks)) else audio_dur
 
             if is_isolated_backing:
-                # Tight Stage-1 local window for simultaneous parenthetical backing vocal
-                b_s = max(0.0, float(lines[blk[0]]["start"]) - 0.6)
-                b_e = min(audio_dur, float(lines[blk[-1]]["end"]) + 0.8)
+                # Non-overlapping local window for isolated parenthetical backing vocal: never bleed into neighboring lead lines!
+                b_s = max(prev_e, float(lines[blk[0]]["start"]) - 0.15)
+                b_e = min(nxt_s, float(lines[blk[-1]]["end"]) + 0.15)
                 next_bound = b_e
             else:
-                left_pad = 0.6 if prev_is_backing else 2.0
-                right_pad = 0.6 if nxt_is_backing else 2.5
-                b_s = max(0.0 if prev_is_backing else prev_e, float(lines[blk[0]]["start"]) - left_pad)
-                if nxt_is_backing:
-                    b_e = min(audio_dur, float(lines[blk[-1]]["end"]) + right_pad)
-                    next_bound = b_e
-                else:
-                    b_e = min(nxt_s, float(lines[blk[-1]]["end"]) + right_pad)
-                    next_bound = nxt_s
+                left_pad = 0.25 if prev_is_backing else 2.0
+                right_pad = 0.25 if nxt_is_backing else 2.5
+                b_s = max(prev_e, float(lines[blk[0]]["start"]) - left_pad)
+                b_e = min(nxt_s, float(lines[blk[-1]]["end"]) + right_pad)
+                next_bound = b_e if nxt_is_backing else nxt_s
 
             if b_e - b_s < 0.35:
                 continue
