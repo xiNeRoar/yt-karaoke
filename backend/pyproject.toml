@@ -19,6 +19,9 @@ dependencies = [
     "shazamio>=0.9.0",
     "yt-dlp-ejs>=0.8.0",
     "qwen-asr>=0.0.6",
+    "pypinyin>=0.53.0",
+    "pykakasi>=2.3.0",
+    "hangul-romanize>=0.1.0",
 ]
 
 [[tool.uv.index]]

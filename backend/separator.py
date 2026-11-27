@@ -382,8 +382,8 @@ class KaraokeSeparatorManager:
                         except Exception:
                             pass
 
-        # Run optional Qwen3 lyrics upgrade AFTER releasing _worker_lock so user separation jobs are NEVER blocked!
-        # Re-check idle state AND live free VRAM (>= 2200MB required for Qwen3): never pile onto an active lyrics queue or burn CPU!
+        # Run optional 20ms CTC lyrics upgrade AFTER releasing _worker_lock so user separation jobs are NEVER blocked!
+        # Re-check idle state AND live free VRAM (>= 2200MB required for idle background upgrade): never contend with user GPU load!
         try:
             with self._lock:
                 idle_for_lyrics = (
@@ -396,9 +396,10 @@ class KaraokeSeparatorManager:
                 cur_ly = self.get_lyrics(vid, mode)
                 cur_src = str(cur_ly.get("source") or "")
                 keep_sources = {
-                    "youtube_sub_qwen3", "lrclib_qwen3_align",
-                    "qwen3_forced_align", "live_qwen3_align", "mashup_qwen3_align",
-                    "qwen3_phrase_rescue_align", "whisper_qwen3_ai",
+                    "netease_yrc_verified",
+                    "youtube_sub_ctc", "lrclib_ctc_align",
+                    "ctc_forced_align", "live_ctc_align", "mashup_ctc_align",
+                    "ctc_phrase_rescue_align", "whisper_ctc_ai",
                 }
                 if cur_src not in keep_sources:
                     self.start_lyrics_generation(

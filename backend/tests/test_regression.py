@@ -153,9 +153,12 @@ def test_worker_and_separator_invariants() -> None:
     import re
     assert re.search(r"_acquire_lock_with_heartbeat\(\s*self\._lyrics_lock", sep_src), "_run_lyrics_worker must refresh heartbeat while waiting for _lyrics_lock"
     assert re.search(r"_acquire_lock_with_heartbeat\(\s*self\._worker_lock", sep_src), "_run_worker_subprocess must refresh heartbeat while waiting for _worker_lock"
-    assert "free_mb_ly >= 2200" in sep_src, "HQUpgrade must skip force_ai lyrics when GPU VRAM is below Qwen3 threshold"
+    assert "free_mb_ly >= 2200" in sep_src, "HQUpgrade must skip idle force_ai lyrics when GPU VRAM is low"
+    assert "netease_yrc_verified" in sep_src and "ctc_forced_align" in sep_src and "live_ctc_align" in sep_src, "separator.py idle keep_sources must include YRC and 20ms CTC sources"
     assert "is_cpu_lyrics" in sep_src, "_run_lyrics_worker must scale timeout when running on CPU fallback"
-    assert "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must also pass through acoustic & Qwen3 refinement"
+    assert "whisper_ctc_ai" in lw_src and "whisper_qwen3_ai" in lw_src, "Free-transcribe fallback must pass through Stage-2 20ms CTC (with Qwen3 fallback)"
+    assert "netease_yrc_verified" in lw_src and "_verify_and_shift_yrc_against_vocals" in lw_src, "Tier 0 NetEase YRC must be acoustically verified before emission"
+    assert "refine_lines_with_ctc" in lw_src and "_build_ctc_blocks(lines)" in lw_src, "Primary Stage-2 must use 20ms CTC with _build_ctc_blocks"
     assert "is_real_anchor = float(ref.get(\"sim\") or 0.0) > 0.0" in lw_src, "Must never overwrite acoustic alignment of recovered lines with linear placeholders"
     assert "align_chunk, blk_time_map = build_silence_collapsed_audio(" in lw_src, "Live block alignment must compress long guitar-solo/instrumental silences"
     assert "_alignment_needs_live_rematch(aligned, audio_dur, db_profile, step_sec, time_map=time_map, lang=lang)" in lw_src, "Must pass real db_profile + time_map + lang to detect unaligned Song #2 / encores!"
@@ -962,6 +965,134 @@ def test_line_overlap_hog_burst_and_cross_layer_fixes() -> None:
     print("[PASS] Line overlap/hog-burst resolver, EN syllable CDF, empty _catalog.json, upload-gen invalidation & TrayApp polling")
 
 
+def test_tier0_yrc_and_stage2_ctc_invariants() -> None:
+    """Verify Tier 0 NetEase YRC parser + 4-gate acoustic verification (MV shift, Story MV rejection,
+    mid-song cut rejection) and Stage 2 20ms CTC block isolation, multilingual romanization,
+    ctc_start-anchored peak-decay vocal tail physics, and zero-distortion monotonic bounds.
+    """
+    import lyrics_worker as lw
+    import numpy as np
+
+    # 1) parse_yrc: millisecond word spans, JSON/credit filtering, HK Traditional conversion, JP Kanji safety
+    sample_yrc = (
+        '{"t":0,"c":[{"tx":"作词: 林夕"}]}\n'
+        '[0,1200](0,600,0)抽 - (600,600,0)MC 张天赋\n'
+        '[10000,2400](10000,400,0)学(10400,400,0)会(10800,400,0)点(11200,400,0)火(11600,800,0)抽\n'
+        '[12600,77720](12600,500,0)干(13100,500,0)眼(13600,1000,0)泪\n'
+    )
+    parsed_zh = lw.parse_yrc(sample_yrc)
+    assert len(parsed_zh) == 2, f"YRC credit/title header not filtered: {parsed_zh}"
+    assert parsed_zh[0]["text"] == "學會點火抽" and len(parsed_zh[0]["words"]) == 5
+    assert abs(parsed_zh[0]["words"][0]["start"] - 10.0) < 0.01
+    # Final line MUST use actual last word end (14.60s), NEVER NetEase's 77.7s instrumental outro box padding!
+    assert abs(parsed_zh[1]["end"] - 14.6) < 0.01 and abs(parsed_zh[1]["words"][-1]["end"] - 14.6) < 0.01
+
+    sample_jp_yrc = (
+        '[5000,2000](5000,500,0)君(5500,500,0)の(6000,1000,0)声\n'
+        '[7200,1800](7200,900,0)永(8100,900,0)遠\n'
+    )
+    parsed_jp = lw.parse_yrc(sample_jp_yrc)
+    assert len(parsed_jp) == 2 and parsed_jp[1]["text"] == "永遠", f"JP Kanji in YRC corrupted: {parsed_jp}"
+
+    # 2) _verify_and_shift_yrc_against_vocals:
+    #    Build a synthetic 45s vocal waveform matching an 8-line YRC shifted by +4.20s (MV intro logo!)
+    sr = 16000
+    t_grid = np.arange(sr * 45, dtype=np.float32) / sr
+    yrc_synth = []
+    for k in range(8):
+        ls = 6.0 + k * 3.5
+        ws = [{"word": f"字", "start": round(ls + j * 0.4, 3), "end": round(ls + (j + 1) * 0.4, 3)} for j in range(6)]
+        yrc_synth.append({"start": round(ls, 2), "end": round(ls + 2.4, 2), "text": "字字字字字字", "words": ws})
+
+    def _make_vocal_audio(lines_src: list[dict], shift_s: float, mid_cut_extra: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+        y = np.random.default_rng(7).normal(0.0, 1e-4, size=sr * 45).astype(np.float32)
+        for idx_l, ln in enumerate(lines_src):
+            extra = mid_cut_extra if idx_l >= len(lines_src) // 2 else 0.0
+            i0 = int((ln["start"] + shift_s + extra) * sr)
+            i1 = int((ln["end"] + shift_s + extra) * sr)
+            if 0 <= i0 < i1 <= len(y):
+                y[i0:i1] += 0.25 * np.sin(2.0 * np.pi * 330.0 * t_grid[i0:i1])
+        # Build matching 0.1s db_profile
+        hop = int(0.1 * sr)
+        n_f = len(y) // hop
+        rms = np.sqrt(np.mean(y[: n_f * hop].reshape(n_f, hop) ** 2, axis=1) + 1e-12)
+        db_100 = (20.0 * np.log10(rms + 1e-9)).astype(np.float32)
+        return y, db_100
+
+    # 2A) Clean +4.20s MV intro shift MUST pass all 4 gates and align within +/-0.06s!
+    y_mv, db_mv = _make_vocal_audio(yrc_synth, shift_s=4.20, mid_cut_extra=0.0)
+    ver_ok = lw._verify_and_shift_yrc_against_vocals(yrc_synth, y_mv, db_mv, 0.1, first_onset=10.2)
+    assert ver_ok is not None and len(ver_ok) == 8, "Clean MV-shifted YRC was falsely rejected!"
+    assert abs(ver_ok[0]["start"] - 10.20) <= 0.06, f"YRC MV shift inaccurate: {ver_ok[0]['start']} vs 10.20"
+
+    # 2B) Story MV with 7.0s mid-song dialogue break MUST be strictly rejected!
+    y_story, db_story = _make_vocal_audio(yrc_synth, shift_s=2.0, mid_cut_extra=7.0)
+    ver_story = lw._verify_and_shift_yrc_against_vocals(yrc_synth, y_story, db_story, 0.1, first_onset=8.0)
+    assert ver_story is None, "Story MV with mid-song break MUST be rejected by YRC gate!"
+
+    # 2C) Subtle 2.5s mid-song edit (below 5s span gate!) MUST STILL be rejected by half-song word-hit gate!
+    y_edit, db_edit = _make_vocal_audio(yrc_synth, shift_s=2.0, mid_cut_extra=2.5)
+    ver_edit = lw._verify_and_shift_yrc_against_vocals(yrc_synth, y_edit, db_edit, 0.1, first_onset=8.0)
+    assert ver_edit is None, "Mid-song 2.5s edit MUST be rejected by half-song YRC word-hit gate!"
+
+    # 3) _build_ctc_blocks: parenthetical backing-vocal isolation (eu47ChbdYDY L060/L061!) + interlude + script split
+    mix_lines = [
+        {"start": 10.0, "end": 12.2, "text": "一街囂張嘴臉"},
+        {"start": 12.4, "end": 14.8, "text": "全然指控着 都當上法官"},
+        {"start": 15.0, "end": 17.5, "text": "You could be the one"},
+        {"start": 17.6, "end": 20.0, "text": "For you I'll fight against the world"},
+        {"start": 20.1, "end": 22.0, "text": "（怎判斷我最後結果）"},
+        {"start": 22.2, "end": 24.5, "text": "正確路線哪此一個"},
+        {"start": 29.0, "end": 31.2, "text": "當戰敗了不等於錯"},
+    ]
+    blks = lw._build_ctc_blocks(mix_lines)
+    assert blks == [
+        ([0, 1], False),
+        ([2, 3], False),
+        ([4], True),
+        ([5], False),
+        ([6], False),
+    ], f"CTC block partitioning / backing-vocal isolation unexpected: {blks}"
+
+    # 4) Multilingual CTC tokenization & romanization (ZH/YUE, JA Kana, KO Hangul, EN, fallback '*')
+    valid_az = set("abcdefghijklmnopqrstuvwxyz'*")
+    assert lw._tokenize_line_for_ctc("コーヒーしゃ 抽愛 love 사랑") == ["コー", "ヒー", "しゃ", "抽", "愛", "love", "사랑"]
+    assert lw._romanize_token_for_ctc("抽", valid_az) == "chou"
+    assert lw._romanize_token_for_ctc("しゃ", valid_az) == "sha"
+    assert lw._romanize_token_for_ctc("사랑", valid_az) in ("sarang", "salang")
+    assert lw._romanize_token_for_ctc("I'll", valid_az) == "i'll"
+    assert lw._romanize_token_for_ctc("2025", valid_az) == "*"
+
+    # 5) _local_vocal_tail_offset: preserves 4.0s held note AND never stretches across a 12s instrumental solo!
+    db20 = np.full(1000, -65.0, dtype=np.float32)  # 20.0s @ 20ms/frame
+    # Held final note from 2.00s to 6.00s (-14 dB), then 12s silence (with a brief -34 dB reverb floor -> >16dB below peak!)
+    db20[100:300] = -14.0
+    db20[300:900] = -34.0
+    g_thr = -45.0
+    tail_held = lw._local_vocal_tail_offset(2.00, 18.00, db20, g_thr)
+    assert 5.90 <= tail_held <= 6.18, f"Local peak-decay tail wrong (expected ~6.0s): {tail_held}"
+
+    # 6) _enforce_strict_monotonic_bounds: zero overlaps, zero out-of-bounds words, untouched interior onsets
+    raw_mono = [
+        {"start": 10.00, "end": 12.60, "text": "第一句", "words": [{"word": "第", "start": 10.00, "end": 10.40}, {"word": "一", "start": 10.40, "end": 11.20}, {"word": "句", "start": 11.20, "end": 12.60}]},
+        {"start": 12.40, "end": 15.00, "text": "第二句", "words": [{"word": "第", "start": 12.40, "end": 13.00}, {"word": "二", "start": 13.00, "end": 13.80}, {"word": "句", "start": 13.80, "end": 15.00}]},
+    ]
+    fixed_mono = lw._enforce_strict_monotonic_bounds(raw_mono, first_onset=9.5, audio_dur=30.0)
+    assert fixed_mono[0]["end"] <= fixed_mono[1]["start"]
+    assert fixed_mono[0]["words"][1]["start"] == 10.40, "Interior CTC onset must NOT be distorted!"
+    assert fixed_mono[0]["words"][-1]["end"] <= fixed_mono[0]["end"]
+    # 7) Boilerplate "(Official Music Video)" in a spam DB trackName MUST NEVER hijack another MV by the same artist!
+    spam_sc = lw._track_matches_title(
+        "MC 張天賦 - 老派約會之必要 A Gentleman's Guide to Old-Fashioned Dating (Official Music Video)",
+        "MC 張天賦",
+        "MC 張天賦 - 抽 Inhale (Official Music Video)",
+        cand_dur=243.0,
+        yt_dur=253.7,
+    )
+    assert spam_sc == 0.0, f"Boilerplate '(Official Music Video)' hijacked another song by the same artist: {spam_sc}"
+    print("[PASS] Tier 0 NetEase YRC (4-gate acoustic verification) & Stage 2 20ms CTC invariants")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -974,6 +1105,7 @@ def main() -> int:
     test_multilingual_cleaning_similarity_and_splitting()
     test_generic_alignment_recovery_and_qwen3_windows()
     test_line_overlap_hog_burst_and_cross_layer_fixes()
+    test_tier0_yrc_and_stage2_ctc_invariants()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()
