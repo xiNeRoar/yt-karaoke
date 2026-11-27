@@ -1458,7 +1458,25 @@ def test_cpu_thread_cap_hq_yield_and_credit_dedup() -> None:
     assert sc_right_2c > sc_wrong_1c + 0.15, f"2-char title '凡星' ({sc_right_2c}) must strictly beat 1-char tour word '念' ({sc_wrong_1c})"
     sc_chou = lw._track_matches_title("抽", "MC 张天赋", "MC 張天賦 - 抽 Inhale (Official Music Video)")
     assert sc_chou >= 1.5, f"1-char CJK title '抽' must still score strongly when artist matches: {sc_chou}"
-    print("[PASS] CPU thread cap (PyTorch+ONNX+Whisper), HQ mid-song yield, credit filter, dedup & 1-char specificity")
+
+    # 6) NetEase YRC duet speaker-tag onset snapping (leading 0.00s '男：', multi-char '陳蕾：', inline '合：' & '（男：')
+    # Ensures Tier 0 YRC Gate 3/4B NEVER rejects commercial duets due to silent-intro speaker tag padding!
+    duet_yrc = (
+        "[0,16690](0,7160,0)男(7160,7170,0)：(14330,280,0)我(14610,420,0)会(15030,160,0)的(15190,410,0)都(15600,280,0)试(16040,620,0)过\n"
+        "[55780,11540](55780,90,0)陈(55820,40,0)蕾(55870,90,0)：(55960,290,0)人(56250,200,0)造(56450,200,0)的(56650,200,0)孽 (64300,2640,0)合(66940,30,0)：(66970,60,0)破(67030,290,0)解\n"
+        "[79770,3600](79770,100,0)女(79870,110,0)：(79980,520,0)一(80570,350,0)碰 (83100,30,0)（(83130,30,0)男(83160,30,0)：(83190,30,0)没(83220,30,0)神(83250,30,0)韵(83280,90,0)）\n"
+    )
+    parsed_duet = lw.parse_yrc(duet_yrc)
+    assert len(parsed_duet) == 3, f"Expected 3 parsed duet lines, got {parsed_duet}"
+    assert abs(parsed_duet[0]["start"] - 14.31) <= 0.03, f"L0 must snap past 0.00s intro speaker tag to ~14.31s, got {parsed_duet[0]}"
+    assert parsed_duet[0]["words"][0]["word"] == "男：" and parsed_duet[0]["words"][1]["word"] == "我"
+    assert abs(parsed_duet[0]["words"][1]["start"] - 14.33) <= 0.01
+    assert parsed_duet[1]["words"][0]["word"] == "陳蕾：" and any(w["word"] == "合：" and abs(w["end"] - 66.97) <= 0.01 for w in parsed_duet[1]["words"])
+    assert any(w["word"] == "男：" and abs(w["end"] - 83.19) <= 0.01 for w in parsed_duet[2]["words"])
+    # Inline speaker tags must also be skipped by CTC tokenizer so Live duets never align '合'/'男'
+    assert lw._tokenize_line_for_ctc("男：人造的孽 合：破解") == ["人", "造", "的", "孽", "破", "解"]
+    assert lw._tokenize_line_for_ctc("女：一碰已經熄了燈 （男：沒神韻）") == ["一", "碰", "已", "經", "熄", "了", "燈", "沒", "神", "韻"]
+    print("[PASS] CPU thread cap (PyTorch+ONNX+Whisper), HQ mid-song yield, credit filter, dedup, 1-char specificity & YRC duet speaker-tag snap")
 
 
 def main() -> int:

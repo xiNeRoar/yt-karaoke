@@ -566,13 +566,93 @@ def parse_yrc(yrc_text: str) -> list[dict]:
         clean_text = _strip_lyric_question_marks(text if is_non_zh else to_hk_traditional(text))
         if not clean_text:
             continue
+
+        # Detect unsung duet speaker-label spans (e.g. '男' + '：', '女：', '合：', '張'+'敬'+'軒'+'：', '（'+'男'+'：')
+        # NetEase YRC often places dummy 0.00s / silent-gap durations on these tags, which breaks audio-span gates
+        # and shifts line start times! Snap them to [nxt_sung_start - 0.02, nxt_sung_start] as visual-width anchors.
+        n_t = len(toks)
+        spk_span_end: dict[int, tuple[int, str]] = {}
+        spk_consumed: set[int] = set()
+        _spk_name_re = re.compile(r"^(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})$")
+        _spk_full_re = re.compile(r"^([\(（\[【]?)\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：])$")
+        _open_bound_re = re.compile(r"[\s\(（\[【]$")
+        _sung_char_re = re.compile(r"[\w\u4e00-\u9fff\u3040-\u30ff\u3400-\u4dbf\uac00-\ud7af]")
+
+        def _starts_at_boundary(idx_s: int) -> bool:
+            if idx_s == 0:
+                return True
+            prev_raw = toks[idx_s - 1][2]
+            return bool(_open_bound_re.search(prev_raw)) or bool(toks[idx_s][2][:1].isspace())
+
+        i_sp = 0
+        while i_sp < n_t:
+            raw_cur = toks[i_sp][2]
+            st_cur = raw_cur.strip()
+            if _starts_at_boundary(i_sp):
+                m_full = _spk_full_re.match(st_cur)
+                if m_full:
+                    # Single token like '男：' or '（男：'
+                    spk_span_end[i_sp] = (i_sp + 1, m_full.group(2))
+                    spk_consumed.add(i_sp)
+                    i_sp += 1
+                    continue
+                # Multi-token speaker name immediately followed by ':' or '：' (e.g. '男' + '：', '張'+'敬'+'軒'+'：')
+                cand_name = ""
+                matched_j = -1
+                for j_sp in range(i_sp, min(n_t - 1, i_sp + 4)):
+                    piece = toks[j_sp][2].strip()
+                    if j_sp == i_sp and piece and piece[0] in ("(", "（", "[", "【"):
+                        piece = piece[1:].strip()
+                    if not piece:
+                        break
+                    cand_name += piece
+                    if not _spk_name_re.match(cand_name):
+                        break
+                    nxt_raw = toks[j_sp + 1][2].strip()
+                    if nxt_raw in (":", "："):
+                        matched_j = j_sp + 1
+                        break
+                if matched_j >= 0:
+                    colon_ch = toks[matched_j][2].strip()
+                    spk_span_end[i_sp] = (matched_j + 1, f"{cand_name}{colon_ch}")
+                    for k_sp in range(i_sp, matched_j + 1):
+                        spk_consumed.add(k_sp)
+                    i_sp = matched_j + 1
+                    continue
+            i_sp += 1
+
         words_out: list[dict] = []
-        for ws, we, wt_raw in toks:
+        i_tk = 0
+        while i_tk < n_t:
+            if i_tk in spk_span_end:
+                end_sp, spk_lbl = spk_span_end[i_tk]
+                # Find the immediately following real sung token on this line
+                nxt_sung_s: Optional[float] = None
+                for j_tk in range(end_sp, n_t):
+                    if j_tk not in spk_consumed and _sung_char_re.search(toks[j_tk][2]):
+                        nxt_sung_s = toks[j_tk][0]
+                        break
+                if nxt_sung_s is not None:
+                    prev_we = words_out[-1]["end"] if words_out else 0.0
+                    tag_s = max(prev_we, max(0.0, nxt_sung_s - 0.02))
+                    tag_e = max(tag_s, nxt_sung_s)
+                    lbl_clean = _strip_lyric_question_marks(spk_lbl if is_non_zh else to_hk_traditional(spk_lbl))
+                    if lbl_clean:
+                        words_out.append({
+                            "start": round(tag_s, 3),
+                            "end": round(tag_e, 3),
+                            "word": lbl_clean,
+                        })
+                i_tk = end_sp
+                continue
+
+            ws, we, wt_raw = toks[i_tk]
+            i_tk += 1
             wt = _strip_lyric_question_marks(wt_raw.strip())
             if not wt:
                 continue
             # Keep punctuation attached to words, but skip standalone pure-punctuation spans from wipe weights
-            if not re.search(r"[\w\u4e00-\u9fff\u3040-\u30ff\u3400-\u4dbf\uac00-\ud7af]", wt):
+            if not _sung_char_re.search(wt):
                 continue
             w_clean = wt if is_non_zh else to_hk_traditional(wt)
             words_out.append({
@@ -1348,6 +1428,13 @@ def fetch_official_lyrics(
 
             ne_candidates.sort(key=lambda x: x[0], reverse=True)
             best_synced_is_yrc = False
+
+            def _unbalanced_paren_count(ls_chk: list[str]) -> int:
+                return sum(
+                    1 for x in (ls_chk or [])
+                    if (x.count("(") + x.count("（")) != (x.count(")") + x.count("）"))
+                )
+
             for sc, s in ne_candidates[:5]:
                 can_upgrade_lrc = (not is_live_or_alt) and (best_synced is None) and (sc >= best_score - 0.05)
                 # Allow upgrading line-only LRCLIB LRC -> NetEase word-level YRC even when LRCLIB scored slightly
@@ -1390,7 +1477,7 @@ def fetch_official_lyrics(
                                 best_synced = parsed_yrc
                                 best_synced_score = sc
                                 best_synced_is_yrc = True
-                                if not best_lines:
+                                if (not best_lines) or (_unbalanced_paren_count(best_lines) > _unbalanced_paren_count(yrc_clean)):
                                     best_lines = yrc_clean
                                 break
 
@@ -1401,12 +1488,6 @@ def fetch_official_lyrics(
                         ne_clean_lines = clean_lyric_lines([x["text"] for x in parsed])
                         # Clean-text tie-break: when NetEase LRC ties LRCLIB plain text, prefer balanced lyrics
                         # with zero unbalanced cross-line parentheses (e.g. LRCLIB "(看\n全沒罪案發生)" vs clean NetEase LRC)!
-                        def _unbalanced_paren_count(ls_chk: list[str]) -> int:
-                            return sum(
-                                1 for x in (ls_chk or [])
-                                if (x.count("(") + x.count("（")) != (x.count(")") + x.count("）"))
-                            )
-
                         prefer_cleaner_tie = (
                             (sc >= best_score - 0.02)
                             and bool(best_lines)
@@ -4268,7 +4349,8 @@ def _detect_cantonese_vs_mandarin_audio(
     return "zh"
 
 
-SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:[\u4e00-\u9fff]{1,3}|[A-Za-z]{1,12})\s*[:：]\s*")
+SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
+INLINE_SPEAKER_TAG_RE = re.compile(r"(?:^|(?<=[\s\(（\[【]))(?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：]\s*")
 _CTC_TOKEN_RE = re.compile(
     r"[\u3040-\u30ff][\u3041\u3043\u3045\u3047\u3049\u3083\u3085\u3087\u30a1\u30a3\u30a5\u30a7\u30a9\u30e3\u30e5\u30e7\u30fc]*"
     r"|[\u4e00-\u9fff\u3400-\u4dbf]"
@@ -4280,9 +4362,9 @@ _CTC_ROMANIZERS: dict = {}
 
 def _tokenize_line_for_ctc(text: str) -> list[str]:
     """Tokenize a lyric line into alignable KTV units (per Hanzi/Kana-mora, per Latin/Hangul word).
-    Automatically skips unsung leading duet speaker labels (e.g. '男：', '女：', '合：', 'Chorus:').
+    Automatically skips unsung leading & inline duet speaker labels (e.g. '男：', '女：', '合：', '（男：', 'Chorus:').
     """
-    body = SPEAKER_PREFIX_RE.sub("", text or "")
+    body = INLINE_SPEAKER_TAG_RE.sub("", text or "")
     return _CTC_TOKEN_RE.findall(body)
 
 
