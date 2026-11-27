@@ -1357,9 +1357,23 @@ def fetch_official_lyrics(
                         continue
                     parsed = parse_lrc(lrc)
                     if len(parsed) >= 6:
-                        if sc > best_score:
-                            best_score = sc
-                            best_lines = clean_lyric_lines([x["text"] for x in parsed])
+                        ne_clean_lines = clean_lyric_lines([x["text"] for x in parsed])
+                        # Clean-text tie-break: when NetEase LRC ties LRCLIB plain text, prefer balanced lyrics
+                        # with zero unbalanced cross-line parentheses (e.g. LRCLIB "(看\n全沒罪案發生)" vs clean NetEase LRC)!
+                        def _unbalanced_paren_count(ls_chk: list[str]) -> int:
+                            return sum(
+                                1 for x in (ls_chk or [])
+                                if (x.count("(") + x.count("（")) != (x.count(")") + x.count("）"))
+                            )
+
+                        prefer_cleaner_tie = (
+                            (sc >= best_score - 0.02)
+                            and bool(best_lines)
+                            and _unbalanced_paren_count(best_lines) > _unbalanced_paren_count(ne_clean_lines)
+                        )
+                        if sc > best_score or prefer_cleaner_tie:
+                            best_score = max(best_score, sc)
+                            best_lines = ne_clean_lines
                             best_source = f"NetEase ({s.get('name') or ''})"
                             if not is_live_or_alt and dur_ok:
                                 best_synced = parsed
@@ -1374,7 +1388,7 @@ def fetch_official_lyrics(
                             best_synced = parsed
                             best_synced_score = sc
                             if not best_lines:
-                                best_lines = clean_lyric_lines([x["text"] for x in parsed])
+                                best_lines = ne_clean_lines
                             if is_live_or_alt or best_synced_is_yrc:
                                 break
                 except Exception:
@@ -4124,6 +4138,7 @@ def _detect_cantonese_vs_mandarin_audio(
     return "zh"
 
 
+SPEAKER_PREFIX_RE = re.compile(r"^\s*(?:[\u4e00-\u9fff]{1,3}|[A-Za-z]{1,12})\s*[:：]\s*")
 _CTC_TOKEN_RE = re.compile(
     r"[\u3040-\u30ff][\u3041\u3043\u3045\u3047\u3049\u3083\u3085\u3087\u30a1\u30a3\u30a5\u30a7\u30a9\u30e3\u30e5\u30e7\u30fc]*"
     r"|[\u4e00-\u9fff\u3400-\u4dbf]"
@@ -4134,8 +4149,11 @@ _CTC_ROMANIZERS: dict = {}
 
 
 def _tokenize_line_for_ctc(text: str) -> list[str]:
-    """Tokenize a lyric line into alignable KTV units (per Hanzi/Kana-mora, per Latin/Hangul word)."""
-    return _CTC_TOKEN_RE.findall(text or "")
+    """Tokenize a lyric line into alignable KTV units (per Hanzi/Kana-mora, per Latin/Hangul word).
+    Automatically skips unsung leading duet speaker labels (e.g. '男：', '女：', '合：', 'Chorus:').
+    """
+    body = SPEAKER_PREFIX_RE.sub("", text or "")
+    return _CTC_TOKEN_RE.findall(body)
 
 
 def _romanize_token_for_ctc(tok: str, valid_chars: set[str]) -> str:
@@ -4384,6 +4402,594 @@ def _enforce_strict_monotonic_bounds(
     return lines
 
 
+def _chorus_line_similar(a: str, b: str) -> bool:
+    """Character-overlap + normalized equality check for repeated-chorus matching (tolerant of 1-2 char typos)."""
+    na = _norm_lyrics_cmp(a)
+    nb = _norm_lyrics_cmp(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if min(len(na), len(nb)) < 4:
+        return False
+    # Fast positional/multiset char overlap (handles e.g. '貪高興狠心不起' vs '貪高興狠心敷衍' -> 5/7 = 0.71!)
+    from collections import Counter
+    ca, cb = Counter(na), Counter(nb)
+    inter = sum((ca & cb).values())
+    overlap = inter / max(len(na), len(nb))
+    return overlap >= 0.68
+
+
+def _strip_repeated_chorus_overlay_parens(
+    lines: list[dict],
+    db20: np.ndarray,
+    global_thr: float,
+) -> tuple[list[dict], int]:
+    """Strip simultaneous parenthetical backing-vocal overlays ONLY when time-conservation physics proves
+    they were interleaved onto an exact repeated chorus that appeared paren-free earlier in the same song.
+
+    Guarantees ZERO false deletions on genuine sequential/call-and-response parenthetical lines
+    (e.g. solo English verses in parens or sequential call-and-response bridges).
+    Also extends a trailing overlay chorus to the actual contiguous vocal offset so finales never black out early.
+    """
+    if len(lines) < 8:
+        return [dict(ln) for ln in lines], 0
+
+    n = len(lines)
+    in_multi = False
+    stripped: list[tuple[int, str, bool]] = []
+    for idx, ln in enumerate(lines):
+        s = str(ln.get("text") or "")
+        out_ch: list[str] = []
+        had_p = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if in_multi:
+                had_p = True
+                if ch in (")", "）"):
+                    in_multi = False
+                i += 1
+                continue
+            if ch in ("(", "（"):
+                cpos, depth = -1, 1
+                for j in range(i + 1, len(s)):
+                    if s[j] in ("(", "（"):
+                        depth += 1
+                    elif s[j] in (")", "）"):
+                        depth -= 1
+                        if depth == 0:
+                            cpos = j
+                            break
+                if cpos != -1:
+                    had_p = True
+                    i = cpos + 1
+                    continue
+                if any(
+                    any(c in (")", "）") for c in str(lines[k].get("text") or ""))
+                    for k in range(idx + 1, min(n, idx + 3))
+                ):
+                    had_p = True
+                    in_multi = True
+                    break
+            out_ch.append(ch)
+            i += 1
+        stripped.append((idx, re.sub(r"\s+", " ", "".join(out_ch)).strip(), had_p))
+
+    clean_run_starts = [i for i in range(n - 3) if all(not stripped[i + k][2] for k in range(4))]
+    if not clean_run_starts:
+        return [dict(ln) for ln in lines], 0
+
+    non_empty = [(orig_i, txt, had_p) for orig_i, txt, had_p in stripped if txt]
+    strip_orig_range: set[int] = set()
+    keep_clean_map: dict[int, str] = {}
+
+    pos = 0
+    while pos <= len(non_empty) - 4:
+        best_match: Optional[tuple[int, int]] = None
+        for ref_s in clean_run_starts:
+            if ref_s <= non_empty[pos][0] < ref_s + 4:
+                continue
+            if not all(_chorus_line_similar(non_empty[pos + k][1], lines[ref_s + k]["text"]) for k in range(4)):
+                continue
+            k = 4
+            while (
+                pos + k < len(non_empty)
+                and ref_s + k < n
+                and not stripped[ref_s + k][2]
+                and _chorus_line_similar(non_empty[pos + k][1], lines[ref_s + k]["text"])
+            ):
+                k += 1
+            if best_match is None or k > best_match[0]:
+                best_match = (k, ref_s)
+
+        if best_match is not None:
+            k, ref_start = best_match
+            orig_lo = non_empty[pos][0]
+            orig_hi = non_empty[pos + k - 1][0]
+            while orig_hi + 1 < n and stripped[orig_hi + 1][2] and not stripped[orig_hi + 1][1]:
+                orig_hi += 1
+            overlay_items = [oi for oi in range(orig_lo, orig_hi + 1) if stripped[oi][2]]
+            has_inline_overlay = any(stripped[oi][2] and bool(stripped[oi][1]) for oi in overlay_items)
+            ref_core_dur = max(1.0, float(lines[ref_start + k - 2]["end"]) - float(lines[ref_start]["start"]))
+            tgt_core_dur = max(1.0, float(lines[non_empty[pos + k - 2][0]]["end"]) - float(lines[orig_lo]["start"]))
+            standalone_durs = [
+                float(lines[oi]["end"]) - float(lines[oi]["start"])
+                for oi in overlay_items
+                if not stripped[oi][1]
+            ]
+            median_standalone = float(np.median(standalone_durs)) if standalone_durs else 0.0
+            if (
+                len(overlay_items) >= 2
+                and (tgt_core_dur <= ref_core_dur * 1.25)
+                and (has_inline_overlay or median_standalone < 1.35)
+            ):
+                for oi in range(orig_lo, orig_hi + 1):
+                    strip_orig_range.add(oi)
+                for m in range(k):
+                    keep_clean_map[non_empty[pos + m][0]] = lines[ref_start + m]["text"]
+                pos += k
+                continue
+        pos += 1
+
+    if not strip_orig_range:
+        return [dict(ln) for ln in lines], 0
+
+    out: list[dict] = []
+    removed_lines = 0
+    i = 0
+    while i < n:
+        if i in strip_orig_range:
+            j = i
+            while j < n and j in strip_orig_range:
+                j += 1
+            span_s = float(lines[i]["start"])
+            span_e = float(lines[j - 1]["end"])
+            # If this overlay chorus sits at the end of the song, walk contiguous vocals forward so it never blacks out early!
+            if j == n and len(db20) > 0:
+                audio_dur = len(db20) * 0.02
+                t_walk, best_e, quiet = span_e, span_e, 0
+                while t_walk < min(audio_dur, span_e + 18.0):
+                    idx_f = int(t_walk / 0.02)
+                    if idx_f >= len(db20):
+                        break
+                    if db20[idx_f] > global_thr:
+                        quiet = 0
+                        best_e = t_walk + 0.02
+                    else:
+                        quiet += 1
+                        if quiet >= 75:  # 1.5s continuous silence -> vocal truly ended
+                            break
+                    t_walk += 0.02
+                span_e = max(span_e, round(best_e, 2))
+            kept_texts = [keep_clean_map[oi] for oi in range(i, j) if oi in keep_clean_map]
+            removed_lines += (j - i) - len(kept_texts)
+            wts = [max(1.0, estimate_syllable_units(t)) for t in kept_texts]
+            tot_w = float(sum(wts)) or 1.0
+            acc = 0.0
+            for t, wt in zip(kept_texts, wts):
+                ls = span_s + (span_e - span_s) * (acc / tot_w)
+                acc += wt
+                le = span_s + (span_e - span_s) * (acc / tot_w)
+                out.append({
+                    "start": round(ls, 2),
+                    "end": round(max(ls + 0.25, le), 2),
+                    "text": t,
+                    "words": _even_words_for_line(t, ls, max(ls + 0.25, le)),
+                })
+            i = j
+        else:
+            out.append(dict(lines[i]))
+            i += 1
+    return out, removed_lines
+
+
+def _chorus_block_health(sub: list[dict], c_scores: list[float]) -> tuple[float, int, int, int, float]:
+    """Structural + acoustic health score for picking the cleanest repeated-chorus reference twin."""
+    crushed = 0
+    hogs = 0
+    bursts = 0
+    rates: list[float] = []
+    for k, ln in enumerate(sub):
+        d = max(0.05, float(ln["end"]) - float(ln["start"]))
+        txt = str(ln.get("text") or "").strip()
+        is_paren_line = bool(BACKING_PAREN_LINE_RE.match(txt))
+        syl = max(1.0, estimate_syllable_units(txt))
+        if not is_paren_line:
+            rates.append(d / syl)
+            if syl >= 5.0 and (d < 0.80 or (d / syl) < 0.11):
+                crushed += 1
+        if k < len(sub) - 1 and (
+            (d > 7.5 and (d / syl) > 0.70)
+            or (d > 8.0 and syl >= 8.0)
+            or (is_paren_line and d > 3.0)
+        ):
+            hogs += 1
+        ws = ln.get("words") or []
+        if len(ws) >= 4:
+            wdurs = [max(0.01, float(w["end"]) - float(w["start"])) for w in ws]
+            if max(wdurs[:-1]) >= 1.6 and (min(wdurs) <= 0.08 or max(wdurs[:-1]) >= 2.5):
+                bursts += 1
+    mean_sc = float(np.mean(c_scores)) if c_scores else 0.0
+    rate_cv = float(np.std(rates) / max(0.05, float(np.mean(rates)))) if len(rates) >= 2 else 0.0
+    health = mean_sc - 0.50 * crushed - 0.50 * hogs - 0.35 * bursts - 0.10 * rate_cv
+    return health, crushed, hogs, bursts, mean_sc
+
+
+def _rescue_drifted_repeated_choruses(
+    lines: list[dict],
+    line_scores: list[float],
+    audio_dur: float,
+    db20: np.ndarray,
+    global_thr: float,
+    align_single_fn,
+) -> tuple[list[dict], int]:
+    """Same-song cross-chorus self-consistency rescue (Hybrid Guided 20ms CTC -> Clean Twin Projection).
+
+    1. Finds maximal repeated chorus families (>=4 matching lines) across the same recording.
+    2. Selects the cleanest high-confidence occurrence as reference twin (never a broken twin!).
+    3. Strictly protects healthy expressive slow/rubato outros (never triggers when tgt_cr==0,
+       tgt_hg==0, tgt_bs==0, and tgt_sc>=0.13) AND never stretches across >=12s instrumental solos.
+    4. Runs Twin-Prior Guided local CTC first to preserve live rubato; falls back to smooth Twin
+       Projection only if guided CTC stays low-confidence or distorted, behind a strict Pareto gate.
+    """
+    out = [dict(ln) for ln in lines]
+    n = len(out)
+    if n < 8:
+        return out, 0
+
+    def _voc_hit_ratio(sub_lns: list[dict]) -> float:
+        if len(db20) == 0:
+            return 1.0
+        ok = tot = 0
+        for ln in sub_lns:
+            for w in (ln.get("words") or []):
+                i0 = max(0, int(float(w["start"]) / 0.02))
+                i1 = min(len(db20), max(i0 + 1, int(float(w["end"]) / 0.02)))
+                tot += 1
+                if i1 > i0 and float(np.max(db20[i0:i1])) > global_thr:
+                    ok += 1
+        return (ok / tot) if tot > 0 else 1.0
+
+    norm_txts = [_norm_lyrics_cmp(ln.get("text", "")) for ln in out]
+    ng4: dict[tuple[str, ...], list[int]] = {}
+    for i in range(n - 3):
+        key = tuple(norm_txts[i : i + 4])
+        if all(len(x) >= 3 for x in key):
+            ng4.setdefault(key, []).append(i)
+
+    visited: set[int] = set()
+    families: list[tuple[int, list[int]]] = []
+    for i in range(n - 3):
+        if i in visited:
+            continue
+        key = tuple(norm_txts[i : i + 4])
+        occs = [s for s in ng4.get(key, []) if s >= i]
+        if len(occs) < 2:
+            continue
+        clean_occs = [occs[0]]
+        for s in occs[1:]:
+            if s >= clean_occs[-1] + 4:
+                clean_occs.append(s)
+        if len(clean_occs) < 2:
+            continue
+        max_k = 4
+        while True:
+            if clean_occs[0] + max_k >= n:
+                break
+            t0 = out[clean_occs[0] + max_k]["text"]
+            ok = True
+            for oi_idx, s in enumerate(clean_occs):
+                if s + max_k >= n or not _chorus_line_similar(out[s + max_k]["text"], t0):
+                    ok = False
+                    break
+                if oi_idx + 1 < len(clean_occs) and s + max_k >= clean_occs[oi_idx + 1]:
+                    ok = False
+                    break
+            if not ok:
+                break
+            max_k += 1
+        for s in clean_occs:
+            for off in range(max_k):
+                visited.add(s + off)
+        families.append((max_k, clean_occs))
+
+    rescued_count = 0
+    for blk_len, occs in families:
+        occ_info = []
+        for s in occs:
+            sub = out[s : s + blk_len]
+            sc_sub = [line_scores[idx] if idx < len(line_scores) else 0.0 for idx in range(s, s + blk_len)]
+            max_igap = max(
+                (float(sub[m + 1]["start"]) - float(sub[m]["end"]) for m in range(blk_len - 1)),
+                default=0.0,
+            )
+            h, cr, hg, bs, msc = _chorus_block_health(sub, sc_sub)
+            occ_info.append((h, cr, hg, bs, msc, max_igap, s))
+
+        occ_info.sort(key=lambda x: x[0], reverse=True)
+        ref_h, ref_cr, ref_hg, ref_bs, ref_sc, ref_igap, ref_s = occ_info[0]
+        if ref_cr > 0 or ref_hg > 0 or ref_bs > 0 or ref_sc < 0.11 or ref_igap >= 12.0:
+            continue
+        ref_sub = out[ref_s : ref_s + blk_len]
+        ref_t0 = float(ref_sub[0]["start"])
+        ref_full_span = max(0.5, float(ref_sub[-1]["end"]) - ref_t0)
+
+        for tgt_h, tgt_cr, tgt_hg, tgt_bs, tgt_sc, tgt_igap, tgt_s in occ_info[1:]:
+            tgt_sub = out[tgt_s : tgt_s + blk_len]
+            # Interlude-split chorus (e.g. >=12s guitar solo inside chorus):
+            # First check if Stage 1 accidentally tore a CONTIGUOUS chorus across a silent solo (crushed lines on one side
+            # while the other side has a contiguous active-vocal island matching `ref_full_span`, e.g. 戀愛腦之死 L29..L34!).
+            # Only fall through to full-chorus Guided CTC on that clean island if it fits >=0.72*ref_full_span;
+            # otherwise rescue ONLY individually exploded line(s) locally without ever stretching across the solo!
+            relocated_island: Optional[tuple[float, float]] = None
+            if tgt_igap >= 12.0:
+                ref_max_igap = max(
+                    (float(ref_sub[m + 1]["start"]) - float(ref_sub[m]["end"]) for m in range(blk_len - 1)),
+                    default=0.0,
+                )
+                split_m = max(range(blk_len - 1), key=lambda m: float(tgt_sub[m + 1]["start"]) - float(tgt_sub[m]["end"]))
+                gap_s = float(tgt_sub[split_m]["end"])
+                gap_e = float(tgt_sub[split_m + 1]["start"])
+                prev_b_chk = float(out[tgt_s - 1]["end"]) if tgt_s > 0 else 0.0
+                next_b_chk = float(out[tgt_s + blk_len]["start"]) if (tgt_s + blk_len < n) else audio_dur
+                if ref_max_igap < 4.0 and tgt_cr > 0 and len(db20) > 0:
+                    # Find first active vocal onset after gap_s (where post-solo singing really starts!)
+                    post_onset = gap_e
+                    i_gs = max(0, int((gap_s + 2.0) / 0.02))
+                    i_ge = min(len(db20), int(next_b_chk / 0.02))
+                    # Walk backward from gap_e to catch any active vocals right before tgt_sub[split_m+1]["start"]
+                    i_back = min(len(db20) - 1, int(gap_e / 0.02))
+                    while i_back > i_gs and db20[i_back] > global_thr:
+                        i_back -= 1
+                    # Also scan forward from mid-gap if gap_e missed earlier post-solo onset
+                    if i_back < int(gap_e / 0.02) - 5:
+                        post_onset = max(gap_s + 2.0, (i_back + 1) * 0.02)
+                    else:
+                        # Find first >=0.6s continuous active vocal island inside [gap_s + 5s, next_b_chk]
+                        run_len = 0
+                        for idx_f in range(max(i_gs, int((gap_s + 5.0) / 0.02)), i_ge):
+                            if db20[idx_f] > global_thr:
+                                run_len += 1
+                                if run_len >= 30:
+                                    post_onset = (idx_f - 29) * 0.02
+                                    break
+                            else:
+                                run_len = 0
+                    pre_start_est = max(prev_b_chk, float(tgt_sub[0]["start"]) - 2.0)
+                    post_span = next_b_chk - post_onset
+                    pre_span = gap_s - pre_start_est
+                    # Prefer the contiguous island whose duration best fits `ref_full_span` (>= 0.72x)!
+                    if post_span >= ref_full_span * 0.72 and post_span >= pre_span:
+                        relocated_island = (post_onset, min(next_b_chk, post_onset + ref_full_span * 1.15))
+                    elif pre_span >= ref_full_span * 0.72 and pre_span > post_span:
+                        relocated_island = (max(pre_start_est, gap_s - ref_full_span * 1.15), gap_s)
+
+                if relocated_island is None:
+                    for m in range(blk_len):
+                        da = max(0.15, float(ref_sub[m]["end"]) - float(ref_sub[m]["start"]))
+                        db = max(0.15, float(tgt_sub[m]["end"]) - float(tgt_sub[m]["start"]))
+                        if db > max(7.5, da * 2.0):
+                            ls0 = float(tgt_sub[m]["start"])
+                            lim_e = min(float(tgt_sub[m]["end"]), ls0 + da * 1.45)
+                            res1 = align_single_fn(tgt_s + m, tgt_sub[m], max(0.0, ls0 - 0.3), min(audio_dur, lim_e + 0.3))
+                            if res1 is not None:
+                                out[tgt_s + m] = res1[0]
+                                rescued_count += 1
+                    continue
+
+            max_rat = 1.0
+            for m in range(blk_len - 1):
+                da = max(0.15, float(ref_sub[m]["end"]) - float(ref_sub[m]["start"]))
+                db = max(0.15, float(tgt_sub[m]["end"]) - float(tgt_sub[m]["start"]))
+                max_rat = max(max_rat, da / db, db / da)
+
+            # Expressive Slow-Outro Protection: NEVER touch a healthy high-confidence chorus!
+            if relocated_island is None and tgt_cr == 0 and tgt_hg == 0 and tgt_bs == 0 and tgt_sc >= 0.13:
+                continue
+
+            needs_rescue = (
+                (relocated_island is not None)
+                or (tgt_sc < min(0.10, ref_sc * 0.55))
+                or (max_rat >= 2.1 and (tgt_cr > 0 or tgt_hg > 0 or tgt_bs > 0 or tgt_sc < ref_sc * 0.85))
+            )
+            if not needs_rescue:
+                continue
+
+            prev_bound = float(out[tgt_s - 1]["end"]) if tgt_s > 0 else 0.0
+            next_bound = float(out[tgt_s + blk_len]["start"]) if (tgt_s + blk_len < n) else audio_dur
+            if relocated_island is not None:
+                tgt_t0 = max(prev_bound, relocated_island[0])
+                tgt_t1 = min(next_bound, relocated_island[1])
+            else:
+                shifts = []
+                for m in range(blk_len):
+                    da = max(0.15, float(ref_sub[m]["end"]) - float(ref_sub[m]["start"]))
+                    db = max(0.15, float(tgt_sub[m]["end"]) - float(tgt_sub[m]["start"]))
+                    sc_m = line_scores[tgt_s + m] if (tgt_s + m) < len(line_scores) else 0.0
+                    if 0.70 <= (db / da) <= 1.45 and (sc_m >= 0.09 or tgt_sc < 0.09):
+                        shifts.append(float(tgt_sub[m]["start"]) - (float(ref_sub[m]["start"]) - ref_t0))
+                raw_t0 = float(tgt_sub[0]["start"])
+                tgt_t0 = float(np.median(shifts)) if len(shifts) >= max(2, blk_len // 3) else raw_t0
+                # Physical onset invariant: NEVER allow median shift to jump >1.2s past active singing at raw_t0
+                # (prevents late-drifted low-confidence middle lines from pulling a chorus onset 3-4s late!).
+                if tgt_t0 > raw_t0 + 1.2 and len(db20) > 0:
+                    da0 = max(0.15, float(ref_sub[0]["end"]) - float(ref_sub[0]["start"]))
+                    db0 = max(0.15, float(tgt_sub[0]["end"]) - float(tgt_sub[0]["start"]))
+                    i_a = max(0, int(raw_t0 / 0.02))
+                    i_b = min(len(db20), int(tgt_t0 / 0.02))
+                    skipped_active_s = float(np.sum(db20[i_a:i_b] > global_thr)) * 0.02 if i_b > i_a else 0.0
+                    if (0.70 <= (db0 / da0) <= 1.45) or skipped_active_s >= 1.2:
+                        tgt_t0 = raw_t0
+                tgt_t0 = max(prev_bound, tgt_t0)
+                tgt_t1 = min(next_bound, float(tgt_sub[-1]["end"]))
+            # If a low-confidence final chorus was truncated early while contiguous singing continues, walk to true vocal end!
+            if tgt_s + blk_len == n and tgt_sc < 0.10 and len(db20) > 0:
+                t_walk, best_e, quiet = tgt_t1, tgt_t1, 0
+                while t_walk < min(next_bound, tgt_t1 + 15.0):
+                    idx_f = int(t_walk / 0.02)
+                    if idx_f >= len(db20):
+                        break
+                    if db20[idx_f] > global_thr:
+                        quiet = 0
+                        best_e = t_walk + 0.02
+                    else:
+                        quiet += 1
+                        if quiet >= 35:  # 0.70s silence ends contiguous finale singing
+                            break
+                    t_walk += 0.02
+                tgt_t1 = max(tgt_t1, min(next_bound, round(best_e, 2)))
+
+            tgt_full_span = max(0.5, tgt_t1 - tgt_t0)
+            if tgt_s + blk_len == n and tgt_full_span > ref_full_span * 1.15:
+                scale = min(1.08, tgt_full_span / ref_full_span)
+            else:
+                scale = max(0.90, min(1.12, tgt_full_span / ref_full_span))
+
+            proj_lines: list[dict] = []
+            for m, rln in enumerate(ref_sub):
+                ls = tgt_t0 + (float(rln["start"]) - ref_t0) * scale
+                le = tgt_t0 + (float(rln["end"]) - ref_t0) * scale
+                if m == blk_len - 1:
+                    le = min(next_bound, max(ls + 0.4, tgt_t1))
+                elif le > next_bound - 0.2:
+                    le = max(ls + 0.2, next_bound - 0.2)
+                rws = rln.get("words") or []
+                r_dur = max(0.05, float(rln["end"]) - float(rln["start"]))
+                pws: list[dict] = []
+                if rws and _norm_lyrics_cmp(rln["text"]) == _norm_lyrics_cmp(tgt_sub[m]["text"]):
+                    for rw in rws:
+                        u0 = max(0.0, min(1.0, (float(rw["start"]) - float(rln["start"])) / r_dur))
+                        u1 = max(u0, min(1.0, (float(rw["end"]) - float(rln["start"])) / r_dur))
+                        pws.append({
+                            "word": rw["word"],
+                            "start": round(ls + (le - ls) * u0, 3),
+                            "end": round(ls + (le - ls) * u1, 3),
+                        })
+                else:
+                    pws = _even_words_for_line(tgt_sub[m]["text"], ls, le)
+                proj_lines.append({"start": round(ls, 2), "end": round(le, 2), "text": tgt_sub[m]["text"], "words": pws})
+
+            # Step 1: Try Twin-Prior Guided Local CTC first (preserves live 20ms vocal rubato!)
+            guided: list[dict] = []
+            g_scores: list[float] = []
+            for m, pln in enumerate(proj_lines):
+                p_prev = float(guided[-1]["end"]) if m > 0 else prev_bound
+                p_next = float(proj_lines[m + 1]["start"]) + 0.50 if (m + 1 < blk_len) else min(next_bound, float(pln["end"]) + 0.6)
+                res_m = align_single_fn(
+                    tgt_s + m,
+                    pln,
+                    max(p_prev, float(pln["start"]) - 0.60),
+                    min(p_next, float(pln["end"]) + 0.60),
+                )
+                if res_m is not None:
+                    guided.append(res_m[0])
+                    g_scores.append(res_m[1])
+                else:
+                    guided.append(pln)
+                    g_scores.append(0.0)
+
+            _, g_cr, g_hg, g_bs, g_sc = _chorus_block_health(guided, g_scores)
+            g_rat = max(
+                (
+                    max(
+                        (float(ref_sub[m]["end"]) - float(ref_sub[m]["start"])) / max(0.15, float(guided[m]["end"]) - float(guided[m]["start"])),
+                        (float(guided[m]["end"]) - float(guided[m]["start"])) / max(0.15, float(ref_sub[m]["end"]) - float(ref_sub[m]["start"])),
+                    )
+                    for m in range(blk_len - 1)
+                ),
+                default=1.0,
+            )
+            if g_sc >= 0.09 and g_cr == 0 and g_hg == 0 and g_bs == 0 and g_rat < 1.80:
+                chosen = guided
+            else:
+                chosen = proj_lines
+
+            # Strict Pareto Acceptance Gate: never regress defects or vocal coverage!
+            _, new_cr, new_hg, new_bs, _ = _chorus_block_health(chosen, [0.15] * blk_len)
+            new_rat = max(
+                (
+                    max(
+                        (float(ref_sub[m]["end"]) - float(ref_sub[m]["start"])) / max(0.15, float(chosen[m]["end"]) - float(chosen[m]["start"])),
+                        (float(chosen[m]["end"]) - float(chosen[m]["start"])) / max(0.15, float(ref_sub[m]["end"]) - float(ref_sub[m]["start"])),
+                    )
+                    for m in range(blk_len - 1)
+                ),
+                default=1.0,
+            )
+            old_voc = _voc_hit_ratio(tgt_sub)
+            new_voc = _voc_hit_ratio(chosen)
+            if (
+                new_cr <= tgt_cr
+                and new_hg <= tgt_hg
+                and new_bs <= tgt_bs
+                and (new_rat <= max_rat or tgt_sc < 0.10)
+                and new_voc >= old_voc - 0.025
+            ):
+                out[tgt_s : tgt_s + blk_len] = chosen
+                rescued_count += 1
+
+    return out, rescued_count
+
+
+def _apply_single_line_acoustic_safeguards(
+    lines: list[dict],
+    audio_dur: float,
+    db20: np.ndarray,
+    global_thr: float,
+    align_single_fn,
+) -> tuple[list[dict], int]:
+    """Universal single-line acoustic safeguards (zero-twin fallback):
+    1. Crushed final-line rescue: extends into real trailing singing when the last line ended prematurely.
+    2. Intra-line word freeze-burst de-jitter: smooths severe >=18x non-final freeze+burst collapses via vocal energy CDF.
+    """
+    out = [dict(ln) for ln in lines]
+    fixes = 0
+    if not out:
+        return out, 0
+
+    # (a) Crushed final line with continuing vocals right after it
+    last = out[-1]
+    last_syl = max(1.0, estimate_syllable_units(last.get("text", "")))
+    last_dur = float(last["end"]) - float(last["start"])
+    if len(db20) > 0 and last_syl >= 5.0 and (last_dur < 0.85 or (last_dur / last_syl) < 0.11):
+        t_walk = float(last["end"])
+        best_e = t_walk
+        quiet = 0
+        while t_walk < min(audio_dur, float(last["start"]) + max(6.0, last_syl * 0.65)):
+            idx_f = int(t_walk / 0.02)
+            if idx_f >= len(db20):
+                break
+            if db20[idx_f] > global_thr:
+                quiet = 0
+                best_e = t_walk + 0.02
+            else:
+                quiet += 1
+                if quiet >= 20:
+                    break
+            t_walk += 0.02
+        if best_e > float(last["end"]) + 0.4:
+            res_tail = align_single_fn(len(out) - 1, last, float(last["start"]), min(audio_dur, best_e + 0.4))
+            if res_tail is not None and (float(res_tail[0]["end"]) - float(res_tail[0]["start"])) > last_dur + 0.4:
+                out[-1] = res_tail[0]
+                fixes += 1
+
+    # (b) Intra-line word freeze-burst de-jitter (max_nonfinal >= 1.6s & min_w <= 0.08s & ratio >= 18x)
+    for ln in out:
+        ws = ln.get("words") or []
+        if len(ws) < 4:
+            continue
+        wdurs = [max(0.01, float(w["end"]) - float(w["start"])) for w in ws]
+        if max(wdurs[:-1]) >= 1.6 and min(wdurs) <= 0.08 and (max(wdurs[:-1]) / min(wdurs)) >= 18.0:
+            ls, le = float(ln["start"]), float(ln["end"])
+            new_ws = [{"word": w["word"], "start": ls, "end": ls} for w in ws]
+            _distribute_by_vocal_energy_cdf(new_ws, ls, le, db20, 0.02)
+            ln["words"] = new_ws
+            fixes += 1
+
+    return out, fixes
+
+
 def refine_lines_with_ctc(
     lines: list[dict],
     audio_16k: np.ndarray,
@@ -4396,13 +5002,15 @@ def refine_lines_with_ctc(
 ) -> tuple[list[dict], bool]:
     """Primary Stage-2 20ms Multilingual CTC Forced Aligner (`torchaudio.pipelines.MMS_FA`).
 
-    Architecture (Clean Subtraction — ZERO Pass-2B energy distortion):
-    1. Exact 20ms word onsets via MMS_FA CTC forced alignment on isolated vocals.
-    2. Parenthetical backing-vocal isolation + interlude/script block partitioning (`_build_ctc_blocks`).
-    3. Per-line explosion guard (re-aligns any drifted line inside its tight Stage-1 local window).
-    4. Exact 20ms word tails strictly walked from `ctc_start + 0.10s` via `_local_vocal_tail_offset`,
-       with seamless interior bridging (`<= 0.40s` or vocal active within `0.22s` of next onset).
-    5. Runs on GPU (~2s/song) AND falls back cleanly to CPU (~5s/song) instead of skipping on busy VRAM!
+    Architecture:
+    1. Repeated-chorus simultaneous overlay-paren stripping (`_strip_repeated_chorus_overlay_parens`)
+       + unsung speaker-tag skipping (`SPEAKER_PREFIX_RE`).
+    2. Exact 20ms word onsets via MMS_FA CTC forced alignment on isolated vocals.
+    3. Parenthetical backing-vocal isolation + interlude/script block partitioning (`_build_ctc_blocks`).
+    4. Per-line explosion guard + exact 20ms peak-decay vocal tails (`_local_vocal_tail_offset`).
+    5. Same-song cross-chorus self-consistency rescue (`_rescue_drifted_repeated_choruses`: Guided CTC -> Twin Projection)
+       + single-line acoustic safeguards (`_apply_single_line_acoustic_safeguards`).
+    6. Runs on GPU (~2s/song) AND falls back cleanly to CPU (~5s/song) instead of skipping on busy VRAM!
     """
     if not lines or len(lines) < 2 or len(audio_16k) < 16000:
         return lines, False
@@ -4412,6 +5020,16 @@ def refine_lines_with_ctc(
     if len(db20) < 10:
         return lines, False
     global_thr = _adaptive_vocal_threshold_db(db20)
+
+    # M1: Strip simultaneous parenthetical backing overlays ONLY when time-conservation proves they sit on a repeated chorus!
+    work_lines, stripped_overlay_cnt = _strip_repeated_chorus_overlay_parens(lines, db20, global_thr)
+    if stripped_overlay_cnt > 0:
+        print(
+            f"[Lyrics] Stripped {stripped_overlay_cnt} simultaneous overlay-paren line(s) from repeated chorus.",
+            file=sys.stderr,
+            flush=True,
+        )
+    lines = work_lines
 
     blocks = _build_ctc_blocks(lines)
     if not blocks:
@@ -4445,14 +5063,16 @@ def refine_lines_with_ctc(
             seg_start: float,
             line_indices: list[int],
             next_bound_s: float,
-        ) -> Optional[dict[int, list[dict]]]:
+            text_override: Optional[dict[int, str]] = None,
+        ) -> Optional[tuple[dict[int, list[dict]], dict[int, float]]]:
             nonlocal model, dev
             if len(seg_audio) < 1600:
                 return None
             tok_meta: list[tuple[int, str, int, int]] = []
             flat_ids: list[int] = []
             for li in line_indices:
-                for tk in _tokenize_line_for_ctc(lines[li].get("text", "")):
+                txt_li = text_override[li] if (text_override and li in text_override) else lines[li].get("text", "")
+                for tk in _tokenize_line_for_ctc(txt_li):
                     rom = _romanize_token_for_ctc(tk, valid_chars)
                     c0 = len(flat_ids)
                     for ch in rom:
@@ -4505,6 +5125,7 @@ def refine_lines_with_ctc(
                     "word": tk,
                     "start": seg_start + spans[c0].start * ratio,
                     "ctc_end": seg_start + spans[c1 - 1].end * ratio,
+                    "score": float(np.mean([spans[k].score for k in range(c0, c1)])),
                 }
                 for li, tk, c0, c1 in tok_meta
             ]
@@ -4525,15 +5146,19 @@ def refine_lines_with_ctc(
                 bw["end"] = end_t
 
             by_line: dict[int, list[dict]] = {}
+            scores_by_line: dict[int, list[float]] = {}
             for bw in blk_words:
                 by_line.setdefault(bw["li"], []).append({
                     "word": bw["word"],
                     "start": round(bw["start"], 3),
                     "end": round(bw["end"], 3),
                 })
-            return by_line
+                scores_by_line.setdefault(bw["li"], []).append(bw["score"])
+            mean_scores = {li: float(np.mean(vs)) for li, vs in scores_by_line.items() if vs}
+            return by_line, mean_scores
 
         out_lines = [dict(ln) for ln in lines]
+        line_ctc_scores = [0.0 for _ in out_lines]
         refined_blocks = 0
         refined_line_count = 0
 
@@ -4546,13 +5171,10 @@ def refine_lines_with_ctc(
 
             prev_is_backing = (bi > 0) and blocks[bi - 1][1]
             nxt_is_backing = (bi + 1 < len(blocks)) and blocks[bi + 1][1]
-            # Strictly anchor left bound to ALREADY-COMMITTED previous block end (`out_lines`, NOT stale Stage-1 `lines`!)
-            # and right bound to next block's start so adjacent CTC audio windows NEVER overlap and steal each other's words!
             prev_e = float(out_lines[blocks[bi - 1][0][-1]]["end"]) if bi > 0 else 0.0
             nxt_s = float(lines[blocks[bi + 1][0][0]]["start"]) if (bi + 1 < len(blocks)) else audio_dur
 
             if is_isolated_backing:
-                # Non-overlapping local window for isolated parenthetical backing vocal: never bleed into neighboring lead lines!
                 b_s = max(prev_e, float(lines[blk[0]]["start"]) - 0.15)
                 b_e = min(nxt_s, float(lines[blk[-1]]["end"]) + 0.15)
                 next_bound = b_e
@@ -4566,18 +5188,18 @@ def refine_lines_with_ctc(
             if b_e - b_s < 0.35:
                 continue
             seg = audio_16k[int(b_s * 16000) : int(b_e * 16000)]
-            by_line = _align_segment_ctc(seg, b_s, blk, next_bound)
-            if not by_line:
+            seg_res = _align_segment_ctc(seg, b_s, blk, next_bound)
+            if not seg_res:
                 continue
+            by_line, seg_scores = seg_res
 
             block_ok = False
             for li in blk:
                 ws = by_line.get(li) or []
                 if not ws:
                     continue
+                sc_li = seg_scores.get(li, 0.0)
 
-                # Per-line explosion guard: detect when CTC drifted words across an adjacent phrase
-                # (using inter-onset core span so genuine held final vowels NEVER false-trigger!)
                 if not is_isolated_backing:
                     orig_s = float(lines[li]["start"])
                     orig_e = float(lines[li]["end"])
@@ -4597,11 +5219,11 @@ def refine_lines_with_ctc(
                         loc_e = min(audio_dur, orig_e + 0.8)
                         loc_seg = audio_16k[int(loc_s * 16000) : int(loc_e * 16000)]
                         loc_res = _align_segment_ctc(loc_seg, loc_s, [li], loc_e)
-                        loc_ws = (loc_res or {}).get(li) or []
+                        loc_ws = (loc_res[0].get(li) if loc_res else None) or []
                         if loc_ws and (float(loc_ws[-1]["end"]) - float(loc_ws[0]["start"])) <= max(9.5, orig_dur * 2.1):
                             ws = loc_ws
+                            sc_li = loc_res[1].get(li, sc_li) if loc_res else sc_li
                         else:
-                            # Preserve Stage-1 line rather than shipping an exploded CTC drift!
                             if not lines[li].get("words"):
                                 out_lines[li]["words"] = _even_words_for_line(lines[li].get("text", ""), orig_s, orig_e)
                             continue
@@ -4609,6 +5231,7 @@ def refine_lines_with_ctc(
                 out_lines[li]["start"] = round(ws[0]["start"], 2)
                 out_lines[li]["end"] = round(max(ws[0]["start"] + 0.15, ws[-1]["end"]), 2)
                 out_lines[li]["words"] = ws
+                line_ctc_scores[li] = sc_li
                 refined_line_count += 1
                 block_ok = True
 
@@ -4618,14 +5241,47 @@ def refine_lines_with_ctc(
         if refined_blocks == 0:
             return lines, False
         if require_all_windows and refined_blocks < len(blocks):
-            # Ensure 0-word scaffolds (YouTube CC / LRC) never leak unrefined 0-word lines!
             if any(not ln.get("words") for ln in out_lines if _tokenize_line_for_ctc(ln.get("text", ""))):
                 return lines, False
 
         out_lines = _enforce_strict_monotonic_bounds(out_lines, first_onset, audio_dur)
+
+        # Single-line local CTC helper shared by M2h (Guided CTC) and M3 (Trailing rescue)
+        def _align_single_local(li_idx: int, ln_obj: dict, win_s: float, win_e: float) -> Optional[tuple[dict, float]]:
+            ws_cl = max(0.0, float(win_s))
+            we_cl = min(audio_dur, float(win_e))
+            if we_cl - ws_cl < 0.35:
+                return None
+            seg_loc = audio_16k[int(ws_cl * 16000) : int(we_cl * 16000)]
+            r_loc = _align_segment_ctc(seg_loc, ws_cl, [li_idx], we_cl, text_override={li_idx: ln_obj.get("text", "")})
+            if not r_loc:
+                return None
+            lws = r_loc[0].get(li_idx) or []
+            if not lws:
+                return None
+            return (
+                {
+                    "start": round(lws[0]["start"], 2),
+                    "end": round(max(lws[0]["start"] + 0.15, lws[-1]["end"]), 2),
+                    "text": ln_obj.get("text", ""),
+                    "words": lws,
+                },
+                r_loc[1].get(li_idx, 0.0),
+            )
+
+        # M2h: Same-song cross-chorus self-consistency rescue (Guided CTC -> Twin Projection, Pareto-gated)
+        out_lines, rescued_choruses = _rescue_drifted_repeated_choruses(
+            out_lines, line_ctc_scores, audio_dur, db20, global_thr, _align_single_local
+        )
+        # M3: Single-line acoustic safeguards (crushed final-line trailing rescue + intra-line freeze-burst de-jitter)
+        out_lines, single_fixes = _apply_single_line_acoustic_safeguards(
+            out_lines, audio_dur, db20, global_thr, _align_single_local
+        )
+        out_lines = _enforce_strict_monotonic_bounds(out_lines, first_onset, audio_dur)
+
         print(
             f"[Lyrics] MMS_FA 20ms CTC ({dev}) refined {refined_blocks}/{len(blocks)} blocks "
-            f"({refined_line_count}/{len(out_lines)} lines)",
+            f"({refined_line_count}/{len(out_lines)} lines, chorus_rescue={rescued_choruses}, single_fixes={single_fixes})",
             file=sys.stderr,
             flush=True,
         )

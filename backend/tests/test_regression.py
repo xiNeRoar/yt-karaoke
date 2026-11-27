@@ -1176,6 +1176,194 @@ def test_question_mark_sanitization_ui_and_security_invariants() -> None:
     print("[PASS] Question-mark sanitization (backend + frontend), sync-button removal, visual DB indicators & security hardening")
 
 
+def test_cross_chorus_overlay_paren_and_safeguard_invariants() -> None:
+    """Verify M1 (overlay-paren strip + speaker-tag CTC skip), M2h (cross-chorus Guided CTC -> Twin Projection
+    + interlude guard + expressive slow-outro protection), and M3 (trailing final-line rescue + freeze-burst de-jitter).
+    """
+    import lyrics_worker as lw
+    import numpy as np
+
+    # 1) Unsung duet speaker tags MUST be skipped by CTC tokenizer while preserving sung tokens!
+    assert lw._tokenize_line_for_ctc("男：落力為你好") == ["落", "力", "為", "你", "好"]
+    assert lw._tokenize_line_for_ctc("女：我決意愛他") == ["我", "決", "意", "愛", "他"]
+    assert lw._tokenize_line_for_ctc("合：相愛很難") == ["相", "愛", "很", "難"]
+    assert lw._tokenize_line_for_ctc("Chorus: Let it go") == ["Let", "it", "go"]
+    assert lw._tokenize_line_for_ctc("男：") == []
+
+    # 2) M1: Strip simultaneous overlay parens on repeated chorus (including 1-char typo & cross-line unclosed paren),
+    #    while strictly preserving genuine sequential solo parens with extra musical time!
+    db20_active = np.full(13000, -18.0, dtype=np.float32)  # 260s @ 20ms
+    db20_active[12575:] = -70.0  # singing ends at 251.5s
+    kuai_synth = [
+        # Clean Chorus 1 (0..4, 15s total)
+        {"start": 70.0, "end": 72.0, "text": "難道 愛 愛 愛 愛 愛", "words": []},
+        {"start": 72.1, "end": 74.1, "text": "我對愛情已死心", "words": []},
+        {"start": 74.2, "end": 76.2, "text": "貪高興狠心敷衍", "words": []},
+        {"start": 76.3, "end": 79.0, "text": "一下卻逼真的親吻", "words": []},
+        {"start": 79.1, "end": 82.0, "text": "我們這結局太不堪", "words": []},
+        {"start": 82.1, "end": 85.0, "text": "分不出真假的愛恨", "words": []},
+        # Verse separator
+        {"start": 100.0, "end": 104.0, "text": "前夜一起睡", "words": []},
+        {"start": 105.0, "end": 109.0, "text": "完全忘記往日為何", "words": []},
+        # Final Chorus with simultaneous overlay parens + 1-char typo + cross-line split + truncated at 242.9s!
+        {"start": 230.0, "end": 231.8, "text": "難道 愛 愛 愛 愛 愛", "words": []},
+        {"start": 231.8, "end": 232.2, "text": "(把失敗)", "words": []},
+        {"start": 232.2, "end": 232.6, "text": "我對愛情已死心", "words": []},
+        {"start": 232.6, "end": 233.0, "text": "(換教訓)", "words": []},
+        {"start": 233.1, "end": 235.0, "text": "貪高興狠心不起 (不死)", "words": []},
+        {"start": 235.1, "end": 237.5, "text": "一下卻逼真的親吻", "words": []},
+        {"start": 237.6, "end": 239.0, "text": "(總算幸運)", "words": []},
+        {"start": 239.1, "end": 240.5, "text": "我們這結局太不堪 (看", "words": []},
+        {"start": 240.6, "end": 241.2, "text": "全沒罪案發生)", "words": []},
+        {"start": 241.3, "end": 242.5, "text": "分不出真假的愛恨", "words": []},
+        {"start": 242.5, "end": 242.9, "text": "(合襯)", "words": []},
+    ]
+    m1_out, m1_rem = lw._strip_repeated_chorus_overlay_parens(kuai_synth, db20_active, -45.0)
+    assert m1_rem == 5, f"Expected 5 standalone overlay paren lines stripped, got {m1_rem}: {[x['text'] for x in m1_out]}"
+    assert len(m1_out) == 14
+    assert all("(" not in x["text"] and ")" not in x["text"] for x in m1_out)
+    assert m1_out[-1]["end"] >= 251.0, f"Trailing overlay chorus was not extended to real 251.5s vocal end: {m1_out[-1]}"
+
+    # Genuine sequential solo parens (extra 4.5s musical bars, like 晚安莉莉 L005-L006!) MUST NOT be deleted!
+    seq_paren = [
+        {"start": 10.0, "end": 12.0, "text": "開口諸多不滿", "words": []},
+        {"start": 12.1, "end": 14.0, "text": "閉上大門", "words": []},
+        {"start": 14.1, "end": 16.0, "text": "(Embrace your nightmare in the dark", "words": []},
+        {"start": 16.1, "end": 18.6, "text": "Now here let's start to face My Heart)", "words": []},
+        {"start": 18.7, "end": 20.0, "text": "並沒耐心解釋", "words": []},
+        {"start": 20.1, "end": 22.5, "text": "你就算憎我不壓低我價值", "words": []},
+        # Later repeat skips the English lines (only 7.5s instead of 12.5s!)
+        {"start": 60.0, "end": 62.0, "text": "開口諸多不滿", "words": []},
+        {"start": 62.1, "end": 63.5, "text": "閉上大門", "words": []},
+        {"start": 63.6, "end": 65.0, "text": "並沒耐心解釋", "words": []},
+        {"start": 65.1, "end": 67.5, "text": "你就算憎我不壓低我價值", "words": []},
+    ]
+    seq_out, seq_rem = lw._strip_repeated_chorus_overlay_parens(seq_paren, db20_active, -45.0)
+    assert seq_rem == 0 and len(seq_out) == len(seq_paren), f"Sequential solo parens falsely stripped: {seq_out}"
+
+    # 3) M2h: Expressive Slow-Outro Protection! A healthy high-confidence chorus sung at 2.2x slower tempo
+    #    MUST NOT be overwritten back to fast tempo!
+    def _mk_ln(s, e, txt):
+        return {"start": s, "end": e, "text": txt, "words": lw._even_words_for_line(txt, s, e)}
+
+    chorus_txts = ["在你每次抱怨的眼眸", "像我永遠不懂給你溫柔", "別再訴說我倆早已分手", "像你教我傷心依然未夠"]
+    slow_outro_song = (
+        [_mk_ln(10.0 + i * 2.5, 12.4 + i * 2.5, t) for i, t in enumerate(chorus_txts)]
+        + [_mk_ln(40.0 + i * 5.2, 45.0 + i * 5.2, t) for i, t in enumerate(chorus_txts)]  # 2.1x slower emotional piano outro!
+    )
+    slow_scores = [0.24, 0.24, 0.24, 0.24, 0.22, 0.22, 0.22, 0.22]
+    slow_res, slow_cnt = lw._rescue_drifted_repeated_choruses(
+        slow_outro_song, slow_scores, 80.0, db20_active[:4000], -45.0, lambda i, ln, ws, we: None
+    )
+    assert slow_cnt == 0 and abs(slow_res[4]["end"] - 45.0) < 0.02, f"Healthy slow rubato outro was falsely overwritten: {slow_res[4:]}"
+
+    # 4) M2h: Broken first chorus (crushed L002=0.60s!) MUST pick healthy SECOND chorus as reference and rescue L000..L003!
+    broken_first = [
+        _mk_ln(10.0, 14.0, chorus_txts[0]),
+        _mk_ln(14.1, 16.5, chorus_txts[1]),
+        _mk_ln(16.6, 17.2, chorus_txts[2]),  # CRUSHED 0.60s / 10syl!
+        _mk_ln(17.3, 20.0, chorus_txts[3]),
+        _mk_ln(50.0, 52.4, chorus_txts[0]),
+        _mk_ln(52.5, 54.9, chorus_txts[1]),
+        _mk_ln(55.0, 57.4, chorus_txts[2]),
+        _mk_ln(57.5, 59.9, chorus_txts[3]),
+    ]
+    bf_scores = [0.16, 0.15, 0.04, 0.14, 0.22, 0.22, 0.22, 0.22]
+    bf_res, bf_cnt = lw._rescue_drifted_repeated_choruses(
+        broken_first, bf_scores, 80.0, db20_active[:4000], -45.0, lambda i, ln, ws, we: None
+    )
+    assert bf_cnt == 1, f"Broken first chorus was not rescued from clean second twin: {bf_res}"
+    assert (bf_res[2]["end"] - bf_res[2]["start"]) >= 2.0, f"Crushed L002 not restored: {bf_res[2]}"
+    assert abs(bf_res[6]["start"] - 55.0) < 0.02, "Healthy second twin must remain untouched!"
+
+    # 4B) M2h: Onset vocal-coverage guard! Late-drifted low-confidence middle lines MUST NOT pull tgt_t0
+    #     3-4 seconds past real active singing at tgt_sub[0]["start"]!
+    late_mid_chorus = [
+        _mk_ln(10.0, 12.0, chorus_txts[0]),
+        _mk_ln(12.1, 14.1, chorus_txts[1]),
+        _mk_ln(14.2, 16.2, chorus_txts[2]),
+        _mk_ln(16.3, 19.0, chorus_txts[3]),
+        # Final chorus: L4 starts cleanly at 50.0s (2.0s), then L5/L6/L7 drifted +3.5s late with low confidence!
+        _mk_ln(50.0, 52.0, chorus_txts[0]),
+        _mk_ln(55.6, 57.6, chorus_txts[1]),
+        _mk_ln(57.7, 59.7, chorus_txts[2]),
+        _mk_ln(59.8, 62.5, chorus_txts[3]),
+    ]
+    lm_res, lm_cnt = lw._rescue_drifted_repeated_choruses(
+        late_mid_chorus, [0.24, 0.24, 0.24, 0.24, 0.08, 0.05, 0.05, 0.05], 80.0, db20_active[:4000], -45.0,
+        lambda i, ln, ws, we: None,
+    )
+    assert lm_cnt == 1 and abs(lm_res[4]["start"] - 50.0) <= 0.5, f"Chorus onset wrongly pulled late past active singing: {lm_res[4]}"
+
+    # 5) M2h: Interlude guard (>=12s guitar solo inside chorus) fixes exploded line locally when post-gap
+    #    cannot fit the whole chorus, AND relocates a crushed split chorus cleanly onto the post-solo vocal island when it DOES!
+    db20_solo = np.full(8000, -18.0, dtype=np.float32)  # 160s
+    db20_solo[3600:5000] = -65.0  # 28s silent guitar solo (72s .. 100s)
+    solo_chorus = [
+        _mk_ln(10.0, 14.5, chorus_txts[0]),
+        _mk_ln(14.6, 19.0, chorus_txts[1]),
+        _mk_ln(19.1, 23.0, chorus_txts[2]),
+        _mk_ln(23.1, 27.0, chorus_txts[3]),
+        _mk_ln(60.0, 71.2, chorus_txts[0]),  # 11.2s exploded hog before 28s solo
+        _mk_ln(102.0, 106.5, chorus_txts[1]),
+        _mk_ln(106.6, 110.5, chorus_txts[2]),
+        _mk_ln(110.6, 114.5, chorus_txts[3]),
+        _mk_ln(115.0, 118.0, "後段結束句測試"),  # caps post-solo island to 15s (< 0.72*17s? wait 15 > 12.2, use 110.0 to test local fix!)
+    ]
+    solo_chorus[-1] = _mk_ln(110.8, 113.8, "後段結束句測試")
+    solo_chorus[7] = _mk_ln(108.0, 110.7, chorus_txts[3])
+    solo_res, solo_cnt = lw._rescue_drifted_repeated_choruses(
+        solo_chorus, [0.22] * 4 + [0.08, 0.20, 0.20, 0.20, 0.20], 130.0, db20_solo[:6500], -45.0,
+        lambda i, ln, ws, we: (_mk_ln(60.0, 65.5, ln["text"]), 0.18),
+    )
+    assert solo_cnt == 1 and 64.5 <= solo_res[4]["end"] <= 66.5, f"Interlude-split hog not fixed locally: {solo_res[4]}"
+    assert abs(solo_res[5]["start"] - 102.0) < 0.02, f"Guitar solo gap was distorted: {solo_res[5]}"
+
+    # 5B) Crushed split chorus torn across a 30s silent solo (like 戀愛腦之死 L29..L32 packed into 5s pre-solo
+    #     while post-solo 100s..124s has 24s of active singing!) MUST relocate cleanly onto [100s, 117s]!
+    split_crushed = [
+        _mk_ln(10.0, 14.0, chorus_txts[0]),
+        _mk_ln(14.1, 18.0, chorus_txts[1]),
+        _mk_ln(18.1, 22.0, chorus_txts[2]),
+        _mk_ln(22.1, 26.0, chorus_txts[3]),
+        _mk_ln(68.0, 68.7, chorus_txts[0]),  # crushed pre-solo
+        _mk_ln(68.8, 69.5, chorus_txts[1]),  # crushed pre-solo
+        _mk_ln(69.6, 70.3, chorus_txts[2]),  # crushed pre-solo
+        _mk_ln(101.0, 105.0, chorus_txts[3]),
+        _mk_ln(124.0, 128.0, "尾段句測試內容"),
+    ]
+    sc_res, sc_cnt = lw._rescue_drifted_repeated_choruses(
+        split_crushed, [0.22] * 4 + [0.06, 0.06, 0.06, 0.16, 0.20], 140.0, db20_solo[:7000], -45.0,
+        lambda i, ln, ws, we: None,
+    )
+    assert sc_cnt == 1 and sc_res[4]["start"] >= 99.0 and all((x["end"] - x["start"]) >= 3.0 for x in sc_res[4:8]), f"Split crushed chorus not relocated onto post-solo island: {sc_res[4:8]}"
+
+    # 6) M3: Final-line crushed trailing rescue + intra-line freeze-burst de-jitter
+    db20_tail = np.full(1500, -70.0, dtype=np.float32)  # 30s
+    db20_tail[500:1200] = -16.0  # active singing 10.0s .. 24.0s
+    m3_in = [
+        {
+            "start": 10.0, "end": 14.0, "text": "立甚麼心腸",
+            "words": [
+                {"word": "立", "start": 10.0, "end": 13.0},   # 3.0s freeze!
+                {"word": "甚", "start": 13.0, "end": 13.04},  # 0.04s burst (75x!)
+                {"word": "麼", "start": 13.04, "end": 13.10},
+                {"word": "心", "start": 13.10, "end": 13.20},
+                {"word": "腸", "start": 13.20, "end": 14.0},
+            ],
+        },
+        _mk_ln(20.0, 20.72, "寧願今晚等你 也不怕心死"),  # crushed 0.72s final line while singing continues to 24.0s!
+    ]
+    m3_out, m3_fixes = lw._apply_single_line_acoustic_safeguards(
+        m3_in, 30.0, db20_tail, -45.0,
+        lambda i, ln, ws, we: (_mk_ln(ws, min(we, 23.6), ln["text"]), 0.16),
+    )
+    assert m3_fixes == 2, f"Expected both M3 tail + dejitter fixes, got {m3_fixes}: {m3_out}"
+    assert (m3_out[1]["end"] - m3_out[1]["start"]) >= 3.0, f"Crushed final line not extended: {m3_out[1]}"
+    assert all((w["end"] - w["start"]) >= 0.30 for w in m3_out[0]["words"]), f"Freeze-burst not smoothed: {m3_out[0]['words']}"
+    print("[PASS] Cross-chorus M1/M2h/M3 invariants (speaker skip, overlay-paren physics, slow-outro guard, interlude guard, tail & burst rescue)")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -1189,6 +1377,7 @@ def main() -> int:
     test_generic_alignment_recovery_and_qwen3_windows()
     test_line_overlap_hog_burst_and_cross_layer_fixes()
     test_tier0_yrc_and_stage2_ctc_invariants()
+    test_cross_chorus_overlay_paren_and_safeguard_invariants()
     test_question_mark_sanitization_ui_and_security_invariants()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
