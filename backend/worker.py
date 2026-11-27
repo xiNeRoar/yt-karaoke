@@ -27,6 +27,24 @@ YT_COOKIES_FILE = BASE_DIR / "cookies.txt"
 YT_FIREFOX_PROFILE = BASE_DIR / ".yt_firefox_profile"
 
 
+def compute_cpu_thread_cap() -> int:
+    """Cap CPU worker threads to ~25% of logical cores (max 6) so CPU fallback never starves desktop UI."""
+    env_override = os.environ.get("KARAOKE_CPU_THREADS", "").strip()
+    if env_override.isdigit() and int(env_override) >= 1:
+        return min(16, int(env_override))
+    cores = os.cpu_count() or 4
+    if cores >= 16:
+        return min(6, max(4, cores // 4))
+    if cores >= 8:
+        return 4
+    return max(2, cores // 2)
+
+
+class _HQYieldInterrupt(RuntimeError):
+    """Raised when idle --force-hq background upgrade detects GPU contention and yields cleanly (rc=2)."""
+
+
+
 def get_yt_js_runtimes() -> dict:
     """Detect local JS runtime (node/deno/bun) so yt-dlp 2026+ solves YouTube player formats cleanly."""
     runtimes: dict = {}
@@ -250,16 +268,34 @@ def main() -> int:
 
         update(title=title, duration=duration, status="separating", progress=28, stage_text="準備去人聲中...")
 
-        # Step 2: Setup PyTorch & audio-separator
+        # Step 2: Setup PyTorch, ONNXRuntime & audio-separator with strict CPU thread cap (prevents 100% CPU lockups!)
+        cpu_cap = compute_cpu_thread_cap()
+        for _env_k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[_env_k] = str(cpu_cap)
         if device_mode == "cpu":
             os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
         import torch
         if device_mode == "cpu":
             torch.cuda.is_available = lambda: False
-        # Avoid Intel P+E core OpenMP oversubscription when running any CPU chunks
         try:
-            torch.set_num_threads(min(8, max(4, (os.cpu_count() or 8) // 2)))
+            torch.set_num_threads(cpu_cap)
+            torch.set_num_interop_threads(min(2, cpu_cap))
+        except Exception:
+            pass
+
+        # Cap ONNXRuntime CPU threads too (MDXSeparator creates default SessionOptions with intra_op_num_threads=0 = ALL cores!)
+        try:
+            import onnxruntime as _ort
+            _OrigSessionOptions = _ort.SessionOptions
+
+            class _CappedSessionOptions(_OrigSessionOptions):
+                def __init__(self, *a, **kw):
+                    super().__init__(*a, **kw)
+                    self.intra_op_num_threads = cpu_cap
+                    self.inter_op_num_threads = 1
+
+            _ort.SessionOptions = _CappedSessionOptions
         except Exception:
             pass
 
@@ -454,6 +490,17 @@ def main() -> int:
                 # Decide optimal device BEFORE EVERY CHUNK (~0.05ms check)
                 if device_mode == "gpu":
                     want = "cuda"
+                elif args.force_hq:
+                    # Idle background HQ upgrade MUST NEVER grind the huge RoFormer transformer on CPU!
+                    # If another GPU workload starts mid-song, release 100% VRAM and yield cleanly (rc=2).
+                    fmb = free_vram_mb()
+                    min_needed = 1200 if dyn_state["dev"] == "cuda" else 3000
+                    if fmb < min_needed:
+                        move_model("cpu")
+                        raise _HQYieldInterrupt(
+                            f"Idle HQ upgrade yielded mid-song (free_vram={fmb:.0f}MB < {min_needed}MB)"
+                        )
+                    want = "cuda"
                 else:
                     # Hysteresis: stay on GPU while >= 900 MB free; hop back onto GPU once >= 2200 MB free
                     fmb = free_vram_mb()
@@ -472,8 +519,10 @@ def main() -> int:
                         return out.detach().cpu()
                     except RuntimeError as e:
                         if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                            # Instant OOM recovery: yield 100% VRAM and retry this exact chunk on CPU!
+                            # Instant OOM recovery: yield 100% VRAM!
                             move_model("cpu")
+                            if args.force_hq:
+                                raise _HQYieldInterrupt(f"Idle HQ upgrade yielded on CUDA OOM: {e}")
                         else:
                             raise
 
@@ -545,6 +594,9 @@ def main() -> int:
             stage_text="最後整理中...",
         )
         return 0
+    except _HQYieldInterrupt as y_exc:
+        print(f"[Worker] {y_exc}", file=sys.stderr, flush=True)
+        return 2
     except Exception as exc:
         clean_msg = friendly_error_message(exc)
         update(

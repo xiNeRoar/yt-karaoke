@@ -1395,6 +1395,63 @@ def test_batched_clip_timestamps_and_vram_guard() -> None:
     print("[PASS] Batched clip_timestamps trough splitting, anti-loop fallback & 3200MB WDDM VRAM guard")
 
 
+def test_cpu_thread_cap_hq_yield_and_credit_dedup() -> None:
+    import worker as wk
+    import lyrics_worker as lw
+
+    # 1) Bounded CPU thread cap on both worker & lyrics_worker (<=6 default, respects KARAOKE_CPU_THREADS)
+    old_env = os.environ.pop("KARAOKE_CPU_THREADS", None)
+    try:
+        w_cap = wk.compute_cpu_thread_cap()
+        l_cap = lw.compute_cpu_thread_cap()
+        assert 2 <= w_cap <= 6 and w_cap == l_cap, f"Unexpected default thread caps: {w_cap}, {l_cap}"
+        os.environ["KARAOKE_CPU_THREADS"] = "3"
+        assert wk.compute_cpu_thread_cap() == 3 and lw.compute_cpu_thread_cap() == 3
+    finally:
+        if old_env is None:
+            os.environ.pop("KARAOKE_CPU_THREADS", None)
+        else:
+            os.environ["KARAOKE_CPU_THREADS"] = old_env
+
+    # 2) Worker invariants: ONNXRuntime thread cap + --force-hq mid-song yield (rc=2, never grinds RoFormer on CPU!)
+    wk_src = (BACKEND / "worker.py").read_text(encoding="utf-8")
+    assert "_CappedSessionOptions" in wk_src and "intra_op_num_threads = cpu_cap" in wk_src
+    assert "class _HQYieldInterrupt" in wk_src and "except _HQYieldInterrupt" in wk_src
+
+    # 3) Credit-line filter catches prefixed instruments/studio roles without false-matching real lyrics
+    bad_credits = [
+        "木吉他 : Gig Studio/Kai",
+        "電結他：Jason",
+        "原聲吉他：阿明",
+        "和聲編寫：陳蕾",
+        "錄音室：Avon Studio",
+        "混音工程師：Ray",
+        "母帶後期處理：Ted Jensen",
+        "Acoustic Guitar: John Mayer",
+        "Backing Vocals: Jane Doe",
+    ]
+    for bc in bad_credits:
+        assert lw.CREDIT_LINE_RE.match(bc), f"Missed credit line: {bc}"
+
+    real_lyrics = [
+        "我也很想可被看到",
+        "誰都可發光 只要找對地方",
+        "結他聲響起那一刻",
+        "吉他彈到天明",
+        "人聲鼎沸之中想起你",
+        "錄音帶裡的故事",
+        "Piano man sing us a song",
+    ]
+    for rl in real_lyrics:
+        assert not lw.CREDIT_LINE_RE.match(rl), f"False-matched real lyric as credit: {rl}"
+
+    # 4) Duplicate phrase-rescue pool guard present in lyrics_worker.py
+    lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
+    assert "def _is_duplicate_pool" in lw_src and "not _is_duplicate_pool(r_pool, song_pools)" in lw_src
+    assert "_apply_cpu_thread_limits()" in lw_src
+    print("[PASS] CPU thread cap (PyTorch+ONNX+Whisper), HQ mid-song yield, credit filter & duplicate-pool guard")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -1410,6 +1467,7 @@ def main() -> int:
     test_tier0_yrc_and_stage2_ctc_invariants()
     test_cross_chorus_overlay_paren_and_safeguard_invariants()
     test_batched_clip_timestamps_and_vram_guard()
+    test_cpu_thread_cap_hq_yield_and_credit_dedup()
     test_question_mark_sanitization_ui_and_security_invariants()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()

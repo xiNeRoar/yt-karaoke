@@ -55,13 +55,20 @@ HALLUCINATION_RE = re.compile(
 )
 GARBAGE_CHARS_RE = re.compile(r"[\ufffd\u0400-\u04FF]")  # Replacement char or Cyrillic hallucinations
 CREDIT_LINE_RE = re.compile(
-    r"^\s*(?:作[詞词](?:\s*/\s*作曲)?|作曲|[編编]曲|[監监][製制]|[製制]作人|混音|[縮缩]混|[錄录]音|和[音聲声]|母[帶带]|"
-    r"出品|[發发]行|原唱|翻唱|演唱|主唱|[詞词]曲|吉他|[貝贝]斯|鼓|[鍵键][盤盘]|弦[樂乐]|企[劃划]|策[劃划]|[統统][籌筹]|[後后]期|"
+    r"^\s*(?:"
+    r"(?:作[詞词](?:\s*/\s*作曲)?|作曲|[編编]曲|[監监][製制]|[製制]作人|混音|[縮缩]混|[錄录]音|和[音聲声]|母[帶带]|"
+    r"出品|[發发]行|原唱|翻唱|演唱|主唱|[詞词]曲|吉他|結他|[貝贝]斯|鼓|[鍵键][盤盘]|弦[樂乐]|企[劃划]|策[劃划]|[統统][籌筹]|[後后]期|"
     r"[詞词]|曲|[編编]|[監监]|OP|SP|"
     r"Lyricist|Lyrics\s*by|Composer|Music\s*(?:&|and)\s*Lyrics|Music\s*by|Written\s*by|"
     r"Arranger|Arranged\s*by|Producer|Produced\s*by|Executive\s*Producer|"
     r"Mixed\s*by|Mixing|Mastered\s*by|Mastering|Vocalist|Backing\s*Vocals?|Vocals?|"
-    r"Guitar|Bass|Drums|Piano|Keyboard|Strings|Chorus|Recording|Studio)\s*[:：\-]",
+    r"Guitar|Bass|Drums|Piano|Keyboard|Strings|Chorus|Recording|Studio)\s*[:：\-]"
+    r"|(?:[\u4e00-\u9fff]{0,4}(?:吉他|結他|[貝贝]斯|鼓|[鍵键][盤盘]|[鋼钢]琴|提琴|弦[樂乐]|管[樂乐]|和[音聲声]|合音|人[聲声]|"
+    r"[錄录]音|混音|[縮缩]混|母[帶带]|[製制]作|配唱|[編编]曲|[監监][製制]|企[劃划]|策[劃划]|[統统][籌筹]|[後后]期|版[權权]|"
+    r"[發发]行|出品)(?:[室棚師师組组團团手長长人理監监員员]|工程[師师]|指導|指导|[總总][監监]|[編编][寫写]|助理|[團团][隊队]|[設设][計计]|[處处]理)?)\s*[:：]"
+    r"|(?:(?:Acoustic|Electric|Lead|Rhythm|Bass|Additional|Live|Backing|Background|Vocal|Co-|Executive|Assistant|Sound|Audio|Mixing|Mastering|Recording)\s+"
+    r"(?:Guitars?|Bass|Drums|Percussion|Piano|Keyboards?|Strings|Vocals?|Producer|Engineer|Arrangement|Studio|Direction))\s*[:：]"
+    r")",
     re.IGNORECASE,
 )
 SECTION_HEADER_RE = re.compile(
@@ -147,8 +154,38 @@ def _release_torch_vram() -> None:
 WHISPER_MIN_VRAM_MB = 3200  # large-v3-turbo float16 weights (~2.34 GB) + KV cache (~0.85 GB) before WDDM PCIe spill
 
 
+def compute_cpu_thread_cap() -> int:
+    """Cap CPU threads to ~25% of logical cores (max 6) so CPU fallback never starves desktop UI."""
+    env_override = os.environ.get("KARAOKE_CPU_THREADS", "").strip()
+    if env_override.isdigit() and int(env_override) >= 1:
+        return min(16, int(env_override))
+    cores = os.cpu_count() or 4
+    if cores >= 16:
+        return min(6, max(4, cores // 4))
+    if cores >= 8:
+        return 4
+    return max(2, cores // 2)
+
+
+def _apply_cpu_thread_limits() -> int:
+    """Apply bounded CPU thread limits to OpenMP/BLAS env vars and PyTorch (if imported)."""
+    cap = compute_cpu_thread_cap()
+    for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[_k] = str(cap)
+    try:
+        import torch
+        torch.set_num_threads(cap)
+        try:
+            torch.set_num_interop_threads(min(2, cap))
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+    return cap
+
+
 def _whisper_load_kwargs(dev: str, local_files_only: bool = False) -> dict:
-    """Shared faster-whisper/stable-ts model kwargs with multi-core CPU thread scaling."""
+    """Shared faster-whisper/stable-ts model kwargs with bounded CPU thread scaling."""
     ctype = "float16" if dev == "cuda" else "int8"
     kw: dict = {
         "device": dev,
@@ -157,8 +194,7 @@ def _whisper_load_kwargs(dev: str, local_files_only: bool = False) -> dict:
         "local_files_only": local_files_only,
     }
     if dev == "cpu":
-        cores = os.cpu_count() or 4
-        kw["cpu_threads"] = max(4, min(16, (cores // 2) if cores >= 12 else cores))
+        kw["cpu_threads"] = _apply_cpu_thread_limits()
     return kw
 
 
@@ -3590,6 +3626,19 @@ def _live_section_anchored_align(
                 hits += 1
         return hits >= min_hits
 
+    def _is_duplicate_pool(candidate_lines: list[str], existing_pools: list[list[str]]) -> bool:
+        c_set = {_norm_lyrics_cmp(x) for x in (candidate_lines or []) if len(_norm_lyrics_cmp(x)) >= 4}
+        if len(c_set) < 3:
+            return True
+        for ep in existing_pools:
+            e_set = {_norm_lyrics_cmp(x) for x in (ep or []) if len(_norm_lyrics_cmp(x)) >= 4}
+            if not e_set:
+                continue
+            ov = len(c_set & e_set) / max(1, min(len(c_set), len(e_set)))
+            if ov >= 0.50:
+                return True
+        return False
+
     extra_clusters = _find_sustained_unmatched_clusters(unmatched_gaps)
     if extra_clusters:
         added_pool = False
@@ -3597,7 +3646,11 @@ def _live_section_anchored_align(
         for cl in extra_clusters[:3]:
             rescued_pools = search_official_lyrics_pools_by_sung_phrases(cl)
             for r_pool in rescued_pools:
-                if r_pool and _verify_rescued_pool(cl, r_pool, strict_multi=has_multi_title):
+                if (
+                    r_pool
+                    and not _is_duplicate_pool(r_pool, song_pools)
+                    and _verify_rescued_pool(cl, r_pool, strict_multi=has_multi_title)
+                ):
                     official_lines = list(official_lines) + r_pool
                     song_pools.append(list(r_pool))
                     added_pool = True
@@ -5112,6 +5165,7 @@ def refine_lines_with_ctc(
 
     model = None
     try:
+        _apply_cpu_thread_limits()
         import torch
         import torchaudio
 
@@ -5983,6 +6037,7 @@ def write_status(status_file: Path, payload: dict) -> None:
 
 
 def main() -> int:
+    _apply_cpu_thread_limits()
     parser = argparse.ArgumentParser()
     parser.add_argument("--video-id", required=True)
     parser.add_argument("--vocals-path", required=True)

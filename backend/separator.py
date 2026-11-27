@@ -1299,7 +1299,8 @@ class KaraokeSeparatorManager:
                 elif self.device_mode == "gpu":
                     eff_mode = "gpu"
                 else:
-                    eff_mode = "auto" if free_mb >= 2000 else "cpu"
+                    # Allow MMS_FA 20ms CTC (>=1200MB) on GPU while lyrics_worker keeps Whisper CPU-safe below 3200MB!
+                    eff_mode = "auto" if free_mb >= 1200 else "cpu"
                 meta = meta_hint if (meta_hint and meta_hint.get("yt_meta_present")) else self.get_meta(video_id, mode)
                 # For Drive-cached songs (e.g. Force AI re-align), restore full YouTube track/artist/desc/subs from Drive meta.json!
                 if (
