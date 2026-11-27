@@ -441,7 +441,8 @@ class GatewayState:
                 if cat_res.returncode == 0 and cat_res.stdout.strip():
                     cat_doc = json.loads(cat_res.stdout)
                     songs = cat_doc.get("songs") if isinstance(cat_doc, dict) else None
-                    if isinstance(songs, dict) and len(songs) > 0:
+                    valid_empty = isinstance(songs, dict) and len(songs) == 0 and cat_doc.get("version") == 1 and "updated_at" in cat_doc
+                    if isinstance(songs, dict) and (len(songs) > 0 or valid_empty):
                         cleaned: dict[str, dict] = {}
                         for key, entry in songs.items():
                             if not isinstance(entry, dict) or entry.get("mode", "pure") != "pure":
@@ -461,7 +462,7 @@ class GatewayState:
                                 "storage": "gdrive",
                                 "url": f"https://www.youtube.com/watch?v={vid}",
                             }
-                        if cleaned:
+                        if cleaned or valid_empty:
                             evict_vids: list[str] = []
                             with self._lock:
                                 for k, new_ent in cleaned.items():

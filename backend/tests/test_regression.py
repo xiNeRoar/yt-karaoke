@@ -887,6 +887,81 @@ def test_generic_alignment_recovery_and_qwen3_windows() -> None:
     print("[PASS] Syllable-aware gap recovery, bilingual rematch tolerance, Qwen3 halo/script windows, yue sync & freeze-burst smoothing")
 
 
+def test_line_overlap_hog_burst_and_cross_layer_fixes() -> None:
+    """Verify non-destructive line overlap resolution, line-level hog-then-burst rescue, syllable CDF weighting,
+    empty _catalog.json fast-path acceptance, and bounded lyrics upload generation invalidation.
+    """
+    import lyrics_worker as lw
+    import numpy as np
+
+    # 1) Deep mixed-source overlap MUST NOT domino-crush into 0.25s/0.30s slivers!
+    colliding = [
+        {"start": 100.00, "end": 104.20, "text": "第一句本來有好長歌詞", "words": []},
+        {"start": 101.80, "end": 103.50, "text": "第二句時間倒序撞入嚟", "words": []},
+        {"start": 103.30, "end": 106.00, "text": "第三句接住一齊唱落去", "words": []},
+    ]
+    res_col = lw._resolve_line_overlaps_and_crushes([dict(x) for x in colliding], np.array([]), 0.1, 0.0)
+    for idx, ln in enumerate(res_col):
+        assert (ln["end"] - ln["start"]) >= 1.5, f"Overlap resolution domino-crushed line {idx}: {res_col}"
+        if idx > 0:
+            assert ln["start"] >= res_col[idx - 1]["end"] - 1e-6, f"Lines still overlap: {res_col}"
+
+    # 2) Line-level Hog-Then-Burst (real eu47ChbdYDY pattern: L112=4.91s glued to L113=0.25s + L114=0.25s!)
+    hog_lines = [
+        {"start": 455.42, "end": 460.33, "text": "去到這次我已退燒", "words": []},
+        {"start": 460.42, "end": 460.67, "text": "看到了 看破了", "words": []},
+        {"start": 460.67, "end": 460.92, "text": "説我愛你也都不過", "words": []},
+    ]
+    res_hog = lw._resolve_line_overlaps_and_crushes([dict(x) for x in hog_lines], np.array([]), 0.1, 0.0)
+    assert all((ln["end"] - ln["start"]) >= 1.3 for ln in res_hog), f"Line-level hog-burst not rescued: {res_hog}"
+    assert abs(res_hog[0]["start"] - 455.42) < 0.02 and abs(res_hog[-1]["end"] - 460.92) < 0.02
+
+    # 2B) Signature 1 with breath pause: 0.6s silent breath + 1.0s connected singing right before crushed 0.34s line
+    #     must absorb ONLY the connected singing and preserve the 0.6s breath pause!
+    db_gap = np.full(200, -60.0, dtype=np.float32)  # 20.0s @ 0.1s/step
+    db_gap[10:40] = -14.0   # line 0 singing (1.0s-4.0s)
+    db_gap[46:60] = -14.0   # 0.6s breath (4.0-4.6s), then connected singing (4.6-6.0s) for crushed line 1 (5.66-6.00s)!
+    gap_lines = [
+        {"start": 1.00, "end": 4.00, "text": "我就算輸 都不會令我", "words": []},
+        {"start": 5.66, "end": 6.00, "text": "輸走眼前的我", "words": []},
+    ]
+    res_gap = lw._resolve_line_overlaps_and_crushes([dict(x) for x in gap_lines], db_gap, 0.1, 0.0)
+    assert 4.50 <= res_gap[1]["start"] <= 4.75 and (res_gap[1]["end"] - res_gap[1]["start"]) >= 1.25, f"Connected gap rescue failed: {res_gap}"
+
+    # 3) Must strictly preserve: (a) genuine fast rap, (b) 1-char exclamation '啊', (c) held final note before interlude!
+    rap_lines = [
+        {"start": 10.00, "end": 10.90, "text": "快使用雙截棍哼哼哈兮", "words": []},
+        {"start": 10.90, "end": 11.80, "text": "習武之人切記仁者無敵", "words": []},
+    ]
+    res_rap = lw._resolve_line_overlaps_and_crushes([dict(x) for x in rap_lines], np.array([]), 0.1, 0.0)
+    assert abs(res_rap[0]["end"] - 10.90) < 0.02, f"Fast rap altered: {res_rap}"
+
+    excl_and_held = [
+        {"start": 20.00, "end": 23.80, "text": "愛你到永遠", "words": []},
+        {"start": 28.00, "end": 28.26, "text": "啊", "words": []},
+    ]
+    res_eh = lw._resolve_line_overlaps_and_crushes([dict(x) for x in excl_and_held], np.array([]), 0.1, 0.0)
+    assert abs(res_eh[0]["end"] - 23.80) < 0.02 and abs(res_eh[1]["end"] - 28.26) < 0.02, f"Held/exclamation altered: {res_eh}"
+
+    # 4) English CDF redistribution uses syllable weights (1-syl 'through' must NOT get 7x weight of 1-syl 'I'!)
+    en_ws = [{"word": "I", "start": 1.0, "end": 1.0}, {"word": "through", "start": 1.0, "end": 1.0}]
+    lw._distribute_by_vocal_energy_cdf(en_ws, 1.0, 2.0, np.array([]), 0.1)
+    assert abs((en_ws[0]["end"] - en_ws[0]["start"]) - 0.5) < 0.05, f"EN syllable CDF weighting wrong: {en_ws}"
+
+    # 5) Cross-layer static/structural invariants: empty _catalog.json, force_ai gen bump, 320s wait, TrayApp health polling
+    gw_src = (ROOT / "gateway" / "main.py").read_text(encoding="utf-8")
+    st_src = (BACKEND / "storage.py").read_text(encoding="utf-8")
+    sep_src = (BACKEND / "separator.py").read_text(encoding="utf-8")
+    tray_src = (ROOT / "tray-app" / "TrayApp.cs").read_text(encoding="utf-8")
+    assert "valid_empty" in gw_src and "if cleaned or valid_empty:" in gw_src, "Gateway must accept valid empty _catalog.json!"
+    assert "valid_empty" in st_src, "storage.py must accept valid empty _catalog.json!"
+    assert "self._bump_lyrics_upload_gen(video_id)" in sep_src and "ev.wait(timeout=320.0)" in sep_src
+    assert "self._lyrics_upload_epoch" in sep_src, "delete_cache clear-all must invalidate pending uploads via epoch!"
+    assert "await Task.Run(() => StopBackend());" in tray_src and "for (int attempt = 0; attempt < 24" in tray_src
+    assert not (ROOT / "public" / "assets" / "aistudio").exists(), "Leaked aistudio screenshots must not exist in repo!"
+    print("[PASS] Line overlap/hog-burst resolver, EN syllable CDF, empty _catalog.json, upload-gen invalidation & TrayApp polling")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -898,6 +973,7 @@ def main() -> int:
     test_bilingual_title_matching_and_artist_isolation()
     test_multilingual_cleaning_similarity_and_splitting()
     test_generic_alignment_recovery_and_qwen3_windows()
+    test_line_overlap_hog_burst_and_cross_layer_fixes()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()
     test_monotonic_anchor_consensus_and_contiguous_span()

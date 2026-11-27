@@ -352,7 +352,8 @@ class GoogleDriveStorage:
                 )
                 cat_doc = json.loads(cat_raw)
                 songs = cat_doc.get("songs") if isinstance(cat_doc, dict) else None
-                if isinstance(songs, dict) and len(songs) > 0:
+                valid_empty = isinstance(songs, dict) and len(songs) == 0 and cat_doc.get("version") == 1 and "updated_at" in cat_doc
+                if isinstance(songs, dict) and (len(songs) > 0 or valid_empty):
                     with self._lock:
                         self._index = songs
                         self._save_index()

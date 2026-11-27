@@ -1047,6 +1047,11 @@ namespace YtKaraokeTray
         private void UpdateOfflineUI()
         {
             if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)UpdateOfflineUI); } catch { }
+                return;
+            }
             if (_starting)
             {
                 _lblStatusPill.Text = "啟動中";
@@ -1214,7 +1219,7 @@ namespace YtKaraokeTray
             public string Detail;
         }
 
-        private Task<GitSyncResult> SyncRepoFromGitHubAsync()
+        private Task<GitSyncResult> SyncRepoFromGitHubAsync(int pullTimeoutMs = 15000)
         {
             return Task.Run(() =>
             {
@@ -1235,7 +1240,7 @@ namespace YtKaraokeTray
                     }
                     res.BeforeSha = outTxt;
 
-                    if (!RunGitCommand(gitExe, "pull --ff-only origin main", 15000, out outTxt, out errTxt))
+                    if (!RunGitCommand(gitExe, "pull --ff-only origin main", pullTimeoutMs, out outTxt, out errTxt))
                     {
                         res.Detail = string.IsNullOrEmpty(errTxt) ? outTxt : errTxt;
                         return res;
@@ -1279,7 +1284,7 @@ namespace YtKaraokeTray
                 }
                 if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Enabled = false;
                 AppendLog("[Update] Checking GitHub (origin/main) before starting backend...");
-                var res = await SyncRepoFromGitHubAsync();
+                var res = await SyncRepoFromGitHubAsync(8000);
                 if (res.Ok && res.Updated)
                 {
                     AppendLog("[Update] Pulled latest GitHub commit (" + res.BeforeSha + " -> " + res.AfterSha + ").");
@@ -1367,12 +1372,22 @@ namespace YtKaraokeTray
                     }
 
                     if (_btnCheckUpdate != null && !IsDisposed) _btnCheckUpdate.Text = "重啟後端中...";
-                    StopBackend();
+                    await Task.Run(() => StopBackend());
                     await Task.Delay(500);
                     StartBackend();
-                    await Task.Delay(1800);
+                    bool becameOnline = false;
+                    for (int attempt = 0; attempt < 24 && !IsDisposed; attempt++)
+                    {
+                        await Task.Delay(500);
+                        string healthCheck = await HttpRequestAsync("GET", "/api/health", null, 1200, false);
+                        if (!string.IsNullOrEmpty(healthCheck))
+                        {
+                            becameOnline = true;
+                            break;
+                        }
+                    }
                     await PollAllAsync();
-                    if (_backendOnline)
+                    if (becameOnline || _backendOnline)
                     {
                         await HttpRequestAsync("POST", "/api/admin/reload-extension", "{}", 2500, true);
                     }

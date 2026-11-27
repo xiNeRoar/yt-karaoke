@@ -1699,7 +1699,7 @@ def _distribute_by_vocal_energy_cdf(
     if not ws_slice or span_e <= span_s:
         return
 
-    weights = [max(1, len(re.sub(r"\s+", "", str(w.get("word") or "")))) for w in ws_slice]
+    weights = [max(1.0, estimate_syllable_units(str(w.get("word") or ""))) for w in ws_slice]
     total_w = float(sum(weights))
 
     # Build piecewise-linear time(u) inverse CDF for u in [0, 1]
@@ -1900,6 +1900,222 @@ def _smooth_bunched_words(
     return ws
 
 
+def _redistribute_line_cluster_with_cdf(
+    cluster: list[dict],
+    span_s: float,
+    span_e: float,
+    db_profile: np.ndarray,
+    step_sec: float,
+) -> None:
+    """Redistribute a cluster of overlapping or hog-burst-crushed lines across [span_s, span_e]
+    proportional to syllable weights via cumulative vocal energy CDF, rebuilding monotonic words.
+    """
+    if not cluster or span_e <= span_s + 0.05:
+        return
+    syls = [max(1.0, estimate_syllable_units(ln.get("text", ""))) for ln in cluster]
+    total_syl = float(sum(syls))
+
+    use_cdf = False
+    if len(db_profile) >= 10 and step_sec > 0:
+        thr_db = _adaptive_vocal_threshold_db(db_profile)
+        f0 = max(0, int(span_s / step_sec))
+        f1 = min(len(db_profile), max(f0 + 1, int(np.ceil(span_e / step_sec))))
+        seg_db = db_profile[f0:f1]
+        if len(seg_db) >= 2:
+            energy = np.maximum(0.0, 10.0 ** ((seg_db - thr_db) / 20.0) - 1.0)
+            if float(np.sum(energy)) > 1e-4:
+                energy = energy + 1e-3 * float(np.mean(energy))
+                cdf = np.concatenate(([0.0], np.cumsum(energy)))
+                cdf = cdf / float(cdf[-1])
+                times = np.linspace(span_s, span_e, len(cdf))
+                use_cdf = True
+
+    def _u_to_time(u: float) -> float:
+        u = max(0.0, min(1.0, u))
+        if use_cdf:
+            return float(np.interp(u, cdf, times))
+        return span_s + (span_e - span_s) * u
+
+    acc = 0.0
+    prev_end = span_s
+    for idx, (ln, wt) in enumerate(zip(cluster, syls)):
+        u0 = acc / total_syl
+        acc += wt
+        u1 = acc / total_syl
+        ns = round(max(prev_end, _u_to_time(u0)), 2)
+        ne = round(span_e if idx == len(cluster) - 1 else _u_to_time(u1), 2)
+        if ne <= ns + 0.05:
+            ne = round(min(span_e, ns + max(0.05, (span_e - span_s) * (wt / total_syl))), 2)
+        if ne <= ns:
+            ne = round(ns + 0.05, 2)
+        ln["start"] = ns
+        ln["end"] = ne
+        prev_end = ne
+        ws = ln.get("words") or _even_words_for_line(ln.get("text", ""), ns, ne)
+        if ws:
+            _distribute_by_vocal_energy_cdf(ws, ns, ne, db_profile, step_sec)
+            ln["words"] = ws
+
+
+def _resolve_line_overlaps_and_crushes(
+    lines: list[dict],
+    db_profile: np.ndarray,
+    step_sec: float,
+    first_onset: float,
+) -> list[dict]:
+    """Structural, first-principles line-boundary conflict & line-level hog-then-burst resolver:
+
+    1. Pass A (Non-Destructive Overlap Resolution):
+       - Mild touching boundaries split cleanly at midpoint when both lines stay physically singable.
+       - Deep/inverted overlaps (e.g. mixed Stage-1 + Qwen3 window edges) expand to the contiguous
+         colliding cluster and redistribute via syllable-weighted vocal-energy CDF (eliminating 0.25s domino crushes!).
+    2. Pass B (Acoustic-Verified Line-Level Hog-Then-Burst & Active-Gap Rescue):
+       - Rescues multi-syllable lines crushed below physical singing limits (<=0.082s/syl) when either
+         an immediately adjacent active-singing dead gap exists OR a touching neighbor line hogged
+         >=1.85x the combined cluster syllable pace (strictly preserving fast rap, 1-2 syl exclamations, & held notes!).
+    """
+    n = len(lines)
+    if n < 2:
+        return lines
+
+    def _clamp_words(ln: dict) -> None:
+        ws = ln.get("words") or []
+        if not ws:
+            return
+        ls, le = float(ln["start"]), float(ln["end"])
+        prev_we = ls
+        for wi, w in enumerate(ws):
+            ws_i = max(prev_we, min(le, float(w.get("start", ls))))
+            we_i = max(ws_i, min(le, float(w.get("end", ws_i))))
+            if wi == len(ws) - 1:
+                we_i = le
+            w["start"] = round(ws_i, 2)
+            w["end"] = round(we_i, 2)
+            prev_we = we_i
+
+    # Pass A: Non-destructive overlap resolution (zero 0.25s/0.30s domino crushing!)
+    i = 0
+    while i < n - 1:
+        s0, e0 = float(lines[i]["start"]), float(lines[i]["end"])
+        s1, e1 = float(lines[i + 1]["start"]), float(lines[i + 1]["end"])
+        if e0 > s1:
+            syl0 = estimate_syllable_units(lines[i].get("text", ""))
+            syl1 = estimate_syllable_units(lines[i + 1].get("text", ""))
+            min0 = min(0.45, max(0.28, 0.08 * syl0))
+            min1 = min(0.45, max(0.28, 0.08 * syl1))
+            mid = round((e0 + s1) / 2.0, 2)
+            if s1 >= s0 and (mid - s0) >= min0 and (e1 - mid) >= min1:
+                lines[i]["end"] = mid
+                lines[i + 1]["start"] = mid
+                _clamp_words(lines[i])
+                _clamp_words(lines[i + 1])
+                i += 1
+            else:
+                a = i
+                b = i + 1
+                max_e = max(e0, e1)
+                while b + 1 < n:
+                    ns = float(lines[b + 1]["start"])
+                    ne = float(lines[b + 1]["end"])
+                    nsyl = estimate_syllable_units(lines[b + 1].get("text", ""))
+                    is_touch_crushed = (ns <= max_e + 0.15) and nsyl >= 3.0 and ((ne - ns) / nsyl) <= 0.085
+                    if ns < max_e or is_touch_crushed:
+                        b += 1
+                        max_e = max(max_e, ne)
+                    else:
+                        break
+                cluster_s = max(first_onset, min(float(x["start"]) for x in lines[a : b + 1]))
+                cluster_e = max(float(x["end"]) for x in lines[a : b + 1])
+                if cluster_e > cluster_s + 0.05:
+                    _redistribute_line_cluster_with_cdf(lines[a : b + 1], cluster_s, cluster_e, db_profile, step_sec)
+                i = b + 1
+        else:
+            i += 1
+
+    # Pass B: Acoustic-verified Line-Level Hog-Then-Burst & Active-Singing Gap Rescue
+    has_db = len(db_profile) >= 10 and step_sec > 0
+    gap_thr_db = _adaptive_vocal_threshold_db(db_profile, margin_db=-1.0) if has_db else 0.0
+
+    syls_all = [max(1.0, estimate_syllable_units(ln.get("text", ""))) for ln in lines]
+
+    def _is_crushed_line(idx: int) -> bool:
+        dur = float(lines[idx]["end"]) - float(lines[idx]["start"])
+        sy = syls_all[idx]
+        return (sy >= 3.0 and (dur / sy) <= 0.082) or (sy >= 4.0 and dur <= 0.36)
+
+    i = 0
+    while i < n:
+        if _is_crushed_line(i):
+            j = i + 1
+            while j < n and _is_crushed_line(j) and (float(lines[j]["start"]) - float(lines[j - 1]["end"])) <= 0.35:
+                j += 1
+            run_s, run_e = i, j
+            prev_end = float(lines[run_s - 1]["end"]) if run_s > 0 else first_onset
+            next_start = float(lines[run_e]["start"]) if run_e < n else float(lines[run_e - 1]["end"])
+            left_gap = float(lines[run_s]["start"]) - prev_end
+            right_gap = next_start - float(lines[run_e - 1]["end"])
+            rescued = False
+
+            # Signature 1: Contiguous active singing directly connected to crushed run across a dead gap
+            # (walks backward/forward via _contiguous_vocal_span so breath pauses before/after are preserved!)
+            span_s = float(lines[run_s]["start"])
+            span_e = float(lines[run_e - 1]["end"])
+            expanded_gap = False
+            if has_db and left_gap >= 0.45:
+                l_act, l_first, _ = _contiguous_vocal_span(
+                    db_profile, step_sec, gap_thr_db, prev_end, span_s, direction="backward", max_silent_gap=0.40
+                )
+                if l_act >= 0.40 and l_first < span_s - 0.35:
+                    span_s = max(prev_end, l_first)
+                    expanded_gap = True
+            if has_db and run_e < n and right_gap >= 0.45:
+                r_act, _, r_last = _contiguous_vocal_span(
+                    db_profile, step_sec, gap_thr_db, span_e, next_start, direction="forward", max_silent_gap=0.40
+                )
+                if r_act >= 0.40 and r_last > span_e + 0.35:
+                    span_e = min(next_start, r_last)
+                    expanded_gap = True
+            if expanded_gap and span_e > span_s + 0.25:
+                _redistribute_line_cluster_with_cdf(lines[run_s:run_e], span_s, span_e, db_profile, step_sec)
+                rescued = True
+
+            # Signature 2: Touching hogging neighbor line (e.g. L112=4.9s glued to L113-L114=0.25s each!)
+            if not rescued:
+                run_syl = sum(syls_all[run_s:run_e])
+                left_ok = False
+                right_ok = False
+                left_pace = 0.0
+                right_pace = 0.0
+                if run_s > 0 and left_gap <= 0.35:
+                    ldur = float(lines[run_s - 1]["end"]) - float(lines[run_s - 1]["start"])
+                    left_pace = ldur / syls_all[run_s - 1]
+                    comb_span_l = float(lines[run_e - 1]["end"]) - float(lines[run_s - 1]["start"])
+                    comb_pace_l = comb_span_l / (syls_all[run_s - 1] + run_syl)
+                    if comb_pace_l >= 0.13 and left_pace >= max(0.32, 1.85 * comb_pace_l):
+                        left_ok = True
+                if run_e < n and right_gap <= 0.35:
+                    rdur = float(lines[run_e]["end"]) - float(lines[run_e]["start"])
+                    right_pace = rdur / syls_all[run_e]
+                    comb_span_r = float(lines[run_e]["end"]) - float(lines[run_s]["start"])
+                    comb_pace_r = comb_span_r / (syls_all[run_e] + run_syl)
+                    if comb_pace_r >= 0.13 and right_pace >= max(0.32, 1.85 * comb_pace_r):
+                        right_ok = True
+                if left_ok or right_ok:
+                    if left_ok and (not right_ok or left_pace >= right_pace):
+                        run_s -= 1
+                    else:
+                        run_e += 1
+                    span_s = float(lines[run_s]["start"])
+                    span_e = float(lines[run_e - 1]["end"])
+                    if span_e > span_s + 0.25:
+                        _redistribute_line_cluster_with_cdf(lines[run_s:run_e], span_s, span_e, db_profile, step_sec)
+            i = max(j, run_e)
+        else:
+            i += 1
+
+    return lines
+
+
 def refine_alignment_with_acoustics(
     lines: list[dict],
     db_profile: np.ndarray,
@@ -2019,6 +2235,9 @@ def refine_alignment_with_acoustics(
         ws = ln.get("words") or []
         if ws:
             ln["words"] = _smooth_bunched_words(ws, ln["start"], ln["end"], db_profile, step_sec)
+
+    # 3B) Structural line-boundary conflict & line-level hog-then-burst resolver (zero 0.25s domino crushes!)
+    lines = _resolve_line_overlaps_and_crushes(lines, db_profile, step_sec, first_onset)
 
     # 4) Global structural post-invariants: ZERO line overlaps and ZERO out-of-bounds word timestamps!
     for i in range(len(lines)):
@@ -2249,7 +2468,7 @@ def _alignment_needs_live_rematch(
         if not is_backing:
             if dur < max(0.38, 0.08 * n_syl) or (prev_start >= 0 and not prev_was_zero and (rs - prev_start) < 0.22):
                 crushed += 1
-            if n_syl >= 4.0 and dur < 0.48:
+            if (n_syl >= 4.0 and dur < 0.48) or (n_syl >= 2.0 and dur < 0.085 * n_syl):
                 tight_run += 1
                 max_tight_run = max(max_tight_run, tight_run)
             else:
@@ -2264,8 +2483,8 @@ def _alignment_needs_live_rematch(
                 low_prob += 1
 
     low_ratio = low_prob / max(1, prob_checked)
-    min_crushed = max(4, int(round(len(segs) * 0.10)))
-    if crushed >= min_crushed or max_tight_run >= 4:
+    min_crushed = max(3, int(round(len(segs) * 0.08)))
+    if crushed >= min_crushed or max_tight_run >= 3:
         return True, f"crushed={crushed},tight_run={max_tight_run}"
     if prob_checked >= 6 and low_ratio >= low_ratio_limit:
         return True, f"low_prob={low_ratio:.2f}"
@@ -2466,19 +2685,21 @@ def _recover_missing_lines_between_anchors(
     mid_syl = sum(mid_weights)
 
     # Case 1: Clean distinct gap between cur.end and nxt.start -> preserve anchor timestamps & fill inside gap
-    if (gap_e - gap_s) >= max(0.75, 0.55 * missing_n):
+    # Enforce syllable-rate physics so Case 1 never crams 2+ multi-syllable lines into 0.25s slivers (falls through to Case 2!)
+    if (gap_e - gap_s) >= max(0.75, 0.55 * missing_n, 0.095 * mid_syl):
         act_sec, v_first, v_last = gap_act_fn(gap_s, gap_e)
-        if act_sec >= max(0.45, min(0.45 * missing_n, 0.09 * mid_syl)):
+        if act_sec >= max(0.45, 0.08 * mid_syl):
             span_s = max(gap_s, v_first)
             span_e = min(gap_e, max(span_s + 0.4, v_last))
-            out: list[dict] = []
-            acc = 0.0
-            for txt, wt in zip(mid_lines, mid_weights):
-                s_i = span_s + (span_e - span_s) * (acc / mid_syl)
-                acc += wt
-                e_i = span_s + (span_e - span_s) * (acc / mid_syl)
-                out.append({"start": round(s_i, 2), "end": round(max(s_i + 0.25, e_i), 2), "text": txt, "sim": 0.0})
-            return out, None, None
+            if (span_e - span_s) >= max(0.60, 0.095 * mid_syl):
+                out: list[dict] = []
+                acc = 0.0
+                for txt, wt in zip(mid_lines, mid_weights):
+                    s_i = span_s + (span_e - span_s) * (acc / mid_syl)
+                    acc += wt
+                    e_i = span_s + (span_e - span_s) * (acc / mid_syl)
+                    out.append({"start": round(s_i, 2), "end": round(max(s_i + 0.25, e_i), 2), "text": txt, "sim": 0.0})
+                return out, None, None
 
     # Case 2: Touching/bleeding Whisper boundaries (small dead gap) -> test TOTAL span [cur.start, nxt.end]
     # for all (missing_n + 2) lines using syllable-rate physics (>=0.12s/syl total & >=0.10s/syl active vocal)!
@@ -3251,10 +3472,10 @@ def _live_section_anchored_align(
             act_sec, v_first, _ = _contiguous_vocal_span(
                 db_profile, step_sec, gap_thr, win_s, first_item["start"], direction="backward", max_silent_gap=8.0
             )
-            if act_sec >= max(0.7, min(0.55 * lead_n, 0.10 * lead_syl)):
+            if act_sec >= max(0.7, 0.08 * lead_syl):
                 span_s = max(prev_bound, v_first)
                 span_e = first_item["start"]
-                if span_e > span_s + 0.5:
+                if (span_e - span_s) >= max(0.60, 0.095 * lead_syl):
                     acc = 0.0
                     for m_i, wt in enumerate(lead_weights):
                         s_m = span_s + (span_e - span_s) * (acc / lead_syl)
@@ -3300,10 +3521,10 @@ def _live_section_anchored_align(
             act_sec, _, v_last = _contiguous_vocal_span(
                 db_profile, step_sec, gap_thr, last_item["end"], win_e, direction="forward", max_silent_gap=8.0
             )
-            if act_sec >= max(0.7, min(0.55 * trail_n, 0.10 * trail_syl)):
+            if act_sec >= max(0.7, 0.08 * trail_syl):
                 span_s = last_item["end"]
                 span_e = min(next_bound, v_last)
-                if span_e > span_s + 0.5:
+                if (span_e - span_s) >= max(0.60, 0.095 * trail_syl):
                     acc = 0.0
                     for m_i, wt in enumerate(trail_weights):
                         s_m = span_s + (span_e - span_s) * (acc / trail_syl)
@@ -3701,8 +3922,8 @@ def refine_lines_with_qwen3(
                     squished += 1
                 if is_exploded:
                     exploded += 1
-                # Per-line protection: never replace a healthy Stage-1 line with a Qwen3 collapse or interlude blow-up!
-                if (is_squished and orig_dur >= 0.65) or is_exploded:
+                # Per-line protection: never replace a Stage-1 line with a Qwen3 collapse or interlude blow-up!
+                if (is_squished and (orig_dur >= 0.65 or q_dur < orig_dur * 0.75)) or is_exploded:
                     continue
                 abs_s = round(max(first_onset, w_t0 + local_s), 2)
                 abs_e = round(max(abs_s + 0.35, w_t0 + local_e), 2)
@@ -3725,25 +3946,8 @@ def refine_lines_with_qwen3(
         if refined_windows == 0 or (require_all_windows and refined_windows < len(windows)):
             return lines, False
 
-        # Ensure strict monotonic NON-OVERLAPPING line boundaries across window edges AND clamp inner words!
-        for i in range(1, len(refined)):
-            if refined[i]["start"] < refined[i - 1]["end"]:
-                mid = round((refined[i - 1]["end"] + refined[i]["start"]) / 2.0, 2)
-                new_prev_e = max(round(refined[i - 1]["start"] + 0.25, 2), mid)
-                refined[i - 1]["end"] = new_prev_e
-                if refined[i - 1].get("words"):
-                    ps = refined[i - 1]["start"]
-                    for w in refined[i - 1]["words"]:
-                        w["start"] = round(max(ps, min(new_prev_e, float(w["start"]))), 3)
-                        w["end"] = round(max(w["start"], min(new_prev_e, float(w["end"]))), 3)
-                refined[i]["start"] = max(new_prev_e, refined[i]["start"])
-                refined[i]["end"] = max(round(refined[i]["start"] + 0.30, 2), refined[i]["end"])
-                if refined[i].get("words"):
-                    cs, ce = refined[i]["start"], refined[i]["end"]
-                    for w in refined[i]["words"]:
-                        w["start"] = round(max(cs, min(ce, float(w["start"]))), 3)
-                        w["end"] = round(max(w["start"], min(ce, float(w["end"]))), 3)
-
+        # Resolve window-edge overlaps & line-level hog-then-burst crushes WITHOUT 0.25s domino clamping!
+        refined = _resolve_line_overlaps_and_crushes(refined, db_profile, step_sec, first_onset)
         refined = refine_alignment_with_acoustics(refined, db_profile, step_sec, audio_dur, first_onset, conservative=True)
         print(f"[Lyrics] Qwen3-ForcedAligner refined {refined_windows}/{len(windows)} windows ({len(refined)} lines)", file=sys.stderr, flush=True)
         return refined, True

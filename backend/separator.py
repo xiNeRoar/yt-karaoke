@@ -97,7 +97,9 @@ class KaraokeSeparatorManager:
         self._lyrics_gdrive_missing: "OrderedDict[str, float]" = OrderedDict()
         self._lyrics_missing_max = 2000
         self._lyrics_in_progress: set[str] = set()
-        self._lyrics_upload_gen: Dict[str, int] = {}
+        self._lyrics_upload_gen: "OrderedDict[str, int]" = OrderedDict()
+        self._lyrics_upload_gen_max = 2000
+        self._lyrics_upload_epoch: int = 0
         self._hq_upgrade_backoff: Dict[str, float] = {}
         self._hq_upgrade_min_vram_mb = int(os.environ.get("KARAOKE_HQ_UPGRADE_VRAM_MB", "3500"))
 
@@ -1078,6 +1080,7 @@ class KaraokeSeparatorManager:
             with self._lock:
                 self._lyrics_mem_cache.pop(video_id, None)
                 self._lyrics_gdrive_missing.pop(video_id, None)
+                self._bump_lyrics_upload_gen(video_id)
                 for m in ([mode] if mode else list(MODELS.keys())):
                     self._hq_upgrade_backoff.pop(self._job_key(video_id, m), None)
             for jf in (self._lyrics_status_file(video_id), self._status_file(video_id, mode or "pure")):
@@ -1096,6 +1099,8 @@ class KaraokeSeparatorManager:
             with self._lock:
                 self._lyrics_mem_cache.clear()
                 self._lyrics_gdrive_missing.clear()
+                self._lyrics_upload_gen.clear()
+                self._lyrics_upload_epoch += 1
                 self._hq_upgrade_backoff.clear()
             for jf in JOBS_DIR.glob("*.json"):
                 try:
@@ -1105,6 +1110,15 @@ class KaraokeSeparatorManager:
         return removed
 
     # -------------------- 3-Layer Hybrid Lyrics (On-Demand) --------------------
+    def _bump_lyrics_upload_gen(self, video_id: str) -> int:
+        """Increment & LRU-bound per-video lyrics upload generation token (must be called under self._lock)."""
+        nxt = self._lyrics_upload_gen.get(video_id, 0) + 1
+        self._lyrics_upload_gen[video_id] = nxt
+        self._lyrics_upload_gen.move_to_end(video_id)
+        while len(self._lyrics_upload_gen) > self._lyrics_upload_gen_max:
+            self._lyrics_upload_gen.popitem(last=False)
+        return nxt
+
     def _lyrics_file(self, video_id: str) -> Path:
         return self.cache_dir / video_id / "lyrics.json"
 
@@ -1200,6 +1214,7 @@ class KaraokeSeparatorManager:
             if force_ai:
                 self._lyrics_mem_cache.pop(video_id, None)
                 self._lyrics_gdrive_missing.pop(video_id, None)
+                self._bump_lyrics_upload_gen(video_id)
                 try:
                     self._lyrics_file(video_id).unlink(missing_ok=True)
                 except Exception:
@@ -1389,8 +1404,8 @@ class KaraokeSeparatorManager:
                             orig_mtime_ns = 0
                         if snap_file is not None:
                             with self._lock:
-                                my_gen = self._lyrics_upload_gen.get(video_id, 0) + 1
-                                self._lyrics_upload_gen[video_id] = my_gen
+                                my_gen = self._bump_lyrics_upload_gen(video_id)
+                                my_epoch = self._lyrics_upload_epoch
 
                             def _bg_upload_lyrics(
                                 vid=video_id,
@@ -1399,13 +1414,14 @@ class KaraokeSeparatorManager:
                                 snap=snap_file,
                                 mtime_ns=orig_mtime_ns,
                                 gen=my_gen,
+                                epoch=my_epoch,
                                 ev=upload_done_event,
                             ):
                                 try:
                                     if ev is not None:
-                                        ev.wait(timeout=180.0)
+                                        ev.wait(timeout=320.0)
                                     with self._lock:
-                                        if self._lyrics_upload_gen.get(vid) != gen:
+                                        if self._lyrics_upload_epoch != epoch or self._lyrics_upload_gen.get(vid) != gen:
                                             return
                                     if not self.gdrive.has_song(vid, m):
                                         return

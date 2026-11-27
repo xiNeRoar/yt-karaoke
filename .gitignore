@@ -28,6 +28,10 @@ backend/tmp/
 # Built binaries & release zips
 tray-app/*.exe
 tray-app/*.ico
+YouTube AI*.exe
 extension-prod/
 store-assets/
 *.zip
+
+# Accidental external tool screenshot dumps
+public/assets/aistudio/
