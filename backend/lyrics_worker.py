@@ -144,6 +144,9 @@ def _release_torch_vram() -> None:
         pass
 
 
+WHISPER_MIN_VRAM_MB = 3200  # large-v3-turbo float16 weights (~2.34 GB) + KV cache (~0.85 GB) before WDDM PCIe spill
+
+
 def _whisper_load_kwargs(dev: str, local_files_only: bool = False) -> dict:
     """Shared faster-whisper/stable-ts model kwargs with multi-core CPU thread scaling."""
     ctype = "float16" if dev == "cuda" else "int8"
@@ -2076,6 +2079,61 @@ def _map_comp_to_real(
     return mapping[-1][3]
 
 
+def build_batched_clip_timestamps(
+    comp_time_map: list[tuple[float, float, float, float]],
+    db_prof: np.ndarray,
+    step_s: float,
+    total_comp_sec: float,
+    max_clip_sec: float = 28.0,
+) -> list[dict[str, float]]:
+    """Partition silence-collapsed audio into <=max_clip_sec chunks for BatchedInferencePipeline.
+
+    Splits long continuous vocal islands at local RMS energy troughs (mapped back to real time via
+    comp_time_map) so every chunk fits safely inside Whisper's 30s window without VAD dropping falsetto.
+    """
+    clips: list[dict[str, float]] = []
+    if not comp_time_map:
+        cur = 0.0
+        while cur + 0.20 < total_comp_sec:
+            nxt = min(total_comp_sec, cur + max_clip_sec)
+            if total_comp_sec - nxt < 0.50 and (nxt - cur) > 1.0:
+                nxt = total_comp_sec
+            clips.append({"start": round(cur, 3), "end": round(nxt, 3)})
+            cur = nxt
+        return clips
+
+    for cs, ce, rs, _ in comp_time_map:
+        if ce - cs < 0.20:
+            continue
+        if ce - cs <= max_clip_sec:
+            clips.append({"start": round(cs, 3), "end": round(ce, 3)})
+            continue
+
+        cur_cs = cs
+        while ce - cur_cs > max_clip_sec:
+            lo_t = cur_cs + max(0.50, 0.45 * max_clip_sec)
+            hi_t = min(cur_cs + max_clip_sec, ce - 0.50)
+            if hi_t <= lo_t:
+                cut_cs = min(cur_cs + max_clip_sec, max(cur_cs + 0.50, ce - 0.50))
+            elif len(db_prof) > 0 and step_s > 0:
+                real_lo = rs + (lo_t - cs)
+                real_hi = rs + (hi_t - cs)
+                i0 = max(0, int(real_lo / step_s))
+                i1 = min(len(db_prof), int(real_hi / step_s) + 1)
+                if i1 > i0:
+                    best_i = i0 + int(np.argmin(db_prof[i0:i1]))
+                    cut_cs = max(lo_t, min(hi_t, cs + ((best_i + 0.5) * step_s - rs)))
+                else:
+                    cut_cs = hi_t
+            else:
+                cut_cs = hi_t
+            clips.append({"start": round(cur_cs, 3), "end": round(cut_cs, 3)})
+            cur_cs = cut_cs
+        if ce - cur_cs >= 0.20:
+            clips.append({"start": round(cur_cs, 3), "end": round(ce, 3)})
+    return clips
+
+
 def _distribute_by_vocal_energy_cdf(
     ws_slice: list[dict],
     span_s: float,
@@ -3261,17 +3319,27 @@ def _live_section_anchored_align(
         try:
             from faster_whisper import BatchedInferencePipeline, WhisperModel
             if isinstance(model, WhisperModel):
-                batched = BatchedInferencePipeline(model=model)
-                b_segs, _ = batched.transcribe(
-                    comp_audio,
-                    language=transcribe_lang,
-                    batch_size=8,
-                    beam_size=2,
-                    vad_filter=False,
-                    word_timestamps=True,
-                    condition_on_previous_text=False,
-                )
-                raw_segments = list(b_segs)
+                total_comp_sec = (len(comp_audio) / 16000.0) if isinstance(comp_audio, np.ndarray) else 0.0
+                clip_ts = build_batched_clip_timestamps(comp_time_map, db_profile, step_sec, total_comp_sec)
+                if clip_ts:
+                    batched = getattr(model, "batch_inference_pipeline", None) or BatchedInferencePipeline(model=model)
+                    b_segs, _ = batched.transcribe(
+                        comp_audio,
+                        language=transcribe_lang,
+                        batch_size=8,
+                        beam_size=2,
+                        vad_filter=False,
+                        clip_timestamps=clip_ts,
+                        without_timestamps=False,
+                        word_timestamps=True,
+                        multilingual=is_mixed_lang_medley,
+                        condition_on_previous_text=False,
+                        repetition_penalty=1.15,
+                        no_repeat_ngram_size=3,
+                        compression_ratio_threshold=2.0,
+                        no_speech_threshold=0.65,
+                    )
+                    raw_segments = list(b_segs)
         except Exception as _be:
             print(f"[Lyrics] Batched GPU transcribe fallback: {_be}", flush=True)
             raw_segments = []
@@ -3281,8 +3349,15 @@ def _live_section_anchored_align(
             comp_audio,
             language=transcribe_lang,
             beam_size=2 if use_cuda else 1,
+            temperature=0.0,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            compression_ratio_threshold=2.0,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.65,
             vad=False,
             suppress_silence=False,
+            regroup=False,
             condition_on_previous_text=False,
             verbose=False,
         )
@@ -3800,7 +3875,7 @@ def _live_section_anchored_align(
                         "\n".join(pl_cur),
                         language=_whisper_align_lang(s_lang),
                         original_split=True,
-                        fast_mode=(not use_cuda),
+                        fast_mode=True,
                         verbose=False,
                     )
                 except Exception:
@@ -3981,7 +4056,7 @@ def _live_section_anchored_align(
                     blk_text,
                     language=_whisper_align_lang(blk_lang),
                     original_split=True,
-                    fast_mode=(not use_cuda),
+                    fast_mode=True,
                     verbose=False,
                 )
                 al_segs = list(al.segments or [])
@@ -4112,20 +4187,20 @@ def _detect_cantonese_vs_mandarin_audio(
                 if preloaded_model is not None:
                     if hasattr(preloaded_model, "transcribe_original"):
                         _, info = preloaded_model.transcribe_original(
-                            clip, beam_size=1, vad_filter=False, condition_on_previous_text=False
+                            clip, beam_size=1, temperature=0.0, vad_filter=False, condition_on_previous_text=False
                         )
                         det = (getattr(info, "language", "") or "").lower()
                     else:
                         res_id = preloaded_model.transcribe(
-                            clip, beam_size=1, vad=False, condition_on_previous_text=False, verbose=False
+                            clip, beam_size=1, temperature=0.0, vad=False, condition_on_previous_text=False, verbose=False
                         )
                         det = (getattr(res_id, "language", "") or "").lower()
                 else:
                     add_nvidia_dll_dirs()
                     free_mb = query_free_vram_mb()
-                    dev = "cuda" if free_mb >= 2000 else "cpu"
+                    dev = "cuda" if free_mb >= WHISPER_MIN_VRAM_MB else "cpu"
                     m_owned = _load_faster_whisper_model(dev)
-                    _, info = m_owned.transcribe(clip, beam_size=1, vad_filter=False, condition_on_previous_text=False)
+                    _, info = m_owned.transcribe(clip, beam_size=1, temperature=0.0, vad_filter=False, condition_on_previous_text=False)
                     det = (getattr(info, "language", "") or "").lower()
                 if det == "yue":
                     return "yue"
@@ -5569,7 +5644,7 @@ def align_official_lyrics_with_stable_ts(
     add_nvidia_dll_dirs()
 
     free_mb = query_free_vram_mb()
-    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
+    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= WHISPER_MIN_VRAM_MB)
     lang = detect_lyrics_language(official_lines, sub_lang=sub_lang or meta_lang)
     whisper_lang = _whisper_align_lang(lang)
     text_block = "\n".join(official_lines)
@@ -5724,7 +5799,7 @@ def fast_probe_transcribe_for_rescue(
         return []
 
     free_mb = query_free_vram_mb()
-    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
+    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= WHISPER_MIN_VRAM_MB)
     # Never inject Cantonese prompt on Japanese Kanji or Korean titles!
     is_zh_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or "")) and not _is_non_chinese_cjk(title_hint or "")
     prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_zh_title else None
@@ -5774,7 +5849,7 @@ def fallback_free_transcribe(
     add_nvidia_dll_dirs()
 
     free_mb = query_free_vram_mb()
-    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= 2000)
+    use_cuda = (device_mode != "cpu") and (device_mode == "gpu" or free_mb >= WHISPER_MIN_VRAM_MB)
     # Never inject Cantonese prompt on Japanese Kanji or Korean titles!
     is_zh_title = bool(re.search(r"[\u4e00-\u9fff]", title_hint or "")) and not _is_non_chinese_cjk(title_hint or "")
     prompt = f"以下係繁體中文歌詞：{clean_search_title(title_hint)}" if is_zh_title else None
@@ -5790,9 +5865,37 @@ def fallback_free_transcribe(
     def _run(dev: str):
         m = _load_faster_whisper_model(dev)
         try:
+            if dev == "cuda" and isinstance(transcribe_input, np.ndarray) and len(transcribe_input) > 0:
+                try:
+                    from faster_whisper import BatchedInferencePipeline
+                    clip_ts = build_batched_clip_timestamps(
+                        comp_time_map, db_profile, step_sec, len(transcribe_input) / 16000.0
+                    )
+                    if clip_ts:
+                        batched = BatchedInferencePipeline(model=m)
+                        segs, inf = batched.transcribe(
+                            transcribe_input,
+                            batch_size=8,
+                            beam_size=2,
+                            vad_filter=False,
+                            clip_timestamps=clip_ts,
+                            without_timestamps=False,
+                            word_timestamps=True,
+                            initial_prompt=prompt,
+                            repetition_penalty=1.15,
+                            no_repeat_ngram_size=3,
+                            no_speech_threshold=0.65,
+                            log_prob_threshold=-1.0,
+                            compression_ratio_threshold=2.0,
+                            condition_on_previous_text=False,
+                        )
+                        return list(segs), inf
+                except Exception:
+                    pass
             segs, inf = m.transcribe(
                 transcribe_input,
                 beam_size=2 if dev == "cpu" else 5,
+                temperature=(0.0, 0.2),
                 word_timestamps=True,
                 vad_filter=False,
                 initial_prompt=prompt,

@@ -1364,6 +1364,37 @@ def test_cross_chorus_overlay_paren_and_safeguard_invariants() -> None:
     print("[PASS] Cross-chorus M1/M2h/M3 invariants (speaker skip, overlay-paren physics, slow-outro guard, interlude guard, tail & burst rescue)")
 
 
+def test_batched_clip_timestamps_and_vram_guard() -> None:
+    import numpy as np
+    import lyrics_worker as lw
+
+    # 1) Long continuous vocal island (>28s) must be split at local RMS troughs with every clip <=28s & >=0.5s!
+    db_prof = np.full(1000, -14.0, dtype=np.float32)  # 100s @ 0.1s/step
+    db_prof[218:222] = -38.0  # vocal breath trough at 21.8s..22.2s
+    db_prof[470:475] = -39.0  # vocal breath trough at 47.0s..47.5s
+    tmap = [(0.0, 68.0, 5.0, 73.0), (68.35, 80.35, 82.0, 94.0)]
+    clips = lw.build_batched_clip_timestamps(tmap, db_prof, 0.1, 80.35, max_clip_sec=28.0)
+    assert len(clips) >= 4, f"Expected >=4 clips after splitting 68s island, got {clips}"
+    for c in clips:
+        dur = c["end"] - c["start"]
+        assert 0.5 <= dur <= 28.0 + 1e-6, f"Clip violates <=28s / >=0.5s invariant: {c}"
+    # First cut should snap near the real-time trough at 22.0s -> comp time 17.0s (22.0 - 5.0)
+    assert 16.5 <= clips[0]["end"] <= 17.5, f"Expected trough split near 17.0s, got {clips[0]}"
+    assert abs(clips[-1]["start"] - 68.35) < 1e-3 and abs(clips[-1]["end"] - 80.35) < 1e-3
+
+    # 2) Empty comp_time_map fallback cleanly partitions [0, total_comp_sec]
+    fb_clips = lw.build_batched_clip_timestamps([], np.array([], dtype=np.float32), 0.1, 65.0, max_clip_sec=28.0)
+    assert len(fb_clips) == 3 and all(0.5 <= (c["end"] - c["start"]) <= 28.0 for c in fb_clips), f"Fallback clips invalid: {fb_clips}"
+
+    # 3) Source invariants: BatchedInferencePipeline clip_timestamps + anti-loop fallback + 3200MB Whisper VRAM guard
+    lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
+    sep_src = (BACKEND / "separator.py").read_text(encoding="utf-8")
+    assert "clip_timestamps=clip_ts" in lw_src and "without_timestamps=False" in lw_src
+    assert "temperature=0.0" in lw_src and "no_repeat_ngram_size=3" in lw_src
+    assert "WHISPER_MIN_VRAM_MB = 3200" in lw_src and "free_mb < 3200" in sep_src
+    print("[PASS] Batched clip_timestamps trough splitting, anti-loop fallback & 3200MB WDDM VRAM guard")
+
+
 def main() -> int:
     test_python_compile_and_ast()
     test_extension_js_syntax()
@@ -1378,6 +1409,7 @@ def main() -> int:
     test_line_overlap_hog_burst_and_cross_layer_fixes()
     test_tier0_yrc_and_stage2_ctc_invariants()
     test_cross_chorus_overlay_paren_and_safeguard_invariants()
+    test_batched_clip_timestamps_and_vram_guard()
     test_question_mark_sanitization_ui_and_security_invariants()
     test_word_bunching_deglitcher()
     test_silence_collapse_and_mapping()

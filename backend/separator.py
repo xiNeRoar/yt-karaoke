@@ -1353,11 +1353,14 @@ class KaraokeSeparatorManager:
                     self._active_procs[key] = proc
 
                 dur_sec = float(meta.get("duration") or 0.0)
-                is_cpu_lyrics = (eff_mode == "cpu") or (not has_gpu) or (free_mb < 2000)
+                is_cpu_lyrics = (eff_mode == "cpu") or (not has_gpu) or (free_mb < 3200)
                 if is_cpu_lyrics:
-                    lyrics_timeout = max(480, min(1800, int(dur_sec * 3.0) + 120)) if dur_sec > 0 else 720
+                    lyrics_timeout = max(600, min(2100, int(dur_sec * 3.5) + 150)) if dur_sec > 0 else 900
+                elif free_mb < 6500:
+                    # Contended GPU (shared with another app) may run 2-3x slower or fall back to CPU mid-worker
+                    lyrics_timeout = max(540, min(1500, int(dur_sec * 2.8) + 150)) if dur_sec > 0 else 720
                 else:
-                    lyrics_timeout = max(240, min(900, int(dur_sec * 1.5) + 60)) if dur_sec > 0 else 480
+                    lyrics_timeout = max(360, min(1200, int(dur_sec * 2.2) + 120)) if dur_sec > 0 else 600
                 try:
                     stderr_text, _ = proc.communicate(timeout=lyrics_timeout)
                 except subprocess.TimeoutExpired:
