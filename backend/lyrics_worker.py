@@ -1003,12 +1003,14 @@ def _track_matches_title(
             return 2.0
         if len(v_norm) == 1:
             # Allow famous 1-char CJK song titles (e.g. MC 張天賦-抽, 張國榮-紅, 追, 默, 恋) ONLY when artist matches AND token is isolated!
+            # Strictly score BELOW 2-char+ CJK matches (1.18 < 1.42) so a 1-char concert-tour word (e.g. '【念 演唱會】... - 凡星')
+            # NEVER hijacks an actual 2-char song title by the same artist!
             if artist_matched and has_cjk_v:
                 if re.search(
                     rf"(?:^|[\s《》「」『』【】\[\]()（）［］\-—–/|｜'\"‘’]){re.escape(v_norm)}(?:$|[\s《》「」『』【】\[\]()（）［］\-—–/|｜'\"‘’])",
                     y_simp,
                 ):
-                    return 1.45
+                    return 1.18
             return 0.0
         if is_pure_latin_num and len(v_norm) <= 6:
             # Short Latin/numeric titles (505, 1874, 2002, Hello, One) MUST match on word boundaries;

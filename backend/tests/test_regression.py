@@ -1449,7 +1449,16 @@ def test_cpu_thread_cap_hq_yield_and_credit_dedup() -> None:
     lw_src = (BACKEND / "lyrics_worker.py").read_text(encoding="utf-8")
     assert "def _is_duplicate_pool" in lw_src and "not _is_duplicate_pool(r_pool, song_pools)" in lw_src
     assert "_apply_cpu_thread_limits()" in lw_src
-    print("[PASS] CPU thread cap (PyTorch+ONNX+Whisper), HQ mid-song yield, credit filter & duplicate-pool guard")
+
+    # 5) Information-theoretic title specificity: 2-char CJK song title MUST strictly outscore a 1-char tour/concert word
+    # (e.g. '【念 演唱會 現場直擊！】 陳蕾 Panther Chan - 凡星' must match '凡星', NEVER '念'!), while 1-char '抽' still works!
+    tour_title = "【念 演唱會 現場直擊！】 陳蕾 Panther Chan - 凡星"
+    sc_wrong_1c = lw._track_matches_title("念", "陈蕾", tour_title)
+    sc_right_2c = lw._track_matches_title("凡星", "陈蕾", tour_title)
+    assert sc_right_2c > sc_wrong_1c + 0.15, f"2-char title '凡星' ({sc_right_2c}) must strictly beat 1-char tour word '念' ({sc_wrong_1c})"
+    sc_chou = lw._track_matches_title("抽", "MC 张天赋", "MC 張天賦 - 抽 Inhale (Official Music Video)")
+    assert sc_chou >= 1.5, f"1-char CJK title '抽' must still score strongly when artist matches: {sc_chou}"
+    print("[PASS] CPU thread cap (PyTorch+ONNX+Whisper), HQ mid-song yield, credit filter, dedup & 1-char specificity")
 
 
 def main() -> int:
