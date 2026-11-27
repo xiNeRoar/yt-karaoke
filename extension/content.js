@@ -835,7 +835,7 @@
     const baseEl = el("span", { className: "ktv-layer-base" });
     const fillEl = el("span", { className: "ktv-layer-fill" });
     const wrap = el("div", { className: "ktv-sweep-wrap" }, [baseEl, fillEl]);
-    return { wrap, baseEl, fillEl, lastText: "" };
+    return { wrap, baseEl, fillEl, lastText: "", lastSpeaker: "" };
   }
 
   function ensureLyricsOverlay() {
@@ -1012,11 +1012,29 @@
         .replace(/\s+/g, " ")
         .trim();
 
+    // Backward-compatibility fallback for older cached duet lyrics that still have raw '男：'/'女：'/'合：' prefixes
+    const hasExplicitSpeakerMeta = rawLines.some((l) => l && typeof l.speaker === "string" && l.speaker);
+    const LEGACY_SPK_RE = /^\s*[\(（]?\s*(男聲?|女聲?|合唱?|齊|男女合?|Male|Female|All|Both|Chorus)\s*[:：]\s*/i;
+    const legacySpkRole = (lbl) => {
+      const k = String(lbl || "").trim().toLowerCase();
+      if (k.startsWith("男") && !k.includes("女")) return "male";
+      if (k === "male") return "male";
+      if (k.startsWith("女") && !k.includes("男")) return "female";
+      if (k === "female") return "female";
+      return "all";
+    };
+    const enableLegacySpkClean =
+      !hasExplicitSpeakerMeta &&
+      rawLines.filter((l) => l && l.text && LEGACY_SPK_RE.test(String(l.text))).length >= 2;
+    let legacyCurSpeaker = "";
+
     for (const line of rawLines) {
-      const text = stripQuestionMarks(line && line.text ? String(line.text) : "");
+      let text = stripQuestionMarks(line && line.text ? String(line.text) : "");
       if (!text) continue;
       const start = Number(line.start) || 0;
       const end = Math.max(start + 0.3, Number(line.end) || start + 3);
+      const duetTrack = line && typeof line.duet_track === "string" ? line.duet_track : "";
+      let speaker = line && typeof line.speaker === "string" ? line.speaker : "";
       const rawWords = Array.isArray(line.words) ? line.words : [];
       const words = [];
       for (const w of rawWords) {
@@ -1024,10 +1042,27 @@
         if (!cleanW) continue;
         words.push({ ...w, word: cleanW });
       }
+      if (enableLegacySpkClean) {
+        const mSp = text.match(LEGACY_SPK_RE);
+        if (mSp) {
+          const rSp = legacySpkRole(mSp[1]);
+          speaker = rSp;
+          if (duetTrack !== "counter") legacyCurSpeaker = rSp;
+          const unwrapped = text.replace(/^\s*[\(（]\s*/, "").replace(/\s*[\)）]\s*$/, "");
+          text = unwrapped.replace(LEGACY_SPK_RE, "").trim() || text;
+          while (words.length > 0 && /[:：]$/.test(words[0].word || "")) {
+            words.shift();
+          }
+        } else if (legacyCurSpeaker) {
+          speaker = legacyCurSpeaker;
+        }
+      }
       const cjk = isCjkText(text);
+      // Keep simultaneous duet pairs intact on a single KTV row up to 12 CJK units so top/bottom pairing never splits
+      const effMaxCjk = duetTrack === "lead" || duetTrack === "counter" ? Math.max(maxCjkUnits, 12.0) : maxCjkUnits;
 
       let subTexts = [text];
-      if (cjk && visualUnits(text) > maxCjkUnits) {
+      if (cjk && visualUnits(text) > effMaxCjk) {
         const charMap = buildCharWordMap(words);
         const rawPieces = text
           .split(/[\s,，、；;]+/)
@@ -1038,8 +1073,8 @@
         const atomPieces = [];
         let cursor = 0;
         for (const p of rawPieces) {
-          if (visualUnits(p) > maxCjkUnits) {
-            const broken = splitLongCjkPiece(p, cursor, charMap, maxCjkUnits);
+          if (visualUnits(p) > effMaxCjk) {
+            const broken = splitLongCjkPiece(p, cursor, charMap, effMaxCjk);
             for (const b of broken) atomPieces.push(b);
           } else {
             atomPieces.push(p);
@@ -1047,18 +1082,18 @@
           cursor += p.length;
         }
 
-        // Greedily combine short adjacent phrases ONLY when combined fits cleanly within maxCjkUnits
+        // Greedily combine short adjacent phrases ONLY when combined fits cleanly within effMaxCjk
         subTexts = [];
         for (const p of atomPieces) {
-          if (subTexts.length > 0 && visualUnits(`${subTexts[subTexts.length - 1]} ${p}`) <= maxCjkUnits) {
+          if (subTexts.length > 0 && visualUnits(`${subTexts[subTexts.length - 1]} ${p}`) <= effMaxCjk) {
             subTexts[subTexts.length - 1] = `${subTexts[subTexts.length - 1]} ${p}`;
           } else {
             subTexts.push(p);
           }
         }
-      } else if (!cjk && visualUnits(text) > maxCjkUnits * 1.45) {
+      } else if (!cjk && visualUnits(text) > effMaxCjk * 1.45) {
         const toks = text.split(/\s+/).filter(Boolean);
-        const enBudget = maxCjkUnits * 1.4;
+        const enBudget = effMaxCjk * 1.4;
         subTexts = [];
         let cur = "";
         for (const tk of toks) {
@@ -1074,7 +1109,7 @@
       }
 
       if (subTexts.length <= 1) {
-        out.push({ start, end, text, words });
+        out.push({ start, end, text, words, speaker, duetTrack });
         continue;
       }
 
@@ -1125,6 +1160,8 @@
           end: Math.round(subEnd * 100) / 100,
           text: stxt,
           words: subWords,
+          speaker,
+          duetTrack: "",
         });
       }
     }
@@ -1138,7 +1175,11 @@
         out[i].ktvSlot = 0;
         out[i].isSectionStart = true;
       } else {
-        const gap = out[i].start - out[i - 1].end;
+        const prevEnd =
+          i >= 2 && out[i - 1].duetTrack === "counter" && out[i - 2].duetTrack === "lead"
+            ? Math.max(out[i - 1].end, out[i - 2].end)
+            : out[i - 1].end;
+        const gap = out[i].start - prevEnd;
         if (gap >= KTV_INTERLUDE_GAP_SEC) {
           out[i - 1].isSectionEnd = true;
           out[i].isSectionStart = true;
@@ -1218,7 +1259,13 @@
     return Math.max(0, Math.min(1, (now - line.start) / dur));
   }
 
-  function setSlotContent(slot, text, progress) {
+  function setSlotContent(slot, text, progress, speaker = "") {
+    const spk = text ? String(speaker || "") : "";
+    if (slot.lastSpeaker !== spk) {
+      if (spk) slot.wrap.dataset.speaker = spk;
+      else delete slot.wrap.dataset.speaker;
+      slot.lastSpeaker = spk;
+    }
     if (!text) {
       if (slot.lastText !== "") {
         slot.baseEl.textContent = "";
@@ -1349,21 +1396,25 @@
     ov.root.classList.add("visible");
     ov.statusEl.textContent = "";
 
-    // Update 3-2-1 KTV intro countdown dots
+    // Update 3-2-1 KTV intro countdown dots (matches upcoming singer color in HK KTV duets!)
     if (countdownSec > 0) {
+      const cdSpk = nextUpcomingIdx >= 0 && lines[nextUpcomingIdx] ? String(lines[nextUpcomingIdx].speaker || "") : "";
+      if (cdSpk) ov.countdownEl.dataset.speaker = cdSpk;
+      else delete ov.countdownEl.dataset.speaker;
       ov.countdownEl.classList.add("active");
       ov.cdDots[0].classList.toggle("lit", countdownSec <= 3.0);
       ov.cdDots[1].classList.toggle("lit", countdownSec <= 2.0);
       ov.cdDots[2].classList.toggle("lit", countdownSec <= 1.0);
     } else {
       ov.countdownEl.classList.remove("active");
+      delete ov.countdownEl.dataset.speaker;
     }
 
     const topLine = topIdx >= 0 ? lines[topIdx] : null;
     const bottomLine = bottomIdx >= 0 ? lines[bottomIdx] : null;
 
-    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0);
-    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0);
+    setSlotContent(ov.topSlot, topLine ? topLine.text : "", topLine ? computeLineSweepProgress(topLine, now) : 0, topLine ? topLine.speaker : "");
+    setSlotContent(ov.bottomSlot, bottomLine ? bottomLine.text : "", bottomLine ? computeLineSweepProgress(bottomLine, now) : 0, bottomLine ? bottomLine.speaker : "");
   }
 
   let lyricsReqSeq = 0;

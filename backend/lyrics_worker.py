@@ -393,9 +393,12 @@ def _strip_lyric_question_marks(text: str) -> str:
 
 
 def _sanitize_lyric_lines_output(lines: list[dict]) -> list[dict]:
-    """Enforce clean KTV display text on every emitted line & word across all exit paths (zero '?' / '？')."""
+    """Enforce clean KTV display text on every emitted line & word across all exit paths
+    (zero '?' / '？' and authentic HK KTV speaker color-coding without raw '男：'/'女：' prefixes).
+    """
+    cleaned = _normalize_duet_speakers_and_clean_text(list(lines or []))
     out: list[dict] = []
-    for ln in (lines or []):
+    for ln in cleaned:
         clean_t = _strip_lyric_question_marks(str(ln.get("text") or ""))
         if not clean_t:
             continue
@@ -1007,7 +1010,7 @@ def _verify_and_shift_yrc_against_vocals(
         )
         return None
 
-    # All 5 strict gates PASSED -> emit shifted studio word-level YRC!
+    # All 5 strict gates PASSED -> emit shifted studio word-level YRC (clean HK KTV speaker roles)!
     out_lines: list[dict] = []
     for ln in yrc_lines:
         ns = round(max(0.0, float(ln["start"]) + best_shift), 2)
@@ -1022,6 +1025,8 @@ def _verify_and_shift_yrc_against_vocals(
 
     if len(out_lines) < 6:
         return None
+    out_lines = _normalize_duet_speakers_and_clean_text(out_lines, audio_16k=audio_16k)
+    out_lines = _enforce_strict_monotonic_bounds(out_lines, first_onset, audio_dur)
     print(
         f"[Lyrics] Tier 0 NetEase YRC VERIFIED (shift={best_shift:+.2f}s, "
         f"word_hit={overall_word_hit:.2f}, vocal_hit={active_vocal_hit_ratio:.2f}, {len(out_lines)} lines)",
@@ -5623,6 +5628,237 @@ def _expand_and_align_duet_counterpoint(
     return final_lines, duet_pairs
 
 
+_DUET_MALE_KEYS = {"男", "男聲", "男声", "male", "m", "man", "boy", "先生"}
+_DUET_FEMALE_KEYS = {"女", "女聲", "女声", "female", "f", "woman", "girl", "小姐"}
+_DUET_ALL_KEYS = {"合", "合唱", "齊", "齐", "男女", "男女合", "all", "both", "together", "chorus", "duet"}
+
+
+def _norm_speaker_key(raw_label: str) -> str:
+    return re.sub(r"[:：\s]+", "", str(raw_label or "")).strip().lower()
+
+
+def _estimate_segment_pitch_hz(audio_16k: np.ndarray, start_s: float, end_s: float) -> Optional[float]:
+    """Fast pure-numpy autocorrelation F0 estimator (85-550 Hz) for distinguishing Male vs Female
+    named-singer tracks (e.g. '克：' vs '容：') with zero hardcoded artist names!
+    """
+    if audio_16k is None or len(audio_16k) < 1600:
+        return None
+    i0 = max(0, int(round(start_s * 16000)))
+    i1 = min(len(audio_16k), int(round(end_s * 16000)))
+    seg = audio_16k[i0:i1]
+    win = 640   # 40ms @ 16kHz
+    hop = 320   # 20ms
+    if len(seg) < win * 2:
+        return None
+    lag_min = 29    # ~551 Hz
+    lag_max = 188   # ~85 Hz
+    hann = np.hanning(win).astype(np.float32)
+    f0s: list[float] = []
+    for pos in range(0, len(seg) - win + 1, hop):
+        fr = seg[pos : pos + win]
+        rms = float(np.sqrt(np.mean(fr * fr) + 1e-12))
+        if rms < 0.012:
+            continue
+        x = (fr - float(np.mean(fr))) * hann
+        n_fft = 2048
+        spec = np.fft.rfft(x, n=n_fft)
+        ac = np.fft.irfft(spec * np.conj(spec), n=n_fft)[: lag_max + 1]
+        if ac[0] <= 1e-9:
+            continue
+        sub = ac[lag_min : lag_max + 1] / ac[0]
+        pk_i = int(np.argmax(sub))
+        if float(sub[pk_i]) >= 0.55:
+            lag = lag_min + pk_i
+            f0s.append(16000.0 / float(lag))
+    if len(f0s) < 4:
+        return None
+    return float(np.median(f0s))
+
+
+def _normalize_duet_speakers_and_clean_text(
+    lines: list[dict],
+    audio_16k: Optional[np.ndarray] = None,
+) -> list[dict]:
+    """Authentic Hong Kong KTV (Neway / RedMR) Duet Formatter:
+    1. Detects genuine speaker-tagged duets (>=2 distinct speaker keys OR >=2 explicit 男/女/合 lines;
+       leaves solo songs 100% untouched!).
+    2. Maps explicit labels (男/Male -> 'male', 女/Female -> 'female', 合/All/Chorus -> 'all') AND
+       named singer tags (e.g. 克：/容：, MC：/陳蕾：) via F0 pitch separation (lower F0 -> 'male' Blue,
+       higher F0 -> 'female' Pink, with deterministic fallback for same-gender duets).
+    3. Splits mid-line speaker transitions cleanly (e.g. '男：人造的孽 人類竟沒法 合：破解' -> two pure
+       color-coded lines: '人造的孽 人類竟沒法' [male] + '破解' [all]).
+    4. Strips ALL '男：'/'女：'/'合：'/named speaker prefixes and outer duet parens from `text` and `words`,
+       propagating speaker role across continuation lines (without letting counterpoint tracks clobber
+       the continuing lead singer!). 100% idempotent.
+    """
+    if not lines:
+        return lines
+
+    # Scan all speaker tags across lines
+    seen_keys: list[str] = []
+    explicit_role_lines = 0
+    for ln in lines:
+        txt = (ln.get("text") or "").strip()
+        line_has_explicit = False
+        for m in DUET_INLINE_SPK_CAP_RE.finditer(txt):
+            k = _norm_speaker_key(m.group(1))
+            if not k:
+                continue
+            if k not in seen_keys:
+                seen_keys.append(k)
+            if k in _DUET_MALE_KEYS or k in _DUET_FEMALE_KEYS or k in _DUET_ALL_KEYS:
+                line_has_explicit = True
+        if line_has_explicit:
+            explicit_role_lines += 1
+
+    if len(seen_keys) < 2 and explicit_role_lines < 2:
+        return lines
+
+    # Map every speaker key -> canonical HK KTV role ('male' | 'female' | 'all')
+    role_map: dict[str, str] = {}
+    unknown_keys: list[str] = []
+    for k in seen_keys:
+        if k in _DUET_MALE_KEYS:
+            role_map[k] = "male"
+        elif k in _DUET_FEMALE_KEYS:
+            role_map[k] = "female"
+        elif k in _DUET_ALL_KEYS:
+            role_map[k] = "all"
+        else:
+            unknown_keys.append(k)
+
+    if unknown_keys:
+        # Try F0 vocal register classification when exactly 2 named singers exist and audio is available
+        f0_assigned = False
+        if len(unknown_keys) == 2 and audio_16k is not None and len(audio_16k) >= 16000 * 5:
+            pitches: dict[str, list[float]] = {uk: [] for uk in unknown_keys}
+            cur_u = ""
+            for ln in lines:
+                txt = (ln.get("text") or "").strip()
+                m_u = DUET_LEAD_SPEAKER_RE.match(txt)
+                if m_u:
+                    ku = _norm_speaker_key(m_u.group(1))
+                    if ln.get("duet_track") != "counter":
+                        cur_u = ku
+                else:
+                    ku = cur_u
+                if ku in pitches and not ln.get("duet_track"):
+                    f0 = _estimate_segment_pitch_hz(audio_16k, float(ln["start"]), float(ln["end"]))
+                    if f0 is not None:
+                        pitches[ku].append(f0)
+            k0, k1 = unknown_keys[0], unknown_keys[1]
+            if pitches[k0] and pitches[k1]:
+                m0, m1 = float(np.median(pitches[k0])), float(np.median(pitches[k1]))
+                lo_f, hi_f = min(m0, m1), max(m0, m1)
+                if lo_f > 0 and (hi_f / lo_f) >= 1.20 and lo_f < 235.0 and hi_f > 215.0:
+                    role_map[k0] = "male" if m0 < m1 else "female"
+                    role_map[k1] = "female" if m0 < m1 else "male"
+                    f0_assigned = True
+        if not f0_assigned:
+            for idx_u, uk in enumerate(unknown_keys):
+                role_map[uk] = "male" if (idx_u % 2 == 0) else "female"
+
+    out_lines: list[dict] = []
+    cur_speaker = ""
+
+    for ln in lines:
+        raw_txt = (ln.get("text") or "").strip()
+        if not raw_txt:
+            continue
+        # Unwrap outer duet parens when wrapping a speaker-tagged line (e.g. '（男：不想你也失陷）')
+        m_pw = DUET_PAREN_SPEAKER_LINE_RE.match(raw_txt)
+        txt = m_pw.group(1).strip() if m_pw else raw_txt
+
+        # Locate all valid speaker tags on this line
+        matches = [
+            m for m in DUET_INLINE_SPK_CAP_RE.finditer(txt)
+            if _norm_speaker_key(m.group(1)) in role_map
+        ]
+
+        # Pure sung words (strip any 0.02s speaker-tag visual anchors since tags are now removed from text!)
+        sung_ws = [
+            dict(w) for w in (ln.get("words") or [])
+            if not str(w.get("word") or "").rstrip().endswith((":", "："))
+        ]
+
+        # Build (explicit_role_or_None, clean_segment_text) chunks
+        chunks: list[tuple[Optional[str], str]] = []
+        if not matches:
+            chunks.append((None, txt))
+        else:
+            lead_before = txt[: matches[0].start()].strip()
+            if lead_before:
+                chunks.append((None, lead_before))
+            for mi, m in enumerate(matches):
+                role_m = role_map[_norm_speaker_key(m.group(1))]
+                seg_end = matches[mi + 1].start() if (mi + 1 < len(matches)) else len(txt)
+                seg_body = txt[m.end() : seg_end].strip()
+                if seg_body:
+                    chunks.append((role_m, seg_body))
+
+        if not chunks:
+            continue
+
+        if len(chunks) == 1:
+            exp_role, clean_body = chunks[0]
+            eff_role = exp_role if exp_role else cur_speaker
+            if exp_role and ln.get("duet_track") != "counter":
+                cur_speaker = exp_role
+            new_ln = dict(ln)
+            new_ln["text"] = clean_body
+            if sung_ws:
+                new_ln["words"] = sung_ws
+                new_ln["start"] = round(float(sung_ws[0]["start"]), 2)
+                new_ln["end"] = round(max(new_ln["start"] + 0.15, float(sung_ws[-1]["end"])), 2)
+            if eff_role:
+                new_ln["speaker"] = eff_role
+            out_lines.append(new_ln)
+        else:
+            # Mid-line speaker transition (e.g. '男：人造的孽 人類竟沒法 合：破解') -> clean separate lines!
+            tok_counts = [max(1, len(_tokenize_line_for_ctc(body))) for _, body in chunks]
+            total_toks = sum(tok_counts)
+            ls_all, le_all = float(ln["start"]), float(ln["end"])
+            w_cursor = 0
+            acc_toks = 0
+            use_word_slice = (len(sung_ws) == total_toks)
+
+            for ci, ((exp_role, clean_body), n_tk) in enumerate(zip(chunks, tok_counts)):
+                eff_role = exp_role if exp_role else cur_speaker
+                if exp_role and ln.get("duet_track") != "counter":
+                    cur_speaker = exp_role
+
+                if use_word_slice:
+                    seg_ws = [dict(w) for w in sung_ws[w_cursor : w_cursor + n_tk]]
+                    w_cursor += n_tk
+                    s_c = round(float(seg_ws[0]["start"]), 2)
+                    e_c = round(max(s_c + 0.15, float(seg_ws[-1]["end"])), 2)
+                elif sung_ws and w_cursor < len(sung_ws):
+                    take = len(sung_ws) - w_cursor if ci == len(chunks) - 1 else max(
+                        1, min(len(sung_ws) - w_cursor - (len(chunks) - 1 - ci), int(round(len(sung_ws) * (n_tk / total_toks))))
+                    )
+                    seg_ws = [dict(w) for w in sung_ws[w_cursor : w_cursor + take]]
+                    w_cursor += take
+                    s_c = round(float(seg_ws[0]["start"]), 2)
+                    e_c = round(max(s_c + 0.15, float(seg_ws[-1]["end"])), 2)
+                else:
+                    s_c = round(ls_all + (le_all - ls_all) * (acc_toks / max(1, total_toks)), 2)
+                    e_c = round(max(s_c + 0.20, ls_all + (le_all - ls_all) * ((acc_toks + n_tk) / max(1, total_toks))), 2)
+                    seg_ws = _even_words_for_line(clean_body, s_c, e_c)
+                acc_toks += n_tk
+
+                sub_ln = {
+                    "start": s_c,
+                    "end": e_c,
+                    "text": clean_body,
+                    "words": seg_ws,
+                }
+                if eff_role:
+                    sub_ln["speaker"] = eff_role
+                out_lines.append(sub_ln)
+
+    return out_lines
+
+
 def refine_lines_with_ctc(
     lines: list[dict],
     audio_16k: np.ndarray,
@@ -5930,6 +6166,7 @@ def refine_lines_with_ctc(
         out_lines, duet_pairs = _expand_and_align_duet_counterpoint(
             out_lines, audio_dur, first_onset, _align_text_local
         )
+        out_lines = _normalize_duet_speakers_and_clean_text(out_lines, audio_16k=audio_16k)
         out_lines = _enforce_strict_monotonic_bounds(out_lines, first_onset, audio_dur)
 
         print(

@@ -1178,8 +1178,13 @@ def test_question_mark_sanitization_ui_and_security_invariants() -> None:
     assert 'method === "POST" ? "POST" : "GET"' in bg_src and "CATALOG_GET_IDS" in bg_src
     assert r"/^\/api\/audio\/[A-Za-z0-9_-]{11}\/pure\/(instrumental|vocals)$/" in bg_src
     assert 'rel = "noopener noreferrer"' in popup_src and "validVidRe" in popup_src and "encodeURIComponent" in popup_src
-    assert manifest_data["version"] == "1.3.0"
-    print("[PASS] Question-mark sanitization (backend + frontend), sync-button removal, visual DB indicators & security hardening")
+    assert manifest_data["version"] == "1.3.1"
+    # Authentic HK KTV color-coded duet styling (Blue Male / Rose-Pink Female / Gold All, zero raw '男：'/'女：' text!)
+    for role in ('[data-speaker="male"]', '[data-speaker="female"]', '[data-speaker="all"]'):
+        assert role in styles_src, f"Missing HK KTV duet CSS selector {role} in styles.css!"
+    assert "slot.wrap.dataset.speaker" in content_src and "ov.countdownEl.dataset.speaker" in content_src
+    assert "Math.max(maxCjkUnits, 12.0)" in content_src
+    print("[PASS] Question-mark sanitization (backend + frontend), HK KTV duet styling, visual DB indicators & security hardening")
 
 
 def test_cross_chorus_overlay_paren_and_safeguard_invariants() -> None:
@@ -1654,7 +1659,56 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     assert lead_b.get("duet_track") == "lead" and cnt_b.get("duet_track") == "counter"
     assert cnt_b["start"] >= lead_b["start"] and cnt_b["start"] < lead_b["end"]
     assert max(lead_b["end"], cnt_b["end"]) <= nxt_after_b["start"] + 1e-6
-    print("[PASS] Gate 5 YRC word quality, CTC speaker anchors, M1 duet guard, Dual-Track Counterpoint & duet-aware monotonic bounds")
+
+    # 5) Authentic HK KTV speaker cleaning & color-role extraction (zero '男：'/'女：'/'合：'/'克：'/'容：' on screen!)
+    hk_raw = [
+        {"start": 10.0, "end": 12.4, "text": "男：我會的都試過", "words": lw._attach_ctc_speaker_anchors("男：我會的都試過", lw._even_words_for_line("我會的都試過", 10.0, 12.4))},
+        {"start": 12.6, "end": 15.0, "text": "這搶救證實完敗", "words": lw._even_words_for_line("這搶救證實完敗", 12.6, 15.0)},
+        {
+            "start": 16.0, "end": 22.0, "text": "男：人造的孽 人類竟沒法 合：破解",
+            "words": lw._attach_ctc_speaker_anchors(
+                "男：人造的孽 人類竟沒法 合：破解",
+                lw._even_words_for_line("人造的孽人類竟沒法", 16.0, 19.5) + lw._even_words_for_line("破解", 20.0, 22.0),
+            ),
+        },
+        {"start": 23.0, "end": 26.0, "text": "女：一碰已經熄了燈", "words": lw._even_words_for_line("一碰已經熄了燈", 23.0, 26.0), "duet_track": "lead"},
+        {"start": 24.5, "end": 26.0, "text": "男：沒神韻", "words": lw._even_words_for_line("沒神韻", 24.5, 26.0), "duet_track": "counter"},
+        {"start": 26.2, "end": 29.0, "text": "沒靈魂沒有心", "words": lw._even_words_for_line("沒靈魂沒有心", 26.2, 29.0), "duet_track": "lead"},
+        {"start": 27.5, "end": 29.0, "text": "男：空心", "words": lw._even_words_for_line("空心", 27.5, 29.0), "duet_track": "counter"},
+        {"start": 30.0, "end": 32.0, "text": "（男：不想你也失陷）", "words": lw._even_words_for_line("不想你也失陷", 30.0, 32.0)},
+    ]
+    hk_clean = lw._normalize_duet_speakers_and_clean_text(hk_raw)
+    assert len(hk_clean) == 9, f"Expected mid-line '合：破解' split into 9 clean lines, got {len(hk_clean)}: {hk_clean}"
+    assert [x["text"] for x in hk_clean] == [
+        "我會的都試過", "這搶救證實完敗", "人造的孽 人類竟沒法", "破解",
+        "一碰已經熄了燈", "沒神韻", "沒靈魂沒有心", "空心", "不想你也失陷",
+    ], f"Unexpected HK KTV cleaned texts: {[x['text'] for x in hk_clean]}"
+    assert [x.get("speaker") for x in hk_clean] == [
+        "male", "male", "male", "all", "female", "male", "female", "male", "male",
+    ], f"Speaker propagation or counter-clobber bug: {[(x['text'], x.get('speaker')) for x in hk_clean]}"
+    assert all(not w["word"].endswith((":", "：")) for x in hk_clean for w in x["words"]), "Speaker anchor word leaked into cleaned KTV words!"
+    assert lw._normalize_duet_speakers_and_clean_text(hk_clean) == hk_clean, "Speaker cleaner must be strictly idempotent!"
+
+    # 5B) Generic F0 pitch-based named-singer role classification (e.g. '克：' 145Hz male vs '容：' 330Hz female, zero artist hardcoding!)
+    sr = 16000
+    t_f0 = np.arange(sr * 12, dtype=np.float32) / sr
+    y_f0 = np.zeros_like(t_f0)
+    y_f0[int(1.0 * sr) : int(4.0 * sr)] = 0.25 * np.sin(2.0 * np.pi * 330.0 * t_f0[int(1.0 * sr) : int(4.0 * sr)])  # Singer 1 = Female 330Hz
+    y_f0[int(5.0 * sr) : int(8.0 * sr)] = 0.25 * np.sin(2.0 * np.pi * 145.0 * t_f0[int(5.0 * sr) : int(8.0 * sr)])  # Singer 2 = Male 145Hz
+    named_raw = [
+        {"start": 1.0, "end": 4.0, "text": "容：為何望來望去", "words": lw._even_words_for_line("為何望來望去", 1.0, 4.0)},
+        {"start": 5.0, "end": 8.0, "text": "克：從來亦無自信", "words": lw._even_words_for_line("從來亦無自信", 5.0, 8.0)},
+        {"start": 8.5, "end": 11.0, "text": "合：現在還未說", "words": lw._even_words_for_line("現在還未說", 8.5, 11.0)},
+    ]
+    named_clean = lw._normalize_duet_speakers_and_clean_text(named_raw, audio_16k=y_f0)
+    assert [x.get("speaker") for x in named_clean] == ["female", "male", "all"], f"F0 named-singer classification failed: {named_clean}"
+    assert [x["text"] for x in named_clean] == ["為何望來望去", "從來亦無自信", "現在還未說"]
+
+    # 5C) Solo songs without duet tags MUST remain 100% untouched (no 'speaker' field!)
+    solo_only = [{"start": 1.0, "end": 3.0, "text": "愛你一萬年", "words": lw._even_words_for_line("愛你一萬年", 1.0, 3.0)}]
+    solo_clean = lw._normalize_duet_speakers_and_clean_text(solo_only)
+    assert "speaker" not in solo_clean[0] and solo_clean[0]["text"] == "愛你一萬年"
+    print("[PASS] Gate 5 YRC word quality, HK KTV speaker color-coding (incl. F0 named singers), M1 duet guard & Dual-Track Counterpoint")
 
 
 def main() -> int:
