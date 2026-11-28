@@ -1193,7 +1193,10 @@ def test_question_mark_sanitization_ui_and_security_invariants() -> None:
     assert 'method === "POST" ? "POST" : "GET"' in bg_src and "CATALOG_GET_IDS" in bg_src
     assert r"/^\/api\/audio\/[A-Za-z0-9_-]{11}\/pure\/(instrumental|vocals)$/" in bg_src
     assert 'rel = "noopener noreferrer"' in popup_src and "validVidRe" in popup_src and "encodeURIComponent" in popup_src
-    assert manifest_data["version"] == "1.3.1"
+    ver_parts = tuple(int(x) for x in str(manifest_data.get("version") or "0.0.0").split("."))
+    assert ver_parts >= (1, 3, 2), f"Expected extension version >= 1.3.2, got {manifest_data.get('version')}"
+    prod_mf = json.loads((ROOT / "extension-prod" / "manifest.json").read_text(encoding="utf-8"))
+    assert prod_mf.get("version") == manifest_data.get("version"), "extension-prod manifest version out of sync!"
     # Authentic HK KTV color-coded duet styling (Blue Male / Rose-Pink Female / Gold All, zero raw '男：'/'女：' text!)
     for role in ('[data-speaker="male"]', '[data-speaker="female"]', '[data-speaker="all"]'):
         assert role in styles_src, f"Missing HK KTV duet CSS selector {role} in styles.css!"

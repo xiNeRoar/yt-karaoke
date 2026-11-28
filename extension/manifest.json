@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI 唱K 去人聲 for YouTube",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "一鍵去除 YouTube 歌曲人聲，支援導唱音量滑桿、即時升降 Key 及 KTV 同步歌詞。",
   "permissions": [
     "storage"
