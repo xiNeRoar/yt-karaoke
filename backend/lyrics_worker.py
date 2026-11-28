@@ -627,8 +627,16 @@ DUET_SLASH_COUNTERPOINT_RE = re.compile(
 DUET_PAREN_SPEAKER_LINE_RE = re.compile(
     r"^[\(（]\s*((?:[\u4e00-\u9fff]{1,4}|[A-Za-z]{1,12})\s*[:：][^()（）]{2,28})[\)）]\s*$"
 )
-DUET_COLLAB_TITLE_RE = re.compile(
-    r"(?:(?<=\s)|^)(?:x|×|vs\.?|feat\.?|ft\.?|with)(?=\s)|[×&＆/、]|合唱|對唱",
+DUET_GLOBAL_COLLAB_RE = re.compile(
+    r"(?:(?<=\s)|^)(?:feat\.?|ft\.?|vs\.?|duet)(?=[\s.,)）\]】]|$)|合唱|對唱",
+    re.IGNORECASE,
+)
+DUET_ARTIST_SEP_RE = re.compile(
+    r"(?:(?<=\s)|^)(?:x|×|with)(?=\s)|(?<![0-9])[×&＆、/]|(?<!\d)\s*&\s*(?!\d)",
+    re.IGNORECASE,
+)
+_DUET_DRAMA_OR_SHOW_BRACKET_RE = re.compile(
+    r"[\(（\[【][^()（）\[\]【】]*(?:主題曲|插曲|片尾曲|電視劇|劇集|OST|TVB|ViuTV|Live|Official|Video|MV|Lyric|Audio|Acoustic|Ver\.|Version|Concert|演唱會|風雲榜|FIRST\s+TAKE)[^()（）\[\]【】]*[\)）\]】]",
     re.IGNORECASE,
 )
 
@@ -636,24 +644,52 @@ DUET_COLLAB_TITLE_RE = re.compile(
 def _is_collab_duet_title(title_hint: str, yt_artist: str = "") -> bool:
     """Detect explicit multi-artist collaboration metadata across CJK & Western titles
     (e.g. 'MC 張天賦 X Chantel 姚焯菲', '張學友 & 梅艷芳', 'Lady Gaga, Bruno Mars - Die With A Smile'),
-    while returning False on solo titles.
+    strictly isolating artist clauses so solo titles like 'Phil Lam – 高山低谷 / THE FIRST TAKE',
+    '陳蕾 - 窮人的薔薇/ 以正義之名', '(TVB電視劇 洗冤錄1&2 主題曲)', or 'Sam Smith - Dancing With A Stranger'
+    NEVER false-match!
     """
-    t = (title_hint or "").strip()
-    if DUET_COLLAB_TITLE_RE.search(t) or DUET_COLLAB_TITLE_RE.search(yt_artist or ""):
+    t_raw = (title_hint or "").strip()
+    t_clean = _DUET_DRAMA_OR_SHOW_BRACKET_RE.sub(" ", t_raw).strip()
+    if DUET_GLOBAL_COLLAB_RE.search(t_clean) or DUET_GLOBAL_COLLAB_RE.search(yt_artist or ""):
         return True
-    # Check structured yt_artist or leading artist clause before ' - ' / '《' / '「' for comma-separated dual artists
+
+    def _clause_has_multi_artists(cl: str) -> bool:
+        c = (cl or "").strip()
+        if not c or len(c) < 3:
+            return False
+        # Reject R&B or digit-adjacent '&' (e.g. '1&2')
+        c_no_rnb = re.sub(r"\bR\s*&\s*B\b|\d+\s*[&＆x×/]\s*\d+", " ", c, flags=re.IGNORECASE)
+        for sep_pat in (
+            r"\s+(?:x|×|with)\s+",
+            r"\s*[×&＆、/]\s*",
+            r"\s*[,，]\s*",
+        ):
+            parts = [p.strip() for p in re.split(sep_pat, c_no_rnb, flags=re.IGNORECASE) if p.strip()]
+            if len(parts) == 2 and all(2 <= len(p) <= 32 for p in parts):
+                if not any(VERSION_TAG_RE.search(p) for p in parts):
+                    # Reject series/format suffixes such as 'THE FIRST TAKE' or 'Official MV'
+                    if not any(re.search(r"\b(?:first\s+take|live|mv|official|concert|ost|karaoke)\b", p, re.I) for p in parts):
+                        return True
+        return False
+
     artist_clauses: list[str] = []
-    if yt_artist and ("," in yt_artist or "，" in yt_artist):
-        artist_clauses.append(yt_artist)
-    m_head = re.split(r"\s[-—–]\s|[《「『【]", t, maxsplit=1)
-    if len(m_head) >= 2 and ("," in m_head[0] or "，" in m_head[0]):
+    if yt_artist and yt_artist.strip():
+        artist_clauses.append(yt_artist.strip())
+
+    # 1) Explicit 'by <artists>' clause (e.g. '《相愛很難》 by 梅艷芳、張學友 ( Anita Mui / Jacky Cheung )')
+    m_by = re.search(r"\bby\s+([^()（）\[\]【】|｜]+)", t_clean, re.IGNORECASE)
+    if m_by:
+        artist_clauses.append(m_by.group(1).strip())
+
+    # 2) Leading artist clause before title delimiter (' - ', ' – ', ' — ', '《', '「', '『')
+    m_head = re.split(r"\s[-—–]\s|[《「『]", t_clean, maxsplit=1)
+    if len(m_head) >= 2 and m_head[0].strip():
         artist_clauses.append(m_head[0].strip())
-    for cl in artist_clauses:
-        parts = [p.strip() for p in re.split(r"[,，]", cl) if p.strip()]
-        if len(parts) == 2 and all(2 <= len(p) <= 28 for p in parts):
-            if not any(VERSION_TAG_RE.search(p) for p in parts):
-                return True
-    return False
+    elif len(m_head) == 1:
+        # No explicit artist-title delimiter: inspect stripped title directly ONLY for explicit artist separators
+        artist_clauses.append(t_clean)
+
+    return any(_clause_has_multi_artists(cl) for cl in artist_clauses)
 
 
 def _has_verified_duet_tags(lines: list[str], min_tagged_lines: int = 4) -> bool:
@@ -691,12 +727,33 @@ def _sources_represent_same_song(
 
 
 def _iter_duet_spk_matches(text: str) -> list[tuple[int, int, str]]:
-    """Return list of (start, end, raw_tag_label) for both colon tags ('男：') and bracketed canonical tags ('（男）')."""
+    """Return list of (start, end, raw_tag_label) for both colon tags ('男：') and bracketed canonical tags ('（男）').
+
+    Structural prose-colon guard:
+    - Every speaker tag MUST precede actual lyric text (rejects trailing prose colons like 'MY FATHER SAID:').
+    - Non-canonical tags (e.g. 'C:', 'M:', '容：', '克：') MUST appear at line start or immediately inside an opening
+      paren/bracket — NEVER mid-sentence (prevents English prose colons like 'THAT'S WHEN I DECIDED: WHEN I DIE'
+      from being mistaken for singer names and stripped!).
+    """
+    s = text or ""
     out: list[tuple[int, int, str]] = []
-    for m in DUET_INLINE_SPK_CAP_RE.finditer(text or ""):
+    for m in DUET_INLINE_SPK_CAP_RE.finditer(s):
         lbl = (m.group(1) or m.group(2) or "").strip()
-        if lbl:
-            out.append((m.start(), m.end(), lbl))
+        if not lbl:
+            continue
+        if not s[m.end() :].strip():
+            continue
+        k = _norm_speaker_key(lbl)
+        if not k:
+            continue
+        is_canon = (k in _DUET_MALE_KEYS) or (k in _DUET_FEMALE_KEYS) or (k in _DUET_ALL_KEYS)
+        if not is_canon:
+            before = s[: m.start()].strip()
+            # Allow line-start ('C: ...') or immediately inside an opening counterpoint paren ('...（C: ...）')
+            is_line_or_paren_start = (before == "") or before.endswith(("(", "（", "[", "【"))
+            if not is_line_or_paren_start:
+                continue
+        out.append((m.start(), m.end(), lbl))
     return out
 
 
@@ -7062,23 +7119,69 @@ def _infer_untagged_duet_speakers_from_audio(
         if corr > 0.60:
             return lines
 
-    mid_st = 0.5 * (st_lo + st_hi)
+    # 2-State Viterbi HMM Temporal Decoding (eliminates mid-verse Blue/Pink flickering when one singer dips into
+    # chest/head voice for a single line, while allowing crisp switches across verse/phrase pauses!).
+    sigma = max(1.8, 0.35 * (st_hi - st_lo))
+    inv_2var = 1.0 / (2.0 * sigma * sigma)
     st_by_idx = {idx: st for idx, st, _ in measured}
+    seq_idxs = [idx for idx, ln in enumerate(lines) if ln.get("duet_track") != "counter"]
+    if not seq_idxs:
+        return lines
+
+    # Confidence gate (Fail-Safe Graceful Degradation): if >45% of measured lines sit in the ambiguous overlap band
+    # (within ±0.9 semitones of the midpoint), abstain rather than emit misleading random role colors!
+    uncertain_n = sum(1 for _, st, _ in measured if abs(st - 0.5 * (st_lo + st_hi)) < 0.9)
+    if (uncertain_n / max(1, len(measured))) > 0.45:
+        return lines
+
+    # States: 0 = male (st_lo), 1 = female (st_hi)
+    m_len = len(seq_idxs)
+    dp = np.full((m_len, 2), -1e9, dtype=np.float64)
+    back = np.zeros((m_len, 2), dtype=np.int32)
+
+    def _emit_ll(line_idx: int) -> tuple[float, float]:
+        st_v = st_by_idx.get(line_idx)
+        if st_v is None:
+            return (0.0, 0.0)
+        return (-((st_v - st_lo) ** 2) * inv_2var, -((st_v - st_hi) ** 2) * inv_2var)
+
+    dp[0, 0], dp[0, 1] = _emit_ll(seq_idxs[0])
+    for t_i in range(1, m_len):
+        cur_li = seq_idxs[t_i]
+        prev_li = seq_idxs[t_i - 1]
+        dt_gap = max(0.0, float(lines[cur_li]["start"]) - float(lines[prev_li]["end"]))
+        # Strong persistence inside a continuous phrase (<1.2s gap); relaxed switch cost across verse pauses/duets!
+        is_duet_bar = bool(lines[cur_li].get("duet_track")) or bool(lines[prev_li].get("duet_track"))
+        switch_pen = 0.50 if (dt_gap >= 1.2 or is_duet_bar) else 1.65
+        e0, e1 = _emit_ll(cur_li)
+        for st_cur, em in ((0, e0), (1, e1)):
+            s_stay = dp[t_i - 1, st_cur]
+            s_chg = dp[t_i - 1, 1 - st_cur] - switch_pen
+            if s_stay >= s_chg:
+                dp[t_i, st_cur] = s_stay + em
+                back[t_i, st_cur] = st_cur
+            else:
+                dp[t_i, st_cur] = s_chg + em
+                back[t_i, st_cur] = 1 - st_cur
+
+    best_states = [0] * m_len
+    best_states[-1] = 1 if dp[-1, 1] > dp[-1, 0] else 0
+    for t_i in range(m_len - 2, -1, -1):
+        best_states[t_i] = int(back[t_i + 1, best_states[t_i + 1]])
+
+    role_by_idx = {seq_idxs[t_i]: ("female" if best_states[t_i] == 1 else "male") for t_i in range(m_len)}
+    # Require both roles to still be meaningfully present after HMM smoothing (never paint an entire song 1 color!)
+    if len(set(role_by_idx.values())) < 2:
+        return lines
+
     out = [dict(ln) for ln in lines]
-    cur_role = "female" if st_by_idx.get(measured[0][0], mid_st) >= mid_st else "male"
+    cur_role = role_by_idx[seq_idxs[0]]
     for idx, ln in enumerate(out):
         if ln.get("duet_track") == "counter" and idx > 0 and out[idx - 1].get("duet_track") == "lead":
             lead_r = out[idx - 1].get("speaker", cur_role)
             ln["speaker"] = "female" if lead_r == "male" else "male"
             continue
-        st_i = st_by_idx.get(idx)
-        if st_i is not None:
-            if st_i <= mid_st - 0.8:
-                cur_role = "male"
-            elif st_i >= mid_st + 0.8:
-                cur_role = "female"
-            else:
-                cur_role = "female" if st_i >= mid_st else "male"
+        cur_role = role_by_idx.get(idx, cur_role)
         ln["speaker"] = cur_role
     return out
 

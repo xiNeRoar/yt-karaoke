@@ -2002,9 +2002,41 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     assert lw._is_collab_duet_title("Lady Gaga, Bruno Mars - Die With A Smile") is True
     assert lw._is_collab_duet_title("Die With A Smile", yt_artist="Lady Gaga, Bruno Mars") is True
     assert lw._is_collab_duet_title("MC 張天賦 X Chantel 姚焯菲 - 誰能避開戀愛這事情") is True
+    assert lw._is_collab_duet_title("《相愛很難》 by 梅艷芳、張學友 ( Anita Mui / Jacky Cheung )") is True
+    assert lw._is_collab_duet_title("Jason Mraz with Colbie Caillat - Lucky") is True
     assert lw._is_collab_duet_title("陳蕾 - 凡星") is False
     assert lw._is_collab_duet_title("陳蕾 - 凡星 (Live, Concert)") is False
     assert lw._is_collab_duet_title("Adele - Hello") is False
+    # Real-world 61-song library solo traps MUST return False!
+    assert lw._is_collab_duet_title("陳蕾 - 窮人的薔薇/ 以正義之名【第六屆 KKBOX 香港風雲榜】｜KKBOX") is False
+    assert lw._is_collab_duet_title("Phil Lam 林奕匡 – Mountains and Valleys 高山低谷 / THE FIRST TAKE") is False
+    assert lw._is_collab_duet_title("優里 - ベテルギウス / THE FIRST TAKE") is False
+    assert lw._is_collab_duet_title("一個人 - 陳奕迅 MV (TVB電視劇 洗冤錄1&2 主題曲) 歌詞") is False
+    assert lw._is_collab_duet_title("Sam Smith - Dancing With A Stranger") is False
+    # English/CJK prose colons ('MY FATHER SAID:', 'THAT'S WHEN I DECIDED: WHEN I DIE') MUST NEVER trigger duet coloring or delete words!
+    avicii_prose = [
+        {"start": 0.2, "end": 1.6, "text": "[MALE VOICE] WHEN I WAS 16 MY FATHER SAID:", "words": lw._even_words_for_line("WHEN I WAS 16 MY FATHER SAID", 0.2, 1.6)},
+        {"start": 5.6, "end": 8.0, "text": "THAT'S WHEN I DECIDED: WHEN I DIE", "words": lw._even_words_for_line("THAT'S WHEN I DECIDED WHEN I DIE", 5.6, 8.0)},
+        {"start": 8.5, "end": 10.5, "text": "I WANT TO BE REMEMBERED FOR THE LIFE I LIVED", "words": lw._even_words_for_line("I WANT TO BE REMEMBERED FOR THE LIFE I LIVED", 8.5, 10.5)},
+    ]
+    avicii_clean = lw._normalize_duet_speakers_and_clean_text(avicii_prose)
+    assert len(avicii_clean) == 3 and all("speaker" not in x for x in avicii_clean), f"Prose colons triggered false duet split: {avicii_clean}"
+    assert "DECIDED:" in avicii_clean[1]["text"], f"Prose verb 'DECIDED:' was wrongly stripped: {avicii_clean[1]}"
+    # Viterbi HMM temporal continuity: a single brief chest-voice dip inside a continuous female verse MUST NOT flicker 'male'!
+    t_hmm = np.arange(sr * 36, dtype=np.float32) / sr
+    y_hmm = np.zeros_like(t_hmm)
+    hmm_freqs = [320.0, 215.0, 318.0, 325.0, 310.0, 155.0, 160.0, 150.0, 158.0, 162.0]  # Line 1 is 1-line chest dip inside tight female verse
+    hmm_lines = []
+    cur_t_h = 1.0
+    for k_h, f_h in enumerate(hmm_freqs):
+        gap_h = 2.0 if k_h == 5 else 0.25  # 0.25s tight intra-verse, 2.0s verse handoff at k=5!
+        s_h = cur_t_h + (gap_h if k_h > 0 else 0.0)
+        e_h = s_h + 2.4
+        cur_t_h = e_h
+        y_hmm[int(s_h * sr) : int(e_h * sr)] = 0.22 * np.sin(2.0 * np.pi * f_h * t_hmm[int(s_h * sr) : int(e_h * sr)])
+        hmm_lines.append({"start": s_h, "end": e_h, "text": f"測試平滑第{k_h}句", "words": lw._even_words_for_line(f"測試平滑第{k_h}句", s_h, e_h)})
+    hmm_out = lw._infer_untagged_duet_speakers_from_audio(hmm_lines, y_hmm, "Singer A X Singer B - Song")
+    assert [x.get("speaker") for x in hmm_out] == ["female"] * 5 + ["male"] * 5, f"Viterbi HMM failed to prevent 1-line verse flicker: {[x.get('speaker') for x in hmm_out]}"
     tagged_pool = ["男：第一句歌詞測試", "女：第二句歌詞測試", "男：第三句歌詞測試", "合：第四句歌詞測試"]
     untagged_pool = ["第一句歌詞測試", "第二句歌詞測試", "第三句歌詞測試", "第四句歌詞測試"]
     assert lw._has_verified_duet_tags(tagged_pool) is True
