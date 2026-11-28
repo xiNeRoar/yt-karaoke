@@ -1997,6 +1997,85 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     assert [x.get("speaker") for x in inferred_collab] == ["female"] * 5 + ["male"] * 5, f"Untagged duet F0 fallback failed: {inferred_collab}"
     inferred_solo = lw._infer_untagged_duet_speakers_from_audio(untagged_lines, y_duet_u, "陳蕾 - 凡星")
     assert all("speaker" not in x for x in inferred_solo), "Solo title MUST NEVER receive duet speaker colors!"
+
+    # 5L) Generalized Multi-Artist Collab Detector + Duet Source Fusion Helpers + Single Output Gate Invariants
+    assert lw._is_collab_duet_title("Lady Gaga, Bruno Mars - Die With A Smile") is True
+    assert lw._is_collab_duet_title("Die With A Smile", yt_artist="Lady Gaga, Bruno Mars") is True
+    assert lw._is_collab_duet_title("MC 張天賦 X Chantel 姚焯菲 - 誰能避開戀愛這事情") is True
+    assert lw._is_collab_duet_title("陳蕾 - 凡星") is False
+    assert lw._is_collab_duet_title("陳蕾 - 凡星 (Live, Concert)") is False
+    assert lw._is_collab_duet_title("Adele - Hello") is False
+    tagged_pool = ["男：第一句歌詞測試", "女：第二句歌詞測試", "男：第三句歌詞測試", "合：第四句歌詞測試"]
+    untagged_pool = ["第一句歌詞測試", "第二句歌詞測試", "第三句歌詞測試", "第四句歌詞測試"]
+    assert lw._has_verified_duet_tags(tagged_pool) is True
+    assert lw._has_verified_duet_tags(untagged_pool) is False
+    assert lw._sources_represent_same_song(untagged_pool, tagged_pool) is True
+    assert lw._sources_represent_same_song(untagged_pool, ["完全無關另一首歌"]) is False
+    lw_src_txt = (ROOT / "backend" / "lyrics_worker.py").read_text("utf-8")
+    assert "def _emit_lyrics_result(" in lw_src_txt, "main() must funnel all exit paths through single canonical _emit_lyrics_result gate!"
+    assert "yrc_would_lose_duet_tags" in lw_src_txt and "lrc_would_lose_duet_tags" in lw_src_txt and "lrc_would_lose_duet" in lw_src_txt, (
+        "fetch_official_lyrics must enforce duet-tag preservation across LRCLIB, NetEase LRC, and NetEase YRC!"
+    )
+    assert "for f in lrc_futs:" in lw_src_txt and "for f in ne_futs:" in lw_src_txt, (
+        "fetch_official_lyrics must collect concurrent futures deterministically (no as_completed tie race)!"
+    )
+
+    # 5M) Mid-Line Parenthetical Counterpoint ('Prefix (Counter) Suffix' in CJK & English) + Pattern-B inline-A guard
+    mid_in = [
+        {"start": 10.0, "end": 14.0, "text": "你矢口否認 我都很確定 逃離 (難逃) 這事情", "words": lw._even_words_for_line("你矢口否認我都很確定逃離難逃這事情", 10.0, 14.0)},
+        {"start": 15.0, "end": 19.0, "text": "I cannot let go (never let go) of you tonight", "words": lw._even_words_for_line("I cannot let go never let go of you tonight", 15.0, 19.0)},
+        # Pattern B MUST NOT consume a subsequent Pattern-A inline counterpoint line!
+        {"start": 20.0, "end": 22.0, "text": "男：這搶救證實完敗", "words": lw._even_words_for_line("這搶救證實完敗", 20.0, 22.0)},
+        {"start": 22.1, "end": 25.0, "text": "女：誰敢說再修可再生（男：別重嵌）", "words": lw._even_words_for_line("誰敢說再修可再生別重嵌", 22.1, 25.0)},
+    ]
+    mid_exp, n_mid_dp = lw._expand_and_align_duet_counterpoint(mid_in, 35.0, 0.0, _mock_align_duet, title_hint="Artist A, Artist B - Song")
+    assert n_mid_dp == 3, f"Expected 3 simultaneous pairs (CJK mid-paren + EN mid-paren + inline-A preserved), got {n_mid_dp}: {mid_exp}"
+    cjk_lead = next(x for x in mid_exp if x["text"] == "你矢口否認 我都很確定 逃離這事情")
+    cjk_cnt = next(x for x in mid_exp if x["text"] == "難逃")
+    assert cjk_lead.get("duet_track") == "lead" and cjk_cnt.get("duet_track") == "counter"
+    assert cjk_cnt["start"] > cjk_lead["start"] + 1.5, f"Mid-line counter should anchor near prefix '逃離', not line start: {cjk_lead}, {cjk_cnt}"
+    en_lead = next(x for x in mid_exp if x["text"] == "I cannot let go of you tonight")
+    en_cnt = next(x for x in mid_exp if x["text"] == "never let go")
+    assert en_lead.get("duet_track") == "lead" and en_cnt.get("duet_track") == "counter"
+    pat_a_preserved = next(x for x in mid_exp if x["text"] == "男：別重嵌")
+    assert pat_a_preserved.get("duet_track") == "counter", f"Pattern B wrongly consumed inline Pattern-A line: {mid_exp}"
+
+    # 5N) Live Section-Anchored Alignment Case 3: preserve simultaneous duet partner (missing_n=1 & 2, ~0s gap)
+    #     while STILL rejecting genuine multi-line skipped live verses!
+    live_pool_duet = [
+        "C: 有種心跳叫動情",
+        "M: 我驚你承擔很多爭議性",
+        "C: 我不怕承擔很多爭議性",
+        "M: 另一句男主唱副歌",
+        "C: 另一句女對唱副歌",
+        "D: 能一齊就毫無懼意",
+    ]
+    zero_gap_fn = lambda a, b: (0.0, a, b)
+    rec1, new_ce1, new_ns1 = lw._recover_missing_lines_between_anchors(
+        {"start": 10.0, "end": 13.6, "text": live_pool_duet[1]},
+        {"start": 13.7, "end": 17.2, "text": live_pool_duet[3]},
+        live_pool_duet,
+        1, 3, zero_gap_fn,
+    )
+    assert len(rec1) == 1 and rec1[0]["text"] == live_pool_duet[2] and new_ce1 is not None, f"Case 3 missing_n=1 duet partner dropped: {rec1}"
+    rec2, new_ce2, new_ns2 = lw._recover_missing_lines_between_anchors(
+        {"start": 10.0, "end": 13.6, "text": live_pool_duet[1]},
+        {"start": 13.7, "end": 17.5, "text": live_pool_duet[4]},
+        live_pool_duet,
+        1, 4, zero_gap_fn,
+    )
+    assert len(rec2) == 2 and [r["text"] for r in rec2] == [live_pool_duet[2], live_pool_duet[3]] and new_ce2 is not None and new_ns2 is not None, (
+        f"Case 3 missing_n=2 dual-bar partners dropped: {rec2}"
+    )
+    big_skip_pool = [f"M: 現場跳過第{k}句" for k in range(15)]
+    rec_skip, _, _ = lw._recover_missing_lines_between_anchors(
+        {"start": 10.0, "end": 13.0, "text": big_skip_pool[0]},
+        {"start": 13.2, "end": 16.0, "text": big_skip_pool[13]},
+        big_skip_pool,
+        0, 13, zero_gap_fn,
+    )
+    assert rec_skip == [], f"Skipped 12-line live verse must NEVER be hallucinated: {rec_skip}"
+
     print("[PASS] Gate 5 YRC word quality, HK KTV speaker color-coding (incl. F0/paren tags/cross-song isolation), MC banter filter & Dual-Track Counterpoint")
 
 

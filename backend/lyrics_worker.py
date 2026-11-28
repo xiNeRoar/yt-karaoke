@@ -618,6 +618,9 @@ DUET_INLINE_COUNTERPOINT_RE = re.compile(
 DUET_BARE_PAREN_COUNTERPOINT_RE = re.compile(
     r"^([^()（）]{4,36}?)\s*[\(（]\s*([^()（）]{3,32}?)\s*[\)）]\s*$"
 )
+DUET_MIDLINE_PAREN_RE = re.compile(
+    r"^([^()（）]{2,28}?)\s*[\(（]\s*([^()（）]{2,20}?)\s*[\)）]\s*([^()（）]{2,24})\s*$"
+)
 DUET_SLASH_COUNTERPOINT_RE = re.compile(
     r"^([^/／]{3,36}?)\s*[/／]\s*([^/／]{3,36})\s*$"
 )
@@ -628,6 +631,63 @@ DUET_COLLAB_TITLE_RE = re.compile(
     r"(?:(?<=\s)|^)(?:x|×|vs\.?|feat\.?|ft\.?|with)(?=\s)|[×&＆/、]|合唱|對唱",
     re.IGNORECASE,
 )
+
+
+def _is_collab_duet_title(title_hint: str, yt_artist: str = "") -> bool:
+    """Detect explicit multi-artist collaboration metadata across CJK & Western titles
+    (e.g. 'MC 張天賦 X Chantel 姚焯菲', '張學友 & 梅艷芳', 'Lady Gaga, Bruno Mars - Die With A Smile'),
+    while returning False on solo titles.
+    """
+    t = (title_hint or "").strip()
+    if DUET_COLLAB_TITLE_RE.search(t) or DUET_COLLAB_TITLE_RE.search(yt_artist or ""):
+        return True
+    # Check structured yt_artist or leading artist clause before ' - ' / '《' / '「' for comma-separated dual artists
+    artist_clauses: list[str] = []
+    if yt_artist and ("," in yt_artist or "，" in yt_artist):
+        artist_clauses.append(yt_artist)
+    m_head = re.split(r"\s[-—–]\s|[《「『【]", t, maxsplit=1)
+    if len(m_head) >= 2 and ("," in m_head[0] or "，" in m_head[0]):
+        artist_clauses.append(m_head[0].strip())
+    for cl in artist_clauses:
+        parts = [p.strip() for p in re.split(r"[,，]", cl) if p.strip()]
+        if len(parts) == 2 and all(2 <= len(p) <= 28 for p in parts):
+            if not any(VERSION_TAG_RE.search(p) for p in parts):
+                return True
+    return False
+
+
+def _has_verified_duet_tags(lines: list[str], min_tagged_lines: int = 4) -> bool:
+    """True when a lyric pool has >= min_tagged_lines explicit speaker tags across >= 2 distinct speaker keys."""
+    if _pool_duet_tag_count(lines) < min_tagged_lines:
+        return False
+    keys = {
+        _norm_speaker_key(lbl)
+        for ln_d in (lines or [])
+        for _, _, lbl in _iter_duet_spk_matches(ln_d)
+        if _norm_speaker_key(lbl)
+    }
+    return len(keys) >= 2
+
+
+def _sources_represent_same_song(
+    base_lines: list[str],
+    cand_lines: list[str],
+    min_completeness: float = 0.80,
+) -> bool:
+    """Verify two lyric text pools represent the same full song (prevents short teasers or wrong tracks upgrading!)."""
+    if not base_lines or not cand_lines:
+        return False
+    cjk_base = sum(len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) for x in base_lines)
+    cjk_cand = sum(len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) for x in cand_lines)
+    if cjk_cand < max(24, int(cjk_base * min_completeness)):
+        return False
+    if _pools_are_same_song(base_lines, cand_lines):
+        return True
+    sim = _lyric_similarity(
+        " ".join(INLINE_SPEAKER_TAG_RE.sub("", x) for x in base_lines[:16]),
+        " ".join(INLINE_SPEAKER_TAG_RE.sub("", x) for x in cand_lines[:16]),
+    )
+    return sim >= 0.55
 
 
 def _iter_duet_spk_matches(text: str) -> list[tuple[int, int, str]]:
@@ -1711,18 +1771,25 @@ def fetch_official_lyrics(
                 except Exception:
                     return []
 
-            # Run LRCLIB + NetEase searches concurrently in one shared pool!
+            # Run LRCLIB + NetEase searches concurrently in one shared pool, collecting in deterministic
+            # query order (eliminates network-timing race conditions on tied candidates!).
             with ThreadPoolExecutor(max_workers=8) as ex:
                 lrc_futs = [ex.submit(_query_lrclib, q) for q in queries[:8]]
                 ne_futs = [ex.submit(_query_netease, q) for q in ne_queries[:8]]
-                for f in as_completed(lrc_futs):
+                for f in lrc_futs:
                     lrc_pool.extend(f.result())
-                for f in as_completed(ne_futs):
+                for f in ne_futs:
                     ne_raw_songs.extend(f.result())
 
-            # 1) Score LRCLIB candidates
+            def _unbalanced_paren_count(ls_chk: list[str]) -> int:
+                return sum(
+                    1 for x in (ls_chk or [])
+                    if (x.count("(") + x.count("（")) != (x.count(")") + x.count("）"))
+                )
+
+            # 1) Score LRCLIB candidates deterministically (speaker-tagged & clean-paren entries win ties!)
             seen_lrc_ids: set = set()
-            lrc_scored: list[tuple[float, float, dict]] = []
+            lrc_scored: list[tuple[tuple, float, list[str], dict]] = []
             for it in lrc_pool:
                 lid = it.get("id")
                 if lid is not None:
@@ -1734,20 +1801,43 @@ def fetch_official_lyrics(
                 it_dur = float(it.get("duration") or 0.0)
                 match_sc = _track_matches_title(tr_name, ar_name, match_context, cand_dur=it_dur, yt_dur=duration)
                 if match_sc > 0.0:
-                    has_sync_bonus = 0.02 if (it.get("syncedLyrics") or "").strip() else 0.0
-                    lrc_scored.append((match_sc + has_sync_bonus, match_sc, it))
+                    pl = (it.get("plainLyrics") or "").strip()
+                    sl = (it.get("syncedLyrics") or "").strip()
+                    cand_lines = clean_lyric_lines(pl.splitlines()) if pl else clean_lyric_lines([x["text"] for x in parse_lrc(sl)])
+                    if len(cand_lines) < 6:
+                        continue
+                    has_duet = 1 if _pool_duet_tag_count(cand_lines) >= 2 else 0
+                    has_sync = 1 if sl else 0
+                    unbal_pen = -min(4, _unbalanced_paren_count(cand_lines))
+                    sort_key = (round(match_sc, 4), has_duet, has_sync, unbal_pen, -int(lid or 0))
+                    lrc_scored.append((sort_key, match_sc, cand_lines, it))
 
             lrc_scored.sort(key=lambda x: x[0], reverse=True)
-            for _, match_sc, it in lrc_scored:
+            for _, match_sc, cand_lines, it in lrc_scored:
                 tr_name = it.get("trackName") or ""
-                pl = (it.get("plainLyrics") or "").strip()
                 sl = (it.get("syncedLyrics") or "").strip()
-                cand_lines = clean_lyric_lines(pl.splitlines()) if pl else clean_lyric_lines([x["text"] for x in parse_lrc(sl)])
-                if len(cand_lines) >= 6 and match_sc > best_score:
-                    best_score = match_sc
+                cand_has_duet = _pool_duet_tag_count(cand_lines) >= 2
+                best_has_duet = _pool_duet_tag_count(best_lines) >= 2
+                lrc_duet_upgrade = (
+                    cand_has_duet
+                    and bool(best_lines)
+                    and not best_has_duet
+                    and match_sc >= best_score - 0.15
+                    and (
+                        _pools_are_same_song(best_lines, cand_lines)
+                        or _lyric_similarity(" ".join(best_lines[:14]), " ".join(cand_lines[:14])) >= 0.45
+                    )
+                )
+                lrc_would_lose_duet = (not cand_has_duet) and best_has_duet
+                if not lrc_would_lose_duet and (match_sc > best_score or lrc_duet_upgrade):
+                    best_score = max(best_score, match_sc)
                     best_lines = cand_lines
                     best_source = f"LRCLIB ({tr_name})"
-                    if best_synced_score < best_score - 0.05:
+                    if best_synced_score < best_score - 0.05 or (
+                        lrc_duet_upgrade
+                        and best_synced is not None
+                        and _pool_duet_tag_count([x.get("text", "") for x in best_synced]) < 2
+                    ):
                         best_synced = None
                         best_synced_score = 0.0
 
@@ -1756,14 +1846,25 @@ def fetch_official_lyrics(
                     # Allow up to +/-25s for Official MVs with intro/outro logos; main() enforces strict 3-layer acoustic span checks!
                     if it_dur > 0.0 and abs(it_dur - duration) <= 25.0:
                         parsed = parse_lrc(sl)
-                        if len(parsed) >= 6 and (best_synced is None or match_sc > best_synced_score):
-                            best_synced = parsed
-                            best_synced_score = match_sc
-                            if match_sc >= best_score:
-                                best_source = "LRCLIB"
-                                best_score = match_sc
-                                if not best_lines:
-                                    best_lines = clean_lyric_lines([x["text"] for x in parsed])
+                        if len(parsed) >= 6:
+                            sync_has_duet = _pool_duet_tag_count([x.get("text", "") for x in parsed]) >= 2
+                            cur_sync_has_duet = (
+                                best_synced is not None
+                                and _pool_duet_tag_count([x.get("text", "") for x in best_synced]) >= 2
+                            )
+                            sync_would_lose_duet = (not sync_has_duet) and (cur_sync_has_duet or _pool_duet_tag_count(best_lines) >= 2)
+                            if not sync_would_lose_duet and (
+                                best_synced is None
+                                or match_sc > best_synced_score
+                                or (sync_has_duet and not cur_sync_has_duet)
+                            ):
+                                best_synced = parsed
+                                best_synced_score = match_sc
+                                if match_sc >= best_score:
+                                    best_source = "LRCLIB"
+                                    best_score = match_sc
+                                    if not best_lines:
+                                        best_lines = clean_lyric_lines([x["text"] for x in parsed])
 
             # 2) Score NetEase candidates and fetch top lyrics (also allows upgrading synced LRC on equal score!)
             ne_candidates: list[tuple[float, dict]] = []
@@ -1781,14 +1882,8 @@ def fetch_official_lyrics(
                 if sc > 0.0:
                     ne_candidates.append((sc, s))
 
-            ne_candidates.sort(key=lambda x: x[0], reverse=True)
+            ne_candidates.sort(key=lambda x: (round(x[0], 4), -int(x[1].get("id") or 0)), reverse=True)
             best_synced_is_yrc = False
-
-            def _unbalanced_paren_count(ls_chk: list[str]) -> int:
-                return sum(
-                    1 for x in (ls_chk or [])
-                    if (x.count("(") + x.count("（")) != (x.count(")") + x.count("）"))
-                )
 
             for sc, s in ne_candidates[:5]:
                 can_upgrade_lrc = (not is_live_or_alt) and (best_synced is None) and (sc >= best_score - 0.05)
@@ -1811,118 +1906,114 @@ def fetch_official_lyrics(
                     ne_dur = float(s.get("dt") or s.get("duration") or 0.0) / 1000.0
                     dur_ok = (duration > 0.0 and ne_dur > 0.0 and abs(ne_dur - duration) <= 25.0)
 
-                    # Tier 0: Prefer NetEase commercial word-level YRC when studio track duration matches!
+                    # Parse LRC upfront so an untagged YRC on the SAME song (or sibling release) NEVER overrides
+                    # a speaker-tagged duet LRC ('男：'/'女：'/'合：')!
+                    parsed_lrc = parse_lrc(lrc) if lrc else []
+                    ne_clean_lines = clean_lyric_lines([x["text"] for x in parsed_lrc]) if len(parsed_lrc) >= 6 else []
+                    lrc_has_duet_tags = _pool_duet_tag_count(ne_clean_lines) >= 2
+
+                    # Tier 0: Prefer NetEase commercial word-level YRC when studio track duration matches,
+                    # UNLESS either existing best_lines or this song's own LRC carries duet tags that YRC lacks!
                     parsed_yrc = parse_yrc(yrc_raw) if (yrc_raw and not is_live_or_alt) else []
                     if len(parsed_yrc) >= 6 and dur_ok:
                         yrc_clean = clean_lyric_lines([x["text"] for x in parsed_yrc])
-                        if sc > best_score:
-                            best_score = sc
-                            best_lines = yrc_clean
-                            best_source = f"NetEase YRC ({s.get('name') or ''})"
-                            best_synced = parsed_yrc
-                            best_synced_score = sc
-                            best_synced_is_yrc = True
-                            break
-                        elif can_upgrade_yrc:
-                            # Content guard when NetEase title scored below LRCLIB (prevents wrong-song YRC hijack!)
-                            content_ok = (
-                                (sc >= best_score - 0.05)
-                                or (not best_lines)
-                                or (_lyric_similarity(" ".join(best_lines[:14]), " ".join(yrc_clean[:14])) >= 0.45)
-                            )
-                            if content_ok:
+                        yrc_has_duet_tags = _pool_duet_tag_count(yrc_clean) >= 2
+                        existing_has_duet_tags = _pool_duet_tag_count(best_lines) >= 2
+                        yrc_would_lose_duet_tags = (not yrc_has_duet_tags) and (lrc_has_duet_tags or existing_has_duet_tags)
+                        if not yrc_would_lose_duet_tags:
+                            if sc > best_score:
+                                best_score = sc
+                                best_lines = yrc_clean
+                                best_source = f"NetEase YRC ({s.get('name') or ''})"
                                 best_synced = parsed_yrc
                                 best_synced_score = sc
                                 best_synced_is_yrc = True
-                                if (not best_lines) or (_unbalanced_paren_count(best_lines) > _unbalanced_paren_count(yrc_clean)):
-                                    best_lines = yrc_clean
-                                break
+                                if yrc_has_duet_tags or not _is_collab_duet_title(match_context, yt_artist):
+                                    break
+                            elif can_upgrade_yrc:
+                                # Content guard when NetEase title scored below LRCLIB (prevents wrong-song YRC hijack!)
+                                content_ok = (
+                                    (sc >= best_score - 0.05)
+                                    or (not best_lines)
+                                    or (_lyric_similarity(" ".join(best_lines[:14]), " ".join(yrc_clean[:14])) >= 0.45)
+                                )
+                                if content_ok:
+                                    best_synced = parsed_yrc
+                                    best_synced_score = sc
+                                    best_synced_is_yrc = True
+                                    if (not best_lines) or (_unbalanced_paren_count(best_lines) > _unbalanced_paren_count(yrc_clean)):
+                                        best_lines = yrc_clean
+                                    if yrc_has_duet_tags or not _is_collab_duet_title(match_context, yt_artist):
+                                        break
 
-                    if not lrc:
+                    if len(parsed_lrc) < 6:
                         continue
-                    parsed = parse_lrc(lrc)
-                    if len(parsed) >= 6:
-                        ne_clean_lines = clean_lyric_lines([x["text"] for x in parsed])
-                        # Clean-text tie-break: when NetEase LRC ties LRCLIB plain text, prefer balanced lyrics
-                        # with zero unbalanced cross-line parentheses (e.g. LRCLIB "(看\n全沒罪案發生)" vs clean NetEase LRC)!
-                        prefer_cleaner_tie = (
-                            (sc >= best_score - 0.02)
-                            and bool(best_lines)
-                            and _unbalanced_paren_count(best_lines) > _unbalanced_paren_count(ne_clean_lines)
+                    parsed = parsed_lrc
+                    # Re-evaluate duet upgrade right here in case YRC above populated untagged best_lines!
+                    can_upgrade_duet_now = (sc >= best_score - 0.15) and bool(best_lines) and (_pool_duet_tag_count(best_lines) < 2)
+                    # Clean-text tie-break: when NetEase LRC ties LRCLIB plain text, prefer balanced lyrics
+                    # with zero unbalanced cross-line parentheses (e.g. LRCLIB "(看\n全沒罪案發生)" vs clean NetEase LRC)!
+                    prefer_cleaner_tie = (
+                        (sc >= best_score - 0.02)
+                        and bool(best_lines)
+                        and _unbalanced_paren_count(best_lines) > _unbalanced_paren_count(ne_clean_lines)
+                    )
+                    prefer_duet_upgrade = (
+                        can_upgrade_duet_now
+                        and lrc_has_duet_tags
+                        and (
+                            _pools_are_same_song(best_lines, ne_clean_lines)
+                            or _lyric_similarity(" ".join(best_lines[:14]), " ".join(ne_clean_lines[:14])) >= 0.45
                         )
-                        prefer_duet_upgrade = (
-                            can_upgrade_duet
-                            and _pool_duet_tag_count(ne_clean_lines) >= 2
-                            and (
-                                _pools_are_same_song(best_lines, ne_clean_lines)
-                                or _lyric_similarity(" ".join(best_lines[:14]), " ".join(ne_clean_lines[:14])) >= 0.45
-                            )
-                        )
-                        if sc > best_score or prefer_cleaner_tie or prefer_duet_upgrade:
-                            best_score = max(best_score, sc)
-                            best_lines = ne_clean_lines
-                            best_source = f"NetEase ({s.get('name') or ''})"
-                            if not is_live_or_alt and dur_ok:
-                                best_synced = parsed
-                                best_synced_score = sc
-                            elif best_synced_score < best_score - 0.05 or (
-                                prefer_duet_upgrade
-                                and best_synced is not None
-                                and _pool_duet_tag_count([x.get("text", "") for x in best_synced]) < 2
-                            ):
-                                best_synced = None
-                                best_synced_score = 0.0
-                                best_synced_is_yrc = False
-                            # Continue scanning sibling NetEase releases (single vs album re-release) if YRC not found yet!
-                            if is_live_or_alt or best_synced_is_yrc:
-                                break
-                        elif can_upgrade_lrc and dur_ok:
+                    )
+                    # Never let an untagged LRC overwrite an already-duet-tagged same-song best_lines!
+                    lrc_would_lose_duet_tags = (not lrc_has_duet_tags) and (_pool_duet_tag_count(best_lines) >= 2)
+                    if not lrc_would_lose_duet_tags and (sc > best_score or prefer_cleaner_tie or prefer_duet_upgrade):
+                        best_score = max(best_score, sc)
+                        best_lines = ne_clean_lines
+                        best_source = f"NetEase ({s.get('name') or ''})"
+                        if not is_live_or_alt and dur_ok and (
+                            not best_synced_is_yrc or prefer_duet_upgrade
+                        ):
                             best_synced = parsed
                             best_synced_score = sc
-                            if not best_lines:
-                                best_lines = ne_clean_lines
-                            if is_live_or_alt or best_synced_is_yrc:
-                                break
+                            best_synced_is_yrc = False
+                        elif best_synced_score < best_score - 0.05 or (
+                            prefer_duet_upgrade
+                            and best_synced is not None
+                            and _pool_duet_tag_count([x.get("text", "") for x in best_synced]) < 2
+                        ):
+                            best_synced = None
+                            best_synced_score = 0.0
+                            best_synced_is_yrc = False
+                        # Continue scanning sibling NetEase releases (single vs album re-release) if YRC not found yet!
+                        if is_live_or_alt or best_synced_is_yrc:
+                            break
+                    elif not lrc_would_lose_duet_tags and can_upgrade_lrc and dur_ok:
+                        best_synced = parsed
+                        best_synced_score = sc
+                        if not best_lines:
+                            best_lines = ne_clean_lines
+                        if is_live_or_alt or best_synced_is_yrc:
+                            break
                 except Exception:
                     continue
 
-    # 3) YouTube description lookup & official duet speaker-tag upgrade:
+    # 3) Unified YouTube Description fusion:
     #    Catches 改詞版 / parodies / brand-new tracks AND official duet MVs whose description carries artist-published
-    #    speaker labels (e.g. 'C:' / 'M:' / 'D:' or '男：' / '女：') that crowd-sourced LRCLIB/NetEase stripped!
+    #    speaker labels (e.g. 'C:' / 'M:' / 'D:' or '男：' / '女：') that crowd-sourced LRCLIB/NetEase/YRC stripped!
     if yt_desc and (not best_lines or _pool_duet_tag_count(best_lines) < 2):
         desc_lines = extract_lyrics_from_description(yt_desc)
         if desc_lines:
             if not best_lines:
                 best_lines = desc_lines
                 best_source = "YouTube Description"
-            else:
-                desc_spk_keys = {
-                    _norm_speaker_key(lbl)
-                    for ln_d in desc_lines
-                    for _, _, lbl in _iter_duet_spk_matches(ln_d)
-                    if _norm_speaker_key(lbl)
-                }
-                cjk_best = sum(len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) for x in best_lines)
-                cjk_desc = sum(len(_norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", x))) for x in desc_lines)
-                same_song_desc = (
-                    _pools_are_same_song(best_lines, desc_lines)
-                    or _lyric_similarity(
-                        " ".join(INLINE_SPEAKER_TAG_RE.sub("", x) for x in best_lines[:16]),
-                        " ".join(INLINE_SPEAKER_TAG_RE.sub("", x) for x in desc_lines[:16]),
-                    )
-                    >= 0.55
-                )
-                if (
-                    _pool_duet_tag_count(desc_lines) >= 4
-                    and len(desc_spk_keys) >= 2
-                    and same_song_desc
-                    and cjk_desc >= max(24, int(cjk_best * 0.80))
-                ):
-                    best_lines = desc_lines
-                    best_source = "YouTube Description (Official Duet)"
-                    if best_synced is not None and _pool_duet_tag_count([x.get("text", "") for x in best_synced]) < 2:
-                        best_synced = None
-                        best_synced_score = 0.0
+            elif _has_verified_duet_tags(desc_lines) and _sources_represent_same_song(best_lines, desc_lines):
+                best_lines = desc_lines
+                best_source = "YouTube Description (Official Duet)"
+                if best_synced is not None and _pool_duet_tag_count([x.get("text", "") for x in best_synced]) < 2:
+                    best_synced = None
+                    best_synced_score = 0.0
 
     return best_synced, best_lines, best_source
 
@@ -3736,6 +3827,66 @@ def _recover_missing_lines_between_anchors(
                         for m_i in range(missing_n)
                     ]
                     return mid_out, new_cur_end, new_nxt_start
+
+    # Case 3 (Live Simultaneous Duet Counterpoint Partner Preservation):
+    # When Whisper ASR on a live/medley dual-singer bar only transcribes the louder singer, the simultaneous
+    # counterpoint line sits between `cur_idx` and `nxt_idx` with ~0s sequential gap. Preserve it inside its
+    # shared bar scaffold so Stage-2 20ms Dual-Track CTC aligns BOTH singers simultaneously instead of dropping it!
+    if missing_n in (1, 2) and (gap_e - gap_s) <= 1.5:
+        chorus_keys_live = _DUET_ALL_KEYS | {"d"}
+
+        def _eff_pool_speaker(idx_p: int) -> str:
+            spk = ""
+            for j_p in range(max(0, idx_p - 12), idx_p + 1):
+                m_j = DUET_LEAD_SPEAKER_RE.match((pl[j_p] or "").strip())
+                if m_j:
+                    spk = _norm_speaker_key(m_j.group(1))
+            return spk
+
+        def _is_simul_duet_partner(lead_i: int, cand_i: int) -> bool:
+            lt = (pl[lead_i] or "").strip()
+            ct = (pl[cand_i] or "").strip()
+            if DUET_PAREN_SPEAKER_LINE_RE.match(ct):
+                return True
+            if _are_parallel_duet_lines(lt, ct):
+                return True
+            m_c = DUET_LEAD_SPEAKER_RE.match(ct)
+            if not m_c:
+                return False
+            c_sp = _norm_speaker_key(m_c.group(1))
+            l_sp = _eff_pool_speaker(lead_i)
+            if not c_sp or not l_sp or c_sp == l_sp or c_sp in chorus_keys_live or l_sp in chorus_keys_live:
+                return False
+            syl_l = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", lt))
+            syl_c = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", ct))
+            return syl_l >= 5.0 and syl_c >= 5.0
+
+        cur_s_f, cur_e_f = float(cur["start"]), float(cur["end"])
+        nxt_s_f, nxt_e_f = float(nxt["start"]), float(nxt["end"])
+        if missing_n == 1:
+            if _is_simul_duet_partner(cur_idx, cur_idx + 1) and (cur_e_f - cur_s_f) >= 1.6:
+                mid_t = round(0.5 * (cur_s_f + cur_e_f), 2)
+                return [{"start": mid_t, "end": round(cur_e_f, 2), "text": pl[cur_idx + 1], "sim": 0.0}], mid_t, None
+            if _is_simul_duet_partner(cur_idx + 1, nxt_idx) and (nxt_e_f - nxt_s_f) >= 1.6:
+                mid_t = round(0.5 * (nxt_s_f + nxt_e_f), 2)
+                return [{"start": round(nxt_s_f, 2), "end": mid_t, "text": pl[cur_idx + 1], "sim": 0.0}], None, mid_t
+        elif missing_n == 2:
+            if (
+                _is_simul_duet_partner(cur_idx, cur_idx + 1)
+                and _is_simul_duet_partner(cur_idx + 2, nxt_idx)
+                and (cur_e_f - cur_s_f) >= 1.6
+                and (nxt_e_f - nxt_s_f) >= 1.6
+            ):
+                mid_c = round(0.5 * (cur_s_f + cur_e_f), 2)
+                mid_n = round(0.5 * (nxt_s_f + nxt_e_f), 2)
+                return (
+                    [
+                        {"start": mid_c, "end": round(cur_e_f, 2), "text": pl[cur_idx + 1], "sim": 0.0},
+                        {"start": round(nxt_s_f, 2), "end": mid_n, "text": pl[cur_idx + 2], "sim": 0.0},
+                    ],
+                    mid_c,
+                    mid_n,
+                )
 
     return [], None, None
 
@@ -5970,15 +6121,21 @@ def _expand_and_align_duet_counterpoint(
         return lines, 0
 
     tag_count = sum(1 for ln in lines if _iter_duet_spk_matches((ln.get("text") or "").strip()))
-    has_duet_context = (tag_count >= 2) or bool(DUET_COLLAB_TITLE_RE.search(title_hint or ""))
+    has_duet_context = (tag_count >= 2) or _is_collab_duet_title(title_hint)
     chorus_all_keys = _DUET_ALL_KEYS | {"d"}
 
-    # Compute song-adaptive median solo syllable pace (0 magic-number tempo assumptions!)
-    solo_paces: list[float] = []
-    for ln in lines:
+    # Compute per-line & local-neighborhood (±8 lines) solo syllable pace so fast-rap verses and slow-ballad
+    # choruses inside the SAME song each use their own true local musical tempo (excluding duet counterpoint bars!)
+    line_solo_paces: list[Optional[float]] = []
+    for idx_sp, ln in enumerate(lines):
         txt = (ln.get("text") or "").strip()
+        nxt_is_paren_cnt = (idx_sp + 1 < len(lines)) and bool(
+            DUET_PAREN_SPEAKER_LINE_RE.match((lines[idx_sp + 1].get("text") or "").strip())
+        )
+        p_val: Optional[float] = None
         if (
-            not DUET_INLINE_COUNTERPOINT_RE.match(txt)
+            not nxt_is_paren_cnt
+            and not DUET_INLINE_COUNTERPOINT_RE.match(txt)
             and not DUET_PAREN_SPEAKER_LINE_RE.match(txt)
             and not DUET_BARE_PAREN_COUNTERPOINT_RE.match(txt)
             and "/" not in txt
@@ -5987,8 +6144,36 @@ def _expand_and_align_duet_counterpoint(
             syl = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", txt))
             dur = float(ln["end"]) - float(ln["start"])
             if syl >= 4.0 and dur >= 0.5:
-                solo_paces.append(dur / syl)
-    solo_pace = float(np.median(solo_paces)) if solo_paces else 0.38
+                p_val = dur / syl
+        line_solo_paces.append(p_val)
+    valid_global_paces = [p for p in line_solo_paces if p is not None]
+    solo_pace = float(np.median(valid_global_paces)) if valid_global_paces else 0.38
+
+    def _local_solo_pace(idx_c: int) -> float:
+        lo_i = max(0, idx_c - 8)
+        hi_i = min(len(line_solo_paces), idx_c + 10)
+        loc = [line_solo_paces[k] for k in range(lo_i, hi_i) if k not in (idx_c, idx_c + 1) and line_solo_paces[k] is not None]
+        if len(loc) >= 5:
+            return float(np.median(loc))
+        return solo_pace
+
+    def _line_acoustic_objective(ws_list: list[dict], gmean_v: float, syl_v: float, ref_pace: float) -> float:
+        """Unified physical alignment quality objective: combines phoneme log-likelihood, crushed-token penalty,
+        frozen dead-gap cohesion penalty, and impossible syllable compression penalty relative to local tempo.
+        """
+        if not ws_list:
+            return -1e6
+        n_w = len(ws_list)
+        cr_f = sum(1 for w in ws_list if (float(w["end"]) - float(w["start"])) <= 0.065) / max(1, n_w)
+        dur_v = max(0.05, float(ws_list[-1]["end"]) - float(ws_list[0]["start"]))
+        act_pace = dur_v / max(1.0, syl_v)
+        max_step = max(
+            (float(ws_list[m + 1]["start"]) - float(ws_list[m]["start"]) for m in range(n_w - 1)),
+            default=0.0,
+        )
+        comp_pen = max(0.0, float(np.log((ref_pace * 0.68) / max(0.04, act_pace))))
+        gap_pen = max(0.0, max_step - 0.95)
+        return float(np.log(max(1e-3, gmean_v))) - 2.4 * cr_f - 0.70 * gap_pen - 1.5 * comp_pen
 
     final_lines: list[dict] = []
     n = len(lines)
@@ -6024,10 +6209,12 @@ def _expand_and_align_duet_counterpoint(
             cur_speaker = _norm_speaker_key(m_sp.group(1))
         prev_end = _prev_max_end()
 
-        # Pattern A: Single-line counterpoint ('Lead（Speaker2：Counter）', 'Lead / Counter', or duet 'Lead (Counter)')
+        # Pattern A: Single-line counterpoint ('Lead（Speaker2：Counter）', 'Lead / Counter', duet 'Lead (Counter)', or mid-line 'Prefix (Counter) Suffix')
         lead_a_txt = ""
         cnt_a_txt = ""
         infer_cnt_opp = False
+        mid_anchor_prefix_toks: Optional[int] = None
+        loc_pace_i = _local_solo_pace(i)
         m_inl = DUET_INLINE_COUNTERPOINT_RE.match(txt)
         if m_inl:
             lead_a_txt = m_inl.group(1).strip()
@@ -6056,6 +6243,24 @@ def _expand_and_align_duet_counterpoint(
                     ):
                         lead_a_txt, cnt_a_txt = cand_l, cand_c
                         infer_cnt_opp = not bool(DUET_LEAD_SPEAKER_RE.match(cnt_a_txt))
+                else:
+                    m_mp = DUET_MIDLINE_PAREN_RE.match(txt)
+                    if m_mp:
+                        pre_m, mid_c, suf_m = m_mp.group(1).strip(), m_mp.group(2).strip(), m_mp.group(3).strip()
+                        cjk_join = bool(re.search(r"[\u4e00-\u9fff\u3040-\u30ff]$", pre_m) and re.search(r"^[\u4e00-\u9fff\u3040-\u30ff]", suf_m))
+                        cand_l = f"{pre_m}{suf_m}" if cjk_join else f"{pre_m} {suf_m}"
+                        sl_a = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", cand_l))
+                        sl_b = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", mid_c))
+                        if (
+                            sl_a >= 6.0
+                            and sl_b >= 2.0
+                            and not VERSION_TAG_RE.search(mid_c)
+                            and not SECTION_HEADER_RE.match(mid_c)
+                            and _line_script_kind(cand_l) == _line_script_kind(mid_c)
+                        ):
+                            lead_a_txt, cnt_a_txt = cand_l, mid_c
+                            infer_cnt_opp = not bool(DUET_LEAD_SPEAKER_RE.match(cnt_a_txt))
+                            mid_anchor_prefix_toks = len(_tokenize_line_for_ctc(pre_m))
 
         if lead_a_txt and cnt_a_txt:
             syl_a = estimate_syllable_units(INLINE_SPEAKER_TAG_RE.sub("", lead_a_txt))
@@ -6065,14 +6270,14 @@ def _expand_and_align_duet_counterpoint(
                 b_toks = _tokenize_line_for_ctc(cnt_a_txt)
                 base_ws = _sung_words_only(ln.get("words") or [])
                 is_sequential = False
-                if len(base_ws) == len(a_toks) + len(b_toks) and a_toks and b_toks:
+                if mid_anchor_prefix_toks is None and len(base_ws) == len(a_toks) + len(b_toks) and a_toks and b_toks:
                     ba = [dict(w) for w in base_ws[: len(a_toks)]]
                     bb = [dict(w) for w in base_ws[len(a_toks) :]]
                     seq_gap = float(bb[0]["start"]) - float(ba[-1]["end"])
                     seq_dur = float(bb[-1]["end"]) - float(ba[0]["start"])
                     seq_pace = seq_dur / max(1.0, syl_a + syl_b)
                     seq_crushed = sum(1 for w in base_ws if (float(w["end"]) - float(w["start"])) <= 0.065)
-                    if seq_gap >= 0.25 and seq_pace >= solo_pace * 0.92 and seq_crushed == 0:
+                    if seq_gap >= 0.25 and seq_pace >= loc_pace_i * 0.92 and seq_crushed == 0:
                         is_sequential = True
                         wa = _attach_ctc_speaker_anchors(lead_a_txt, ba, min_start=prev_end)
                         la_seq = {
@@ -6107,14 +6312,22 @@ def _expand_and_align_duet_counterpoint(
                         norm_la = _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", lead_a_txt))
                         norm_cb = _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", cnt_a_txt))
                         is_tail_echo_a = len(norm_cb) >= 4 and len(norm_la) > len(norm_cb) and norm_la.endswith(norm_cb)
-                        if not is_tail_echo_a and (n_b / max(1, n_a)) >= 0.72:
+                        b_e = w_e
+                        if mid_anchor_prefix_toks is not None and n_a > 0:
+                            anc_lo = max(0, min(n_a - 1, mid_anchor_prefix_toks - max(1, n_b)))
+                            anc_hi = max(anc_lo, min(n_a - 1, mid_anchor_prefix_toks + max(1, n_b)))
+                            b_s = max(w_s, float(la_sung[anc_lo]["start"]) - 0.15)
+                            b_e = min(w_e, float(la_sung[anc_hi]["end"]) + 0.20)
+                            if b_e - b_s < 0.40:
+                                b_e = min(w_e, b_s + 0.60)
+                        elif not is_tail_echo_a and (n_b / max(1, n_a)) >= 0.72:
                             b_s = max(w_s, float(la_sung[0]["start"]) - 0.05)
                         else:
                             tail_idx = max(0, n_a - n_b)
                             b_s = max(w_s, float(la_sung[tail_idx]["start"]) - 0.15)
                             if w_e - b_s < 0.35:
                                 b_s = max(w_s, w_e - 0.50)
-                        res_b = align_text_fn(cnt_a_txt, b_s, w_e, nxt_b)
+                        res_b = align_text_fn(cnt_a_txt, b_s, b_e, min(nxt_b, b_e))
                         if res_b is not None:
                             lb_sung = res_b[0]
                             wa = _attach_ctc_speaker_anchors(lead_a_txt, la_sung, min_start=prev_end)
@@ -6155,8 +6368,14 @@ def _expand_and_align_duet_counterpoint(
             nxt_raw = (nxt.get("text") or "").strip()
             m_p2 = DUET_PAREN_SPEAKER_LINE_RE.match(nxt_raw)
             is_paren_b = bool(m_p2)
+            # NEVER consume `nxt` into Pattern B if `nxt` is itself an inline Pattern-A counterpoint line!
+            nxt_is_inline_a = (not is_paren_b) and bool(
+                DUET_INLINE_COUNTERPOINT_RE.match(nxt_raw)
+                or (DUET_SLASH_COUNTERPOINT_RE.match(nxt_raw) and not CREDIT_LINE_RE.match(nxt_raw))
+                or (has_duet_context and DUET_BARE_PAREN_COUNTERPOINT_RE.match(nxt_raw))
+            )
             cnt_txt = m_p2.group(1).strip() if m_p2 else nxt_raw
-            m_csp = DUET_LEAD_SPEAKER_RE.match(cnt_txt)
+            m_csp = None if nxt_is_inline_a else DUET_LEAD_SPEAKER_RE.match(cnt_txt)
             cnt_sp = _norm_speaker_key(m_csp.group(1)) if m_csp else ""
 
             norm_a = _norm_lyrics_cmp(INLINE_SPEAKER_TAG_RE.sub("", txt))
@@ -6209,21 +6428,24 @@ def _expand_and_align_duet_counterpoint(
                     and syl_a >= 5.0
                     and syl_b >= 5.0
                     and gap_ab <= 0.65
-                    and (dur_a / max(1.0, syl_a)) >= solo_pace * 0.70
-                    and (dur_b / max(1.0, syl_b)) < min(0.16, solo_pace * 0.48)
+                    and (dur_a / max(1.0, syl_a)) >= loc_pace_i * 0.70
+                    and (dur_b / max(1.0, syl_b)) < min(0.16, loc_pace_i * 0.48)
                     and crushed_b >= 2
                 )
 
-                pace_thr = min(0.30, solo_pace * (0.72 if is_paren_b else 0.76))
+                # Unified Local-Tempo + Acoustic Hypothesis Candidate Filter:
+                # Only evaluate Simultaneous (H_sim) vs Sequential (H_seq) when local timing or token integrity
+                # shows compression/crush stress (zero extra compute & zero false positives on clean sequential lines!).
+                pace_thr = min(0.30, loc_pace_i * (0.72 if is_paren_b else 0.76))
                 min_pair_syl = 5.0 if (is_paren_b or is_tail_echo) else 10.0
                 is_compressed_b1 = (
                     (syl_a + syl_b) >= min_pair_syl
                     and (syl_b / max(1.0, syl_a)) >= 0.55
                     and gap_ab <= 0.80
                     and (
-                        comb_pace < pace_thr
-                        or (not is_paren_b and crushed_ab >= 3 and gap_ab <= 0.65 and active_pace < solo_pace * 0.98)
-                        or (is_tail_echo and comb_dur <= syl_a * solo_pace * 1.40)
+                        active_pace < pace_thr
+                        or (not is_paren_b and crushed_ab >= 3 and gap_ab <= 0.65 and active_pace < loc_pace_i * 0.98)
+                        or (is_tail_echo and comb_dur <= syl_a * loc_pace_i * 1.40)
                         or is_displaced_crush_b
                     )
                 )
@@ -6260,8 +6482,25 @@ def _expand_and_align_duet_counterpoint(
                             new_crushed = sum(
                                 1 for w in (la_sung + lb_sung) if (float(w["end"]) - float(w["start"])) <= 0.065
                             )
-                            gm_ok = (len(res_a) < 3 or float(res_a[2]) >= 0.012) and (len(res_b) < 3 or float(res_b[2]) >= 0.012)
-                            crush_improved = (comb_pace < pace_thr) or is_tail_echo or (new_crushed < crushed_ab)
+                            gm_a = float(res_a[2]) if len(res_a) >= 3 else 0.15
+                            gm_b = float(res_b[2]) if len(res_b) >= 3 else 0.15
+                            gm_ok = (gm_a >= 0.012) and (gm_b >= 0.012)
+                            # Unified Hypothesis Quality Verification: H_sim must strictly improve acoustic integrity
+                            # (fewer crushes / higher combined local-tempo objective) over H_seq!
+                            sim_obj = (
+                                _line_acoustic_objective(la_sung, gm_a, syl_a, loc_pace_i)
+                                + _line_acoustic_objective(lb_sung, gm_b, syl_b, loc_pace_i)
+                            )
+                            seq_obj = (
+                                _line_acoustic_objective(ws_a_raw, max(0.05, gm_a), syl_a, loc_pace_i)
+                                + _line_acoustic_objective(ws_b_raw, max(0.05, gm_b), syl_b, loc_pace_i)
+                            )
+                            crush_improved = (
+                                (active_pace < pace_thr)
+                                or is_tail_echo
+                                or (new_crushed < crushed_ab and sim_obj >= seq_obj - 0.15)
+                                or (sim_obj > seq_obj + 0.35)
+                            )
                             if gm_ok and crush_improved:
                                 wa = _attach_ctc_speaker_anchors(txt, la_sung, min_start=prev_end)
                                 la_start = round(wa[0]["start"], 2)
@@ -6767,7 +7006,7 @@ def _infer_untagged_duet_speakers_from_audio(
         return lines
     if any(ln.get("speaker") for ln in lines):
         return lines
-    if not DUET_COLLAB_TITLE_RE.search(title_hint or ""):
+    if not _is_collab_duet_title(title_hint):
         return lines
 
     measured: list[tuple[int, float, float]] = []
@@ -7925,24 +8164,36 @@ def main() -> int:
 
         full_title_hint = f"{title} {yt_artist}".strip()
 
-        # Layer 1: Human YouTube subtitles — NEVER ship 0-word linear-sweep lines when vocals.mp3 exists!
-        # Also verify CC covers >=55% of active vocal singing (blocks 5-line spoken-intro CC from hijacking a song!).
+        def _emit_lyrics_result(
+            source_id: str,
+            label_txt: str,
+            raw_lines_out: list[dict],
+            audio_ref: Optional[np.ndarray] = None,
+        ) -> int:
+            """Single canonical output gate across ALL lyrics exit paths: guarantees 100% consistent
+            speaker-role normalization, untagged-duet YIN F0 fallback, '?' sanitization & atomic JSON write.
+            """
+            result = {
+                "video_id": args.video_id,
+                "title": title,
+                "source": source_id,
+                "source_label": label_txt,
+                "lines": _sanitize_lyric_lines_output(raw_lines_out, audio_16k=audio_ref, title_hint=full_title_hint),
+                "created_at": time.time(),
+            }
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(out_file, result, stamp_updated_at=False)
+            update("finalizing", 98, "載入歌詞中...")
+            return 0
+
+        # Layer 1: Human YouTube subtitles — NEVER ship 0-word linear-sweep lines when vocals.mp3 exists,
+        # AND NEVER let untagged YouTube CC bypass richer speaker-tagged official duet lyrics!
         yt_human_official_lines: list[str] = []
+        prefetched_official: Optional[tuple[Optional[list[dict]], list[str], str]] = None
         cached_vocal_profile = None
         if yt_lines and not force_ai:
             if not vocals_path.exists():
-                result = {
-                    "video_id": args.video_id,
-                    "title": title,
-                    "source": "youtube_sub",
-                    "source_label": "同步字幕",
-                    "lines": _sanitize_lyric_lines_output(yt_lines, title_hint=full_title_hint),
-                    "created_at": time.time(),
-                }
-                out_file.parent.mkdir(parents=True, exist_ok=True)
-                write_json_atomic(out_file, result, stamp_updated_at=False)
-                update("finalizing", 98, "載入歌詞中...")
-                return 0
+                return _emit_lyrics_result("youtube_sub", "同步字幕", yt_lines, audio_ref=None)
 
             cached_vocal_profile = detect_vocal_energy_profile(vocals_path)
             audio_16k_yt, db_prof_yt, step_yt, onset_yt = cached_vocal_profile
@@ -7962,7 +8213,27 @@ def main() -> int:
                         cc_covers_vocals = False
                         print(f"[Lyrics] Skipping partial YouTube CC (vocal coverage={cov_ratio:.2f} < 0.55)", file=sys.stderr, flush=True)
 
-            if cc_covers_vocals and len(audio_16k_yt) > 0:
+            # Unified Duet Source Fusion: if CC has <2 speaker tags on a collaboration video or a video whose
+            # description has duet tags, check official sources first so untagged CC never strips duet roles!
+            cc_upgraded_to_duet = False
+            if cc_covers_vocals and _pool_duet_tag_count([ln.get("text", "") for ln in yt_lines]) < 2:
+                desc_has_duet = bool(yt_desc and _has_verified_duet_tags(extract_lyrics_from_description(yt_desc)))
+                if _is_collab_duet_title(full_title_hint, yt_artist) or desc_has_duet:
+                    cand_sync, cand_off, cand_src = fetch_official_lyrics(
+                        title, duration, yt_desc,
+                        yt_track=yt_track, yt_artist=yt_artist, yt_channel=yt_channel,
+                    )
+                    prefetched_official = (cand_sync, cand_off, cand_src)
+                    cc_plain = [ln.get("text", "") for ln in yt_lines]
+                    if cand_off and _has_verified_duet_tags(cand_off) and _sources_represent_same_song(cc_plain, cand_off, min_completeness=0.75):
+                        cc_upgraded_to_duet = True
+                        print(
+                            f"[Lyrics] Upgraded untagged YouTube CC -> speaker-tagged official lyrics ({cand_src}).",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+
+            if cc_covers_vocals and not cc_upgraded_to_duet and len(audio_16k_yt) > 0:
                 update("running", 65, "精修歌詞時間軸...")
                 yt_ref, yt_eng = _refine_stage2_words(
                     yt_lines, audio_16k_yt, db_prof_yt, step_yt, args.device_mode, onset_yt,
@@ -7972,20 +8243,14 @@ def main() -> int:
                     title_hint=full_title_hint,
                 )
                 if yt_eng and len(yt_ref) >= 4:
-                    result = {
-                        "video_id": args.video_id,
-                        "title": title,
-                        "source": "youtube_sub_ctc" if yt_eng == "ctc" else "youtube_sub_qwen3",
-                        "source_label": "同步字幕",
-                        "lines": _sanitize_lyric_lines_output(yt_ref, audio_16k=audio_16k_yt, title_hint=full_title_hint),
-                        "created_at": time.time(),
-                    }
-                    out_file.parent.mkdir(parents=True, exist_ok=True)
-                    write_json_atomic(out_file, result, stamp_updated_at=False)
-                    update("finalizing", 98, "載入歌詞中...")
-                    return 0
-            # Stage-2 skipped -> keep these exact human YouTube lines ONLY if they cover the vocals!
-            if cc_covers_vocals:
+                    return _emit_lyrics_result(
+                        "youtube_sub_ctc" if yt_eng == "ctc" else "youtube_sub_qwen3",
+                        "同步字幕",
+                        yt_ref,
+                        audio_ref=audio_16k_yt,
+                    )
+            # Stage-2 skipped -> keep these exact human YouTube lines ONLY if they cover vocals and weren't upgraded!
+            if cc_covers_vocals and not cc_upgraded_to_duet:
                 yt_human_official_lines = clean_lyric_lines([ln["text"] for ln in yt_lines])
 
         # Layer 2: Generic parallel official lyrics lookup (Multi-Song Title Set -> LRCLIB + NetEase + YT Desc)
@@ -7998,6 +8263,8 @@ def main() -> int:
         multi_song_pools: list[list[str]] = []
         if yt_human_official_lines:
             lrc_synced, official_lines, lrc_src = None, yt_human_official_lines, "YouTube Human Subtitles"
+        elif prefetched_official is not None:
+            lrc_synced, official_lines, lrc_src = prefetched_official
         else:
             multi_song_pools = fetch_multi_song_lyrics_from_title(title, duration, yt_artist=yt_artist)
             if multi_song_pools:
@@ -8018,18 +8285,7 @@ def main() -> int:
         # Only return raw line-only LRC if vocals.mp3 is unavailable; otherwise ALWAYS acoustically align
         # against THIS video's actual vocals (eliminates MV-vs-Spotify intro offsets and fake 8s 0-word sweeps!).
         if lrc_synced and not force_ai and not vocals_path.exists():
-            result = {
-                "video_id": args.video_id,
-                "title": title,
-                "source": "lrclib_exact",
-                "source_label": "同步歌詞",
-                "lines": _sanitize_lyric_lines_output(lrc_synced, title_hint=full_title_hint),
-                "created_at": time.time(),
-            }
-            out_file.parent.mkdir(parents=True, exist_ok=True)
-            write_json_atomic(out_file, result, stamp_updated_at=False)
-            update("finalizing", 98, "載入歌詞中...")
-            return 0
+            return _emit_lyrics_result("lrclib_exact", "同步歌詞", lrc_synced, audio_ref=None)
 
         if not vocals_path.exists():
             raise RuntimeError("請先開啟唱 K 伴奏")
@@ -8047,18 +8303,7 @@ def main() -> int:
                     lrc_synced, audio_16k, db_profile, step_sec, first_onset
                 )
                 if verified_yrc and len(verified_yrc) >= 6:
-                    result = {
-                        "video_id": args.video_id,
-                        "title": title,
-                        "source": "netease_yrc_verified",
-                        "source_label": "同步歌詞",
-                        "lines": _sanitize_lyric_lines_output(verified_yrc, audio_16k=audio_16k, title_hint=full_title_hint),
-                        "created_at": time.time(),
-                    }
-                    out_file.parent.mkdir(parents=True, exist_ok=True)
-                    write_json_atomic(out_file, result, stamp_updated_at=False)
-                    update("finalizing", 98, "載入歌詞中...")
-                    return 0
+                    return _emit_lyrics_result("netease_yrc_verified", "同步歌詞", verified_yrc, audio_ref=audio_16k)
 
         # Fast-path acoustic alignment when we have studio LRC scaffold (~2.0s total with 20ms CTC!):
         # Auto-compensate MV-vs-Spotify intro offset AND enforce 3 acoustic gates:
@@ -8109,18 +8354,12 @@ def main() -> int:
                     title_hint=full_title_hint,
                 )
                 if s2_eng and len(s2_lines) >= 4:
-                    result = {
-                        "video_id": args.video_id,
-                        "title": title,
-                        "source": "lrclib_ctc_align" if s2_eng == "ctc" else "lrclib_qwen3_align",
-                        "source_label": "同步歌詞",
-                        "lines": _sanitize_lyric_lines_output(s2_lines, audio_16k=audio_16k, title_hint=full_title_hint),
-                        "created_at": time.time(),
-                    }
-                    out_file.parent.mkdir(parents=True, exist_ok=True)
-                    write_json_atomic(out_file, result, stamp_updated_at=False)
-                    update("finalizing", 98, "載入歌詞中...")
-                    return 0
+                    return _emit_lyrics_result(
+                        "lrclib_ctc_align" if s2_eng == "ctc" else "lrclib_qwen3_align",
+                        "同步歌詞",
+                        s2_lines,
+                        audio_ref=audio_16k,
+                    )
 
         # Layer 2B: Automatic Shazam audio fingerprinting when title did NOT resolve >=2 multi-song pools or found nothing.
         # Merges deduplicated Shazam pools with any existing title pool instead of wiping out already-found lyrics!
@@ -8210,6 +8449,7 @@ def main() -> int:
                     inst_path=inst_path, shazam_already_tried=True,
                     initial_song_pools=(rescued_pools if len(rescued_pools) >= 2 else None),
                     sub_lang=yt_lang, meta_lang=yt_video_lang, lang_out=lang_out_r,
+                    title_hint=full_title_hint,
                 )
                 if rescued_aligned:
                     ai_lines = rescued_aligned
@@ -8238,18 +8478,7 @@ def main() -> int:
         if not ai_lines:
             raise RuntimeError("暫未能對齊歌詞")
 
-        result = {
-            "video_id": args.video_id,
-            "title": title,
-            "source": src,
-            "source_label": label,
-            "lines": _sanitize_lyric_lines_output(ai_lines, audio_16k=audio_16k, title_hint=full_title_hint),
-            "created_at": time.time(),
-        }
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(out_file, result, stamp_updated_at=False)
-        update("finalizing", 98, "載入歌詞中...")
-        return 0
+        return _emit_lyrics_result(src, label, ai_lines, audio_ref=audio_16k)
     except Exception as exc:
         update("error", 0, "暫未能載入歌詞", error=str(exc))
         print(f"[LyricsWorker Error] {exc}", file=sys.stderr, flush=True)

@@ -1331,14 +1331,29 @@
         subEnd = Math.max(subStart + 0.25, subEnd);
         prevSubEnd = subEnd;
         elapsedChars += need;
+        const subDuetTrack =
+          duetTrack === "lead" && si === subTexts.length - 1
+            ? "lead"
+            : duetTrack === "counter" && si === 0
+              ? "counter"
+              : "";
         out.push({
           start: Math.round(subStart * 100) / 100,
           end: Math.round(subEnd * 100) / 100,
           text: stxt,
           words: subWords,
           speaker,
-          duetTrack: "",
+          duetTrack: subDuetTrack,
         });
+      }
+    }
+
+    // Preserve monotonic start invariant for simultaneous duet pairs if lead was split into multiple sub-phrases
+    for (let i = 0; i + 1 < out.length; i++) {
+      if (out[i].duetTrack === "lead" && out[i + 1].duetTrack === "counter") {
+        if (out[i + 1].start < out[i].start) {
+          out[i].start = out[i + 1].start;
+        }
       }
     }
 
