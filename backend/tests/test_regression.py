@@ -1197,8 +1197,18 @@ def test_question_mark_sanitization_ui_and_security_invariants() -> None:
     # Authentic HK KTV color-coded duet styling (Blue Male / Rose-Pink Female / Gold All, zero raw '男：'/'女：' text!)
     for role in ('[data-speaker="male"]', '[data-speaker="female"]', '[data-speaker="all"]'):
         assert role in styles_src, f"Missing HK KTV duet CSS selector {role} in styles.css!"
+    # Original d911d6fb subtitle style preserved: zero .ktv-layer-base speaker tinting, identical 1.5px stroke & shadow,
+    # and partitioned -40px clip-path on BOTH baseEl and fillEl (zero clipped dark shadow box & zero double-stroke!)
+    assert ".ktv-layer-base" not in styles_src.split("/* HK KTV Duet Color Coding")[1], (
+        "Must NOT tint or override .ktv-layer-base per speaker — only .ktv-layer-fill color changes!"
+    )
+    assert styles_src.count("-webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.75);") == 2, (
+        "Both .ktv-layer-base and .ktv-layer-fill must share identical 1.5px rgba(0, 0, 0, 0.75) stroke!"
+    )
+    assert "slot.baseEl.style.clipPath = `inset(-40px -40px -40px ${leftPct}%)`" in content_src
+    assert "slot.fillEl.style.clipPath = `inset(-40px ${rightPct}% -40px -40px)`" in content_src
     assert "slot.wrap.dataset.speaker" in content_src and "ov.countdownEl.dataset.speaker" in content_src
-    assert "Math.max(maxCjkUnits, 12.0)" in content_src
+    assert "Math.max(maxCjkUnits, 15.0)" in content_src
     print("[PASS] Question-mark sanitization (backend + frontend), HK KTV duet styling, visual DB indicators & security hardening")
 
 
@@ -1917,6 +1927,76 @@ def test_gate5_yrc_quality_and_dual_track_duet_invariants() -> None:
     brand_new_song = ["沒有一聲再見", "沒有半聲嗟怨", "淡淡去但無言", "過去終於過去"]
     merged_shz = lw._preserve_duet_tags_against_duplicates([untagged_dup, brand_new_song], [duet_pool])
     assert merged_shz[0] == duet_pool and merged_shz[1] == brand_new_song, f"Duet pool downgraded by untagged duplicate: {merged_shz}"
+
+    # 5J) YT Description English Production Credits filter + C:/M:/D: high-tenor YIN F0 (>235Hz) + un-parenthesized/slash/bare-paren counterpoint
+    yt_mv_desc = (
+        "MC 張天賦 X Chantel 姚焯菲《誰能避開戀愛這事情》\n#MC張天賦 #姚焯菲\n—————\n曲：Larry Wong\n詞：林若寧\n\n"
+        "C:  有種心跳叫動情　神奇到整天不安定\n 坐上電單車一樣　衝過去便高興\n"
+        "M: 也許水星戀上火星　感情蒙蔽你眼睛\n 其實我被劣評　請你一眼看清\n"
+        "M: 我驚你承擔很多爭議性\nC: 我不怕承擔很多爭議性\n"
+        "C : 越迴避\nM: 更回味\nD: 能一齊就毫無懼意\n\n"
+        "Production Credits:\n\nDrums by: 肥仔明\nBass by: Ho Chun Kit\nGuitars by: 黃仲賢\n"
+        "Keyboards & Programming by: Larry Wong\nBackground vocals by: Ivory / Titus\nString Arranged by: BJ Strings\n"
+    )
+    desc_extracted = lw.extract_lyrics_from_description(yt_mv_desc)
+    assert len(desc_extracted) >= 9, f"Failed to extract duet lyrics from MV description: {desc_extracted}"
+    assert not any("Credits" in x or "Drums" in x or "Keyboards" in x or "Strings" in x for x in desc_extracted), (
+        f"Production credits leaked into extracted lyrics: {desc_extracted}"
+    )
+    assert desc_extracted[0].startswith("C: 有種心跳叫動情"), f"Leading speaker tag split broke: {desc_extracted[:2]}"
+
+    # High-tenor male (242Hz > old 235Hz ceiling!) vs soprano female (325Hz) with C:/M:/D: initials — MUST map M->male, C->female, D->all!
+    t_hi_tenor = np.arange(sr * 14, dtype=np.float32) / sr
+    y_hi_tenor = np.zeros_like(t_hi_tenor)
+    y_hi_tenor[int(1.0 * sr) : int(4.0 * sr)] = 0.25 * np.sin(2.0 * np.pi * 325.0 * t_hi_tenor[int(1.0 * sr) : int(4.0 * sr)])
+    y_hi_tenor[int(5.0 * sr) : int(8.0 * sr)] = 0.25 * np.sin(2.0 * np.pi * 242.0 * t_hi_tenor[int(5.0 * sr) : int(8.0 * sr)])
+    cmd_lines = [
+        {"start": 1.0, "end": 4.0, "text": "C: 有種心跳叫動情", "words": lw._even_words_for_line("有種心跳叫動情", 1.0, 4.0)},
+        {"start": 5.0, "end": 8.0, "text": "M: 也許水星戀上火星", "words": lw._even_words_for_line("也許水星戀上火星", 5.0, 8.0)},
+        {"start": 9.0, "end": 12.0, "text": "D: 甚麼叫愛情", "words": lw._even_words_for_line("甚麼叫愛情", 9.0, 12.0)},
+    ]
+    cmd_clean = lw._normalize_duet_speakers_and_clean_text(cmd_lines, audio_16k=y_hi_tenor)
+    assert [x.get("speaker") for x in cmd_clean] == ["female", "male", "all"], f"High-tenor C:/M:/D: role mapping failed: {cmd_clean}"
+
+    # Un-parenthesized compressed opposite-speaker pair + slash counterpoint MUST expand to simultaneous (lead, counter),
+    # while short 3-syllable sequential bridge ('C : 越迴避' + 'M: 更回味') MUST stay sequential!
+    def _mock_align_duet(t_s: str, ws: float, we: float, nb: float):
+        ew = lw._even_words_for_line(lw.INLINE_SPEAKER_TAG_RE.sub("", t_s), ws + 0.05, min(we, nb) - 0.05)
+        return ew, 0.22, 0.18
+
+    unparen_in = [
+        {"start": 10.0, "end": 14.0, "text": "C: 甚麼叫愛情愛愛愛得亡命", "words": lw._even_words_for_line("甚麼叫愛情愛愛愛得亡命", 10.0, 14.0)},
+        {"start": 14.2, "end": 18.2, "text": "M: 平常人若果鍾意我是罪名", "words": lw._even_words_for_line("平常人若果鍾意我是罪名", 14.2, 18.2)},
+        {"start": 20.0, "end": 22.1, "text": "M: 我驚你承擔很多爭議性", "words": lw._even_words_for_line("我驚你承擔很多爭議性", 20.0, 22.1)},
+        {"start": 22.1, "end": 24.0, "text": "C: 我不怕承擔很多爭議性", "words": lw._even_words_for_line("我不怕承擔很多爭議性", 22.1, 24.0)},
+        {"start": 25.0, "end": 29.0, "text": "M: 我無法子只顧自己高興 / 最重要的只要自己高興", "words": lw._even_words_for_line("我無法子只顧自己高興最重要的只要自己高興", 25.0, 29.0)},
+        {"start": 30.0, "end": 30.88, "text": "C : 越迴避", "words": lw._even_words_for_line("越迴避", 30.0, 30.88)},
+        {"start": 30.90, "end": 31.70, "text": "M: 更回味", "words": lw._even_words_for_line("更回味", 30.90, 31.70)},
+    ]
+    unparen_exp, n_dp = lw._expand_and_align_duet_counterpoint(unparen_in, 40.0, 0.0, _mock_align_duet, title_hint="MC X Chantel")
+    assert n_dp == 2, f"Expected 2 simultaneous pairs (unparen + slash) and 0 false bridge merges, got {n_dp}: {unparen_exp}"
+    unparen_norm = lw._normalize_duet_speakers_and_clean_text(unparen_exp, audio_16k=None)
+    slash_cnt = next(x for x in unparen_norm if x["text"] == "最重要的只要自己高興")
+    assert slash_cnt.get("duet_track") == "counter" and slash_cnt.get("speaker") == "female", f"Slash counter role failed: {slash_cnt}"
+    br_a = next(x for x in unparen_norm if x["text"] == "越迴避")
+    br_b = next(x for x in unparen_norm if x["text"] == "更回味")
+    assert not br_a.get("duet_track") and not br_b.get("duet_track") and br_b["start"] >= br_a["end"] - 0.05
+
+    # 5K) Untagged duet acoustic YIN F0 fallback: activates ONLY on multi-artist Male+Female bimodal vocals,
+    #     NEVER on solo titles or loudness-correlated solo falsetto!
+    t_duet_u = np.arange(sr * 36, dtype=np.float32) / sr
+    y_duet_u = np.zeros_like(t_duet_u)
+    untagged_lines = []
+    for k_u in range(10):
+        s_u, e_u = 1.0 + k_u * 3.2, 3.6 + k_u * 3.2
+        f_u = 315.0 if k_u < 5 else 165.0
+        amp_u = 0.20 if k_u < 5 else 0.24  # Male slightly louder -> negative st/db correlation
+        y_duet_u[int(s_u * sr) : int(e_u * sr)] = amp_u * np.sin(2.0 * np.pi * f_u * t_duet_u[int(s_u * sr) : int(e_u * sr)])
+        untagged_lines.append({"start": s_u, "end": e_u, "text": f"無標記第{k_u}句歌詞", "words": lw._even_words_for_line(f"無標記第{k_u}句歌詞", s_u, e_u)})
+    inferred_collab = lw._infer_untagged_duet_speakers_from_audio(untagged_lines, y_duet_u, "Singer A X Singer B - Song")
+    assert [x.get("speaker") for x in inferred_collab] == ["female"] * 5 + ["male"] * 5, f"Untagged duet F0 fallback failed: {inferred_collab}"
+    inferred_solo = lw._infer_untagged_duet_speakers_from_audio(untagged_lines, y_duet_u, "陳蕾 - 凡星")
+    assert all("speaker" not in x for x in inferred_solo), "Solo title MUST NEVER receive duet speaker colors!"
     print("[PASS] Gate 5 YRC word quality, HK KTV speaker color-coding (incl. F0/paren tags/cross-song isolation), MC banter filter & Dual-Track Counterpoint")
 
 

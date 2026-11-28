@@ -1234,8 +1234,8 @@
         }
       }
       const cjk = isCjkText(text);
-      // Keep simultaneous duet pairs intact on a single KTV row up to 12 CJK units so top/bottom pairing never splits
-      const effMaxCjk = duetTrack === "lead" || duetTrack === "counter" ? Math.max(maxCjkUnits, 12.0) : maxCjkUnits;
+      // Keep simultaneous duet pairs intact on a single KTV row up to 15 CJK units so top/bottom pairing never splits
+      const effMaxCjk = duetTrack === "lead" || duetTrack === "counter" ? Math.max(maxCjkUnits, 15.0) : maxCjkUnits;
 
       let subTexts = [text];
       if (cjk && visualUnits(text) > effMaxCjk) {
@@ -1448,6 +1448,7 @@
         slot.fillEl.textContent = "";
         slot.lastText = "";
       }
+      slot.baseEl.style.clipPath = "none";
       slot.fillEl.style.clipPath = "inset(0 100% 0 0)";
       return;
     }
@@ -1456,8 +1457,19 @@
       slot.fillEl.textContent = text;
       slot.lastText = text;
     }
-    const rightPct = Math.max(0, Math.min(100, (1 - progress) * 100));
-    slot.fillEl.style.clipPath = `inset(0 ${rightPct.toFixed(2)}% 0 0)`;
+    const p = Math.max(0, Math.min(1, Number(progress) || 0));
+    if (p <= 0) {
+      slot.baseEl.style.clipPath = "none";
+      slot.fillEl.style.clipPath = "inset(0 100% 0 0)";
+    } else if (p >= 1) {
+      slot.baseEl.style.clipPath = "inset(0 0 0 100%)";
+      slot.fillEl.style.clipPath = "none";
+    } else {
+      const leftPct = (p * 100).toFixed(2);
+      const rightPct = (100 - Number(leftPct)).toFixed(2);
+      slot.baseEl.style.clipPath = `inset(-40px -40px -40px ${leftPct}%)`;
+      slot.fillEl.style.clipPath = `inset(-40px ${rightPct}% -40px -40px)`;
+    }
   }
 
   function renderLyricsFrame() {
@@ -1500,8 +1512,14 @@
     let nextUpcomingIdx = -1;
 
     for (let i = 0; i < lines.length; i++) {
-      // Smooth KTV hold: keep finished line comfortably lit for 0.45s (never overlapping next line's start)
-      const nextStart = i + 1 < lines.length ? lines[i + 1].start : lines[i].end + 1.0;
+      // Smooth KTV hold: keep finished line (or finished simultaneous duet pair) comfortably lit for 0.45s
+      const isFinishedDuetLead =
+        lines[i].duetTrack === "lead" &&
+        i + 1 < lines.length &&
+        lines[i + 1].duetTrack === "counter" &&
+        lines[i + 1].end <= lines[i].end + 0.05;
+      const nextIdx = isFinishedDuetLead ? i + 2 : i + 1;
+      const nextStart = nextIdx < lines.length ? lines[nextIdx].start : lines[i].end + 1.0;
       const holdUntil = Math.min(nextStart - 0.05, lines[i].end + 0.45);
       if (now >= lines[i].start && now <= Math.max(lines[i].end, holdUntil)) {
         activeIdx = i;

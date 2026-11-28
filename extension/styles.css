@@ -585,38 +585,35 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
 
 /* Base layer: large, sleek Medium-weight off-white (zero thick stroke bloat) */
 .ktv-layer-base {
-  display: inline-block;
+  display: block;
   color: rgba(240, 242, 246, 0.88);
   -webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.75);
   paint-order: stroke fill;
   text-shadow:
     0 2px 8px rgba(0, 0, 0, 0.85),
     0 4px 18px rgba(0, 0, 0, 0.5);
+  will-change: clip-path;
 }
 
-/* Sweep layer: clean, eye-friendly KTV Blue (zero neon border or colored glow) */
+/* Sweep layer: 100% identical stroke & shadow as base layer — ONLY text color changes! */
 .ktv-layer-fill {
   position: absolute;
   left: 0;
   top: 0;
   right: 0;
   bottom: 0;
-  display: inline-block;
+  display: block;
   color: #4da3ff;
-  -webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.82);
+  -webkit-text-stroke: 1.5px rgba(0, 0, 0, 0.75);
   paint-order: stroke fill;
   text-shadow:
-    0 2px 8px rgba(0, 0, 0, 0.88),
+    0 2px 8px rgba(0, 0, 0, 0.85),
     0 4px 18px rgba(0, 0, 0, 0.5);
   clip-path: inset(0 100% 0 0);
   will-change: clip-path;
 }
 
-/* Clean HK KTV Duet Color Coding — Pure text-color change only (no colored borders or neon glow) */
-.ktv-sweep-wrap[data-speaker="male"] .ktv-layer-base {
-  color: rgba(232, 243, 255, 0.9);
-}
-
+/* HK KTV Duet Color Coding — Pure sweep color change only (original base, stroke & shadow untouched) */
 .ktv-sweep-wrap[data-speaker="male"] .ktv-layer-fill {
   color: #4da3ff;
 }
@@ -625,20 +622,12 @@ html:not([dark]) #yt-ai-ktv-panel .ktv-seg {
   background: #4da3ff;
 }
 
-.ktv-sweep-wrap[data-speaker="female"] .ktv-layer-base {
-  color: rgba(255, 228, 240, 0.9);
-}
-
 .ktv-sweep-wrap[data-speaker="female"] .ktv-layer-fill {
   color: #ff7eb6;
 }
 
 .ktv-countdown[data-speaker="female"] .ktv-cd-dot {
   background: #ff7eb6;
-}
-
-.ktv-sweep-wrap[data-speaker="all"] .ktv-layer-base {
-  color: rgba(255, 244, 214, 0.9);
 }
 
 .ktv-sweep-wrap[data-speaker="all"] .ktv-layer-fill {
